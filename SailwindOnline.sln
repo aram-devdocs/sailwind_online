@@ -51,6 +51,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Sailwind.Online.Sync.Tests"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Sailwind.Architecture.Tests", "tests\Sailwind.Architecture.Tests\Sailwind.Architecture.Tests.csproj", "{EC225D97-418B-45F0-A867-51D92A7CBF33}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Sailwind.Api.SurfaceManifest.Tests", "tests\Sailwind.Api.SurfaceManifest.Tests\Sailwind.Api.SurfaceManifest.Tests.csproj", "{9DD5354D-7F70-4C1F-BC98-570351D29F43}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -116,6 +118,10 @@ Global
 		{EC225D97-418B-45F0-A867-51D92A7CBF33}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{EC225D97-418B-45F0-A867-51D92A7CBF33}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{EC225D97-418B-45F0-A867-51D92A7CBF33}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9DD5354D-7F70-4C1F-BC98-570351D29F43}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9DD5354D-7F70-4C1F-BC98-570351D29F43}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9DD5354D-7F70-4C1F-BC98-570351D29F43}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9DD5354D-7F70-4C1F-BC98-570351D29F43}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{B1EDA44C-FFA6-4602-8477-CFE4AD2C9B26} = {89CA8C0B-0102-4FC5-A8BA-F646CD71B0AA}
@@ -137,5 +143,6 @@ Global
 		{0CB41570-763C-420E-A090-66BA28076C7A} = {8B47A726-A518-48C0-B9EF-575E8B839430}
 		{B409547C-2222-4226-9502-BBD271E5D7C4} = {8B47A726-A518-48C0-B9EF-575E8B839430}
 		{EC225D97-418B-45F0-A867-51D92A7CBF33} = {8B47A726-A518-48C0-B9EF-575E8B839430}
+		{9DD5354D-7F70-4C1F-BC98-570351D29F43} = {8B47A726-A518-48C0-B9EF-575E8B839430}
 	EndGlobalSection
 EndGlobal

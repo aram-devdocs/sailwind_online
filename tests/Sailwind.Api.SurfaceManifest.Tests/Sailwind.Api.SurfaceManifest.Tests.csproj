@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sailwind.Api.SurfaceManifest.Tests</AssemblyName>
+    <RootNamespace>Sailwind.Api.SurfaceManifest.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- References NO repo projects and never loads the game assembly. It only
+         reads committed repo files (manifest/api-surface.json + .sha256) and a
+         source literal (SurfaceManifest.g.cs), so it stays game-free and runs in
+         the SailwindOnline.CI.slnf tier with no lib/ present. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+</Project>
