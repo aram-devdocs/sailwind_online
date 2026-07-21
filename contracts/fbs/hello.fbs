@@ -1,0 +1,34 @@
+// Connection handshake. The client announces its build, mod version, and API
+// surface hash; the server replies with identity, balance, capabilities, and
+// the shared world state a client needs before it can render anything.
+include "world.fbs";
+namespace SwProto;
+
+table CapabilityManifest {
+  protocol_version:ushort;
+  features:[string];
+  tick_hz:ubyte;
+  snapshot_hz:ubyte;
+  aoi_radius_cells:ubyte;
+  cell_size_m:float;
+}
+
+table ClientHello {
+  protocol_version:ushort;
+  display_name:string;
+  token:string;
+  game_build:string;
+  mod_version:string;
+  api_surface_hash:string;
+}
+
+table ServerHello {
+  accepted:bool;
+  reason:string;
+  player_id:ulong;
+  server_name:string;
+  balance_gold:long;
+  capabilities:CapabilityManifest;
+  clock:WorldClock;
+  weather:WeatherSeed;
+}

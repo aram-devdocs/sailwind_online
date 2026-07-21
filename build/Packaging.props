@@ -1,0 +1,38 @@
+<Project>
+
+  <!--
+    Shared package and provenance metadata. Projects that ship (NuGet or
+    Thunderstore) opt in by setting <IsPackable>true</IsPackable>; everything
+    else stays non-packable by default.
+
+    Game DLLs are never packed: all game/Unity/BepInEx references are
+    Private=false (see build/GameReferences.props), so they never reach the
+    output directory and cannot enter any package.
+  -->
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+
+    <Authors>Aram</Authors>
+    <Company>Aram</Company>
+    <Copyright>Copyright (c) 2026 Aram</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/aram-devdocs/sailwind_online</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/aram-devdocs/sailwind_online</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <!-- SourceLink: deterministic builds with source-linked symbols. -->
+  <PropertyGroup>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

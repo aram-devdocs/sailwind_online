@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sailwind.Api.SurfaceTests</AssemblyName>
+    <RootNamespace>Sailwind.Api.SurfaceTests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Not part of SailwindOnline.CI.slnf: the facts in SurfaceContract.g.cs need
+         lib/Assembly-CSharp.dll to mean anything, so this project runs locally /
+         self-hosted after `make setup`. It compiles game-free (Cecil reads a path
+         at runtime) — the game is never a compile reference. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+  </ItemGroup>
+
+</Project>

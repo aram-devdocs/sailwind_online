@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sailwind.ApiGen</AssemblyName>
+    <RootNamespace>Sailwind.ApiGen</RootNamespace>
+    <!-- ApiGen is game-free: Mono.Cecil reads Assembly-CSharp.dll as a file at
+         runtime; the game is never a compile-time reference. This is what lets
+         the tool live in the CI solution filter and build without lib/. -->
+    <IsPackable>false</IsPackable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+  </ItemGroup>
+
+</Project>

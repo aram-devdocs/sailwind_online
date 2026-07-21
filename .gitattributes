@@ -1,0 +1,23 @@
+* text=auto
+
+# LF for anything a POSIX shell or cross-platform toolchain executes or parses
+*.sh text eol=lf
+.githooks/* text eol=lf
+Makefile text eol=lf
+*.rs text eol=lf
+*.fbs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# CRLF for PowerShell (Windows-hosted scripts)
+*.ps1 text eol=crlf
+
+# Normalized text, platform-native line endings
+*.cs text
+*.md text
+*.json text
+
+# Binary assets
+*.dll binary
+*.png binary

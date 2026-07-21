@@ -1,0 +1,23 @@
+# Game IP and local machine state. Never commit (game DLLs, Steam content).
+lib/
+.sandbox/
+decompiled/
+.tools/
+
+# Build output
+artifacts/
+bin/
+obj/
+target/
+server/target/
+
+# Local agent state (project agent config IS committed; local settings are not)
+.claude/settings.local.json
+
+# Editor and user files
+*.user
+
+# Logs and OS noise
+*.log
+.DS_Store
+Thumbs.db

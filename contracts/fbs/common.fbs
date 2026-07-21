@@ -1,0 +1,7 @@
+// Sailwind Online wire contract — shared value types.
+// Source of truth. Generated C# and Rust are produced by flatc; never hand-edit output.
+namespace SwProto;
+
+struct Vec3 { x:float; y:float; z:float; }
+struct QuatC { x:float; y:float; z:float; w:float; }
+struct GridCell { cx:int; cz:int; }

@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/sw-contracts",
+    "crates/sw-net",
+    "crates/sw-world",
+    "crates/sw-econ",
+    "crates/sw-persist",
+    "crates/sw-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.86.0"
+
+[workspace.dependencies]
+flatbuffers = "=25.2.10"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rand = "0.9"
+
+# Internal crates
+sw-contracts = { path = "crates/sw-contracts" }
+sw-net = { path = "crates/sw-net" }
+sw-world = { path = "crates/sw-world" }
+sw-econ = { path = "crates/sw-econ" }
+sw-persist = { path = "crates/sw-persist" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

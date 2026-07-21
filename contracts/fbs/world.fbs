@@ -1,0 +1,5 @@
+// World clock and weather seed — server-authoritative, shared by all clients.
+namespace SwProto;
+
+table WorldClock { day:uint; time_of_day:float; moon_phase:float; }
+table WeatherSeed { seed:ulong; epoch_day:uint; }

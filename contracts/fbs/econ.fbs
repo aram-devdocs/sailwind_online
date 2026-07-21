@@ -1,0 +1,7 @@
+// Shared economy. Clients compute prices locally from server stock; a trade is a
+// reliable transaction the server applies to the authoritative ledger. Idempotent
+// by txn_id so an app-level resend never double-charges.
+namespace SwProto;
+
+table EconTxn { txn_id:ulong; amount_gold:long; kind:ubyte; note:string; }
+table LedgerAck { txn_id:ulong; accepted:bool; new_balance:long; reason:string; }

@@ -1,0 +1,10 @@
+// Positional state. Clients send ClientState at snapshot_hz; the server folds
+// nearby entities into a SnapshotDelta. Boats move slowly, so interpolation and
+// extrapolation on the client are forgiving.
+include "common.fbs";
+namespace SwProto;
+
+table PlayerState { player_id:ulong; pos:Vec3; rot:QuatC; aboard_boat:ulong; t_ms:uint; }
+table BoatState { boat_id:ulong; owner:ulong; pos:Vec3; rot:QuatC; vel:Vec3; t_ms:uint; }
+table ClientState { pos:Vec3; rot:QuatC; vel:Vec3; aboard_boat:ulong; t_ms:uint; }
+table SnapshotDelta { server_tick:uint; players:[PlayerState]; boats:[BoatState]; }

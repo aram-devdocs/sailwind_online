@@ -1,0 +1,104 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Pure C# tier: the game-free solution filter plus the always-run contract
+  # tests. No game DLLs ever enter cloud CI; the net472 plugins build locally.
+  dotnet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Guard - no game IP or binaries tracked
+        run: bash scripts/guard-no-game-ip.sh
+      - name: Build game-free solution filter
+        run: dotnet build SailwindOnline.CI.slnf -c Release
+      - name: Contract codec tests
+        run: dotnet test tests/Sailwind.Contracts.Tests -c Release
+
+  # Rust server workspace on both target OSes (home servers run on Windows).
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # Regenerate the committed FlatBuffers output from contracts/fbs and fail on
+  # any drift: a schema change must land with its regenerated code.
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned flatc
+        run: bash scripts/get-flatc.sh
+      - name: Regenerate C# and Rust from contracts/fbs
+        run: bash scripts/gen-contracts.sh
+      - name: Fail on drift
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated contracts drifted from contracts/fbs. Run 'make contracts' and commit the result."
+            exit 1
+          fi
+
+  # End-to-end conformance: real LiteNetLib client against the real Rust server
+  # over real FlatBuffers envelopes. Interop is milestone M3, so this job is
+  # allowed to fail for now without blocking the gate.
+  smoke:
+    needs: [dotnet, rust]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Build server (release)
+        working-directory: server
+        run: cargo build --release --bin sw-server
+      - name: Run protocol-smoke against the built server
+        run: dotnet run --project tools/protocol-smoke -c Release -- --server server/target/release/sw-server
+
+  # The single required status check. It is trivial and only turns green once
+  # its needs have all passed, so branch protection lists exactly this context.
+  gate:
+    needs: [dotnet, rust, contracts]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs passed
+        run: echo "dotnet, rust and contracts are green."

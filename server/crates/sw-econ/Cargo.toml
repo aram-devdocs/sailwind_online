@@ -1,0 +1,9 @@
+[package]
+name = "sw-econ"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Pure ledger logic over a storage trait — std only.

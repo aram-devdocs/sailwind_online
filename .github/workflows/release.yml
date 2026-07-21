@@ -1,0 +1,81 @@
+name: release
+
+# Tag-driven, three independently versioned artifacts:
+#   server-v*  -> Linux + Windows server binaries on the GitHub Release
+#   api-v*     -> Thunderstore SailwindAPI package
+#   client-v*  -> Thunderstore SailwindOnline package
+# Thunderstore jobs no-op green until lib/ and TCLI_AUTH_TOKEN are provisioned.
+
+on:
+  push:
+    tags: ['api-v*', 'client-v*', 'server-v*']
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  server-binaries:
+    if: startsWith(github.ref_name, 'server-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   archive: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Verify tag matches Cargo workspace version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#server-v}"
+          CARGO=$(grep -m1 '^version' server/Cargo.toml | cut -d'"' -f2)
+          if [ "$TAG" != "$CARGO" ]; then
+            echo "::error::tag $TAG does not match server/Cargo.toml version $CARGO"
+            exit 1
+          fi
+      - name: Build server (release)
+        working-directory: server
+        run: cargo build --release --target ${{ matrix.target }} --bin sw-server
+      - name: Package archive
+        shell: bash
+        run: bash scripts/package-server.sh "${{ matrix.target }}" "${{ matrix.archive }}"
+      - name: Upload to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" artifacts/release/* --clobber
+
+  thunderstore:
+    if: startsWith(github.ref_name, 'api-v') || startsWith(github.ref_name, 'client-v')
+    # ubuntu no-ops without lib/. Flip runs-on to a self-hosted runner that has
+    # the game installed once it exists; the same script runs locally today.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package + publish (no-ops without game DLLs / TCLI_AUTH_TOKEN)
+        shell: pwsh
+        env:
+          TCLI_AUTH_TOKEN: ${{ secrets.TCLI_AUTH_TOKEN }}
+        run: |
+          if (-not (Test-Path 'lib/Assembly-CSharp.dll')) {
+            Write-Host 'lib/ not provisioned - run scripts/package-thunderstore.ps1 locally or on a self-hosted runner. Exiting green.'
+            exit 0
+          }
+          $pkg = if ($env:GITHUB_REF_NAME.StartsWith('api-v')) { 'api' } else { 'client' }
+          pwsh scripts/package-thunderstore.ps1 -Package $pkg -Publish:([bool]$env:TCLI_AUTH_TOKEN)
+      - name: Upload zip as workflow artifact (when built)
+        if: hashFiles('artifacts/thunderstore/*.zip') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderstore-${{ github.ref_name }}
+          path: artifacts/thunderstore/*.zip

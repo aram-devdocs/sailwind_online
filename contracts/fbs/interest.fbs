@@ -1,0 +1,10 @@
+// Server-driven interest management. The server derives each client's grid cells
+// from its ClientState and pushes add/remove deltas plus per-cell snapshots. The
+// client never subscribes to arbitrary regions.
+include "common.fbs";
+include "snapshot.fbs";
+include "moorage.fbs";
+namespace SwProto;
+
+table AoiUpdate { added:[GridCell]; removed:[GridCell]; }
+table CellSnapshot { cell:GridCell; players:[PlayerState]; boats:[BoatState]; moorings:[MoorageRecord]; }

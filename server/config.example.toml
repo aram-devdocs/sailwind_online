@@ -1,0 +1,17 @@
+# Sailwind Online server configuration (init-0).
+# Copy to config.toml and adjust. Values shown are the built-in defaults.
+
+# UDP address the authoritative server binds to.
+bind = "0.0.0.0:38455"
+
+# SQLite database file (created + migrated at boot). WAL journal mode.
+db_path = "sailwind.db"
+
+# Fixed simulation / network pump rate in Hz.
+tick_hz = 30
+
+# Snapshot broadcast rate in Hz (advertised to clients in the capability manifest).
+snapshot_hz = 4
+
+# Human-readable server name returned in ServerHello.
+server_name = "Sailwind Online (dev)"

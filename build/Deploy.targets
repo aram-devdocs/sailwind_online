@@ -1,0 +1,41 @@
+<Project>
+
+  <!--
+    Deploy a built BepInEx plugin into the local Thunderstore Mod Manager
+    profile after a successful build.
+
+    A csproj opts in by setting <PluginName>. When $(SailwindProfile) exists on
+    disk, the plugin assembly and its ship-local payload DLLs are copied to
+    <profile>\BepInEx\plugins\<PluginName>\.
+
+    Default profile: the Thunderstore Mod Manager "Default" profile under
+    %APPDATA%. Override with -p:SailwindProfile=<path>. Disable deployment
+    entirely by pointing at a nonexistent path, e.g.
+    -p:SailwindProfile=C:\__nodeploy__ (the Exists check then skips the copy).
+  -->
+
+  <PropertyGroup>
+    <SailwindProfile Condition="'$(SailwindProfile)' == ''">$(APPDATA)\Thunderstore Mod Manager\DataFolder\Sailwind\profiles\Default</SailwindProfile>
+  </PropertyGroup>
+
+  <Target Name="DeployToSailwindProfile"
+          AfterTargets="Build"
+          Condition="'$(PluginName)' != '' and Exists('$(SailwindProfile)')">
+
+    <PropertyGroup>
+      <PluginDeployDir>$(SailwindProfile)\BepInEx\plugins\$(PluginName)</PluginDeployDir>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <DeployPayload Include="$(TargetPath)" />
+      <DeployPayload Include="@(ReferenceCopyLocalPaths)" Condition="'%(Extension)' == '.dll'" />
+    </ItemGroup>
+
+    <MakeDir Directories="$(PluginDeployDir)" />
+    <Copy SourceFiles="@(DeployPayload)"
+          DestinationFolder="$(PluginDeployDir)"
+          SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Deployed $(PluginName) -> $(PluginDeployDir)" />
+  </Target>
+
+</Project>

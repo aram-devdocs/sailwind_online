@@ -1,0 +1,24 @@
+name: pr-title
+
+# Advisory only. The "gate" check is the merge gate; this never becomes a
+# required status check. Squash-merge titles become Conventional Commits on
+# dev/main, keeping the door open for release automation later.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: pr-title-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: read
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

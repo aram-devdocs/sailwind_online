@@ -1,0 +1,5 @@
+// Presence chat. Broadcast is scoped to the sender's area-of-interest subscribers.
+namespace SwProto;
+
+table ChatSend { text:string; channel:ubyte; }
+table ChatBroadcast { player_id:ulong; display_name:string; text:string; channel:ubyte; t_ms:uint; }

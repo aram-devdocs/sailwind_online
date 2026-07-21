@@ -1,0 +1,14 @@
+<Project>
+
+  <!--
+    Single source of truth for the two C# product versions. Release tags
+    api-v* and client-v* are asserted against these values by the release
+    workflow. The Rust server versions independently through server/Cargo.toml.
+  -->
+
+  <PropertyGroup>
+    <SailwindApiVersion>0.1.0</SailwindApiVersion>
+    <SailwindOnlineVersion>0.1.0</SailwindOnlineVersion>
+  </PropertyGroup>
+
+</Project>

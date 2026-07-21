@@ -1,0 +1,9 @@
+{
+  "name": "SailwindAPI",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/aram-devdocs/sailwind_online",
+  "description": "Generated, version-checked mod API for Sailwind. Stable interfaces and events over the game internals; fails loudly on game updates instead of crashing.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2305"
+  ]
+}

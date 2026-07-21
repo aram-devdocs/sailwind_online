@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Fast, deterministic pre-commit gate. Keep it quick: heavy build/test work
+# belongs in pre-push (make check) and CI, not here.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# 1. AGENTS.md / CLAUDE.md parity. A drifted copy misleads half the tools.
+if ! git diff --no-index --quiet AGENTS.md CLAUDE.md; then
+  echo "pre-commit: AGENTS.md and CLAUDE.md differ." >&2
+  echo "  Run: cp AGENTS.md CLAUDE.md   (then re-stage CLAUDE.md)" >&2
+  exit 1
+fi
+
+# 2. Game-IP guard, when the build lens has provided it. No game DLL, path, or
+#    decompiled source may ever be committed.
+if [ -f scripts/guard-no-game-ip.sh ]; then
+  bash scripts/guard-no-game-ip.sh
+fi
+
+exit 0

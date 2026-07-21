@@ -1,0 +1,29 @@
+<Project>
+
+  <!--
+    Game-coupled references. Imported ONLY by the two net472 BepInEx plugins
+    (Sailwind.API and Sailwind.Online.Client). No other project imports this
+    file, which is what lets cloud CI build the game-free tier without any game
+    DLL present.
+
+    Every reference resolves from the gitignored $(Lib) directory populated by
+    scripts/setup-game. All game, Unity, and BepInEx assemblies are Private=false:
+    they exist at runtime inside the game process and MUST NOT be copied into
+    plugin output or any package. Game IP never leaves the local machine.
+  -->
+
+  <ItemGroup>
+    <PackageReference Include="BepInEx.AssemblyPublicizer.MSBuild" Version="0.4.3" PrivateAssets="all" />
+
+    <Reference Include="Assembly-CSharp" HintPath="$(Lib)\Assembly-CSharp.dll" Publicize="true" Private="false" />
+    <Reference Include="Assembly-CSharp-firstpass" HintPath="$(Lib)\Assembly-CSharp-firstpass.dll" Private="false" />
+    <Reference Include="Crest" HintPath="$(Lib)\Crest.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(Lib)\UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(Lib)\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.PhysicsModule" HintPath="$(Lib)\UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="UnityEngine.IMGUIModule" HintPath="$(Lib)\UnityEngine.IMGUIModule.dll" Private="false" />
+    <Reference Include="BepInEx" HintPath="$(Lib)\BepInEx.dll" Private="false" />
+    <Reference Include="0Harmony" HintPath="$(Lib)\0Harmony.dll" Private="false" />
+  </ItemGroup>
+
+</Project>

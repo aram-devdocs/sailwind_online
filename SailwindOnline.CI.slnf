@@ -1,0 +1,11 @@
+{
+  "solution": {
+    "path": "SailwindOnline.sln",
+    "projects": [
+      "contracts\\cs\\Sailwind.Contracts\\Sailwind.Contracts.csproj",
+      "tools\\Sailwind.ApiGen\\Sailwind.ApiGen.csproj",
+      "tools\\protocol-smoke\\Sailwind.ProtocolSmoke.csproj",
+      "tests\\Sailwind.Contracts.Tests\\Sailwind.Contracts.Tests.csproj"
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Fast gate. Always runs the game-free tier and the Rust checks; when the game
+# DLLs are present locally (lib/Assembly-CSharp.dll), it also builds the full
+# solution and the game-coupled surface tests. Exits non-zero on any failure.
+#
+# CI runs the same underlying commands, so a green check here means the same
+# thing as a green pipeline.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+echo "==> AGENTS.md / CLAUDE.md parity"
+if ! git diff --no-index --quiet AGENTS.md CLAUDE.md; then
+  echo "error: AGENTS.md and CLAUDE.md differ. Run: cp AGENTS.md CLAUDE.md" >&2
+  exit 1
+fi
+
+echo "==> guard: no game IP tracked"
+bash scripts/guard-no-game-ip.sh
+
+echo "==> build game-free solution filter (Release)"
+dotnet build SailwindOnline.CI.slnf -c Release
+
+echo "==> game-free dotnet tests"
+dotnet test tests/Sailwind.Contracts.Tests -c Release
+
+echo "==> cargo fmt (check)"
+cargo fmt --all --check --manifest-path server/Cargo.toml
+
+echo "==> cargo clippy (-D warnings)"
+cargo clippy --workspace --all-targets --manifest-path server/Cargo.toml -- -D warnings
+
+echo "==> cargo test"
+cargo test --workspace --manifest-path server/Cargo.toml
+
+if [ -f lib/Assembly-CSharp.dll ]; then
+  echo "==> lib/ present: full solution build (Release)"
+  dotnet build SailwindOnline.sln -c Release
+  echo "==> game-coupled surface tests"
+  dotnet test tests/Sailwind.Api.SurfaceTests -c Release
+else
+  echo "==> lib/Assembly-CSharp.dll absent: skipping game-coupled tier (runs locally / self-hosted)."
+fi
+
+echo "check: all gates passed."

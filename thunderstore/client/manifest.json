@@ -1,0 +1,10 @@
+{
+  "name": "SailwindOnline",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/aram-devdocs/sailwind_online",
+  "description": "Persistent shared seas for Sailwind: see other sailors, moor your boat in a living harbor, trade in a shared economy. Requires a Sailwind Online server.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2305",
+    "aram_devdocs-SailwindAPI-0.1.0"
+  ]
+}

@@ -1,0 +1,33 @@
+// Top-level frame. Every datagram payload is one Envelope carrying a sequence
+// number and a Payload union. The protocol version is not encoded here — it rides
+// in ClientHello/ServerHello and is stamped as a generated constant per language
+// (contracts/PROTOCOL_VERSION), so client and server refuse a mismatch at handshake.
+include "hello.fbs";
+include "snapshot.fbs";
+include "interest.fbs";
+include "moorage.fbs";
+include "econ.fbs";
+include "chat.fbs";
+include "world.fbs";
+namespace SwProto;
+
+union Payload {
+  ClientHello,
+  ServerHello,
+  ClientState,
+  SnapshotDelta,
+  AoiUpdate,
+  CellSnapshot,
+  MoorRequest,
+  MoorAck,
+  EconTxn,
+  LedgerAck,
+  ChatSend,
+  ChatBroadcast,
+  WorldClock
+}
+
+table Envelope { seq:uint; payload:Payload; }
+
+root_type Envelope;
+file_identifier "SWO0";

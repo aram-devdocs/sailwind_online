@@ -1,0 +1,10 @@
+[package]
+name = "sw-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Intentionally std-only: the init-0 transport is a single-threaded, poll-driven
+# UDP host. No tokio, no mio (see spec-tech.md section 4).

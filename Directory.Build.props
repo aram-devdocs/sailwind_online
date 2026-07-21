@@ -1,0 +1,18 @@
+<Project>
+
+  <!-- Universal MSBuild base for every C# project in the repo. Game references
+       live only in build/GameReferences.props, imported solely by the two net472
+       game-coupled plugins, which is what lets CI build without the game. -->
+  <PropertyGroup>
+    <RepoRoot>$([MSBuild]::EnsureTrailingSlash('$(MSBuildThisFileDirectory)'))</RepoRoot>
+    <Lib>$(RepoRoot)lib</Lib>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

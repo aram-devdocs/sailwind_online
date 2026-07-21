@@ -1,0 +1,26 @@
+[package]
+name = "sailwind-online-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sw-server"
+path = "src/main.rs"
+
+[dependencies]
+sw-contracts.workspace = true
+sw-net.workspace = true
+sw-world.workspace = true
+sw-econ.workspace = true
+sw-persist.workspace = true
+
+flatbuffers.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true
+rand.workspace = true
+ctrlc = "3"

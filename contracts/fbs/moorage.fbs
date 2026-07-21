@@ -1,0 +1,9 @@
+// Persistent boats. A moored boat becomes a lightweight record that survives its
+// owner's disconnect and the server restart; it rehydrates into a real boat only
+// inside a nearby player's area of interest.
+include "common.fbs";
+namespace SwProto;
+
+table MoorageRecord { boat_id:ulong; owner:ulong; cell:GridCell; pos:Vec3; rot:QuatC; name:string; created_at:ulong; }
+table MoorRequest { pos:Vec3; rot:QuatC; name:string; }
+table MoorAck { accepted:bool; record:MoorageRecord; reason:string; }
