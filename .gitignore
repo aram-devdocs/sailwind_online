@@ -13,6 +13,8 @@ server/target/
 
 # Local agent state (project agent config IS committed; local settings are not)
 .claude/settings.local.json
+# Per-session hook state (role marker, one-time-block flags); runtime-only.
+.claude/state/
 
 # Editor and user files
 *.user

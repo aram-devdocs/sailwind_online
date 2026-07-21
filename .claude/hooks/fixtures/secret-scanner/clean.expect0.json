@@ -1,0 +1,1 @@
+{"tool_name":"Write","tool_input":{"file_path":"src/Ship.cs","content":"public sealed class Ship { public int Masts; }"}}

@@ -35,6 +35,8 @@ jobs:
           bash scripts/check-no-leak.sh
       - name: Game-IP guard
         run: bash scripts/guard-no-game-ip.sh
+      - name: Governance hook golden-fixture suite
+        run: bash scripts/test-hooks.sh
 
   # Pure C# tier: the game-free solution filter and every game-free test project
   # (contracts, net, sync, and the Cecil architecture DAG). No game DLLs ever

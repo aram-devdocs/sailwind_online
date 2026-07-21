@@ -19,6 +19,9 @@ bash scripts/check-no-leak.sh
 echo "==> guard: no game IP tracked"
 bash scripts/guard-no-game-ip.sh
 
+echo "==> governance hook golden-fixture suite"
+bash scripts/test-hooks.sh
+
 echo "==> build game-free solution filter (Release)"
 dotnet build SailwindOnline.CI.slnf -c Release
 

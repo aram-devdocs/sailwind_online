@@ -1,0 +1,1 @@
+{"tool_name":"Write","tool_input":{"file_path":"server/.env","content":"DB_PASSWORD=hunter2hunter2\nAPI_TOKEN=abcd1234efgh5678\n"}}

@@ -1,0 +1,1 @@
+{"tool_name":"Write","tool_input":{"file_path":"deploy/id_rsa","content":"-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU\n-----END OPENSSH PRIVATE KEY-----\n"}}
