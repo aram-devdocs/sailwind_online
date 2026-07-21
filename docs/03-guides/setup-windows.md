@@ -17,37 +17,48 @@ not which build number.
   build for you, so a manual install is optional.
 - Git with Git Bash, because the hooks and shell scripts run under bash.
 - For the game-coupled build only: a Steam copy of Sailwind and the Thunderstore
-  Mod Manager with a mod profile, so setup can find the game assemblies and
-  BepInEx core, and deploy can copy the plugin into a running install.
+  Mod Manager with a mod profile, so setup can find the game assemblies and the
+  BepInEx core.
 
 ## Provisioning
 
-Run `make setup`. It locates the Steam install of the game, mirrors what it
-needs into the gitignored sandbox and `lib/` directories, and pulls the BepInEx
-core assemblies from your mod profile. Game files never enter git; `lib/` and
-the sandbox are gitignored by design.
+Run `make setup`. It locates the Steam install of the game, copies the game
+assemblies and the BepInEx core it needs into the gitignored `lib/` directory,
+and records the Steam build id there. Game files never enter git; `lib/` is
+gitignored by design, so nothing derived from game IP is ever committed.
 
-On a machine without the game installed, `make setup` fails with a clear
-message rather than half-provisioning. That is expected: the game-free build
-below does not need it.
+On a machine without the game installed, `make setup` fails with a clear message
+rather than half-provisioning. That is expected: the game-free gate below does
+not need it.
 
-## Building
+## Validating and building
 
-- `make check` is the fast gate: it builds the game-free projects with warnings
-  as errors and runs the game-free test suites plus the Rust checks. It needs no
-  game IP and is what CI runs.
-- `make build` builds the full solution, including the game-coupled plugins, and
-  requires `lib/` from setup.
-- `make audit` runs the full dashboard, including the game-coupled test suites
-  when the game assemblies are present locally.
+- `make validate` is the canonical gate and mirrors CI. It runs the convention
+  and leak checks, the game-IP guard, the governance-hook fixtures, the
+  warnings-as-errors game-free build, every game-free test suite, and the Rust
+  format, lint, and test steps. Where `lib/` is present it also builds the full
+  solution and runs the game-coupled surface tests. Run it before every push,
+  because a green run locally is defined to mean a green pipeline.
+- `make build` builds the full solution in Release, including the game-coupled
+  plugins, and needs `lib/` from setup.
+- `make build-ci` builds the game-free solution filter only, which is what a
+  machine without game IP can build.
 
-## Sandbox and deploy
+## Test profile and deploy
 
-Setup produces a sandbox: a local mirror of the pieces the plugins need to
-build and a target the deploy step writes into. `make deploy` builds the plugins
-and copies them into your Thunderstore mod profile, so launching the game
-through the mod manager loads your freshly built plugin. A build-time switch
-disables the copy when you want to build without deploying.
+Deploying into the game is opt-in and always isolated from your own mods.
+
+- `make test-profile` creates a dedicated `SailwindOnline` Thunderstore mod
+  profile next to your own. It copies the BepInEx core and loader from an
+  existing profile into a fresh one with an empty plugins folder, so your own
+  profile and its mod set are never touched.
+- `make deploy` builds Release with the deploy switch on (`-p:Deploy=true`) and
+  copies the freshly built plugins into that `SailwindOnline` profile. The
+  switch is off by default, so an ordinary build never writes into a game
+  profile.
+- `make run-modded` starts the local server and launches Sailwind modded from
+  the `SailwindOnline` profile, so you can exercise the plugins end to end
+  without disturbing your normal modded game.
 
 ## Running the server
 
