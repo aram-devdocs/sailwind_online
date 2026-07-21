@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Game-free verification of the `dotnet new sailwind-mod` template pack. The
+    scaffolded MOD is a net472 BepInEx plugin (game-coupled), but generating it
+    from the pack and inspecting its shape needs no game DLL, so this runs in
+    cloud CI and proves the template without lib/.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sailwind.Templates.Tests</AssemblyName>
+    <RootNamespace>Sailwind.Templates.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+</Project>

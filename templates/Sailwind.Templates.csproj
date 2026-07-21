@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NuGet template pack for `dotnet new sailwind-mod`. It ships the template under
+    ./sailwind-mod as package content and compiles no code of its own, so it is
+    game-free and builds in cloud CI. The scaffolded MOD is a net472 BepInEx plugin
+    (game-coupled), but generating it from this pack is not.
+
+    Pack with `dotnet pack`; install the folder directly for local use with
+    `dotnet new install ./templates/sailwind-mod` (see the Makefile `template` target).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageType>Template</PackageType>
+    <PackageId>Sailwind.Templates</PackageId>
+    <Title>Sailwind mod templates</Title>
+    <Description>`dotnet new` templates for building a Sailwind mod against the public Sailwind.API surface.</Description>
+    <PackageTags>dotnet-new;templates;sailwind;bepinex;mod</PackageTags>
+    <Authors>Aram</Authors>
+    <IsPackable>true</IsPackable>
+
+    <IncludeContentInPack>true</IncludeContentInPack>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <ContentTargetFolders>content</ContentTargetFolders>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <NoDefaultExcludes>true</NoDefaultExcludes>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+
+    <!-- Compile none of the template content: the content .cs is a plugin, not part of
+         this pack's own (empty) assembly. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <EnableDefaultContentItems>false</EnableDefaultContentItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="sailwind-mod\**\*" Exclude="sailwind-mod\**\bin\**;sailwind-mod\**\obj\**" />
+  </ItemGroup>
+
+</Project>

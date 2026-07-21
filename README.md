@@ -69,6 +69,29 @@ wind, the player's boat, save load and write) instead of raw reflection into
 update turns into a clear, isolated warning rather than a crash. Build against it
 so your mod and Sailwind Online can coexist and integrate.
 
+### Write your own mod
+
+Two starting points build against the public `Sailwind.API` surface and nothing
+else, which is what keeps a mod working across game updates:
+
+- `samples/Sailwind.Mod.Sample` is a worked example plugin. It hard-depends on the
+  Sailwind.API host, waits for the `Ready` signal, then reads the clock, the wind,
+  and the player's boat through the public interfaces. It is one short, commented
+  file that shows the whole consumer contract.
+- `templates/sailwind-mod` is a `dotnet new` template that scaffolds the same shape
+  in one command:
+
+```sh
+dotnet new install ./templates/sailwind-mod   # or: make template
+dotnet new sailwind-mod --name My.Cool.Mod
+```
+
+The scaffolded project is a BepInEx plugin (net472) that references the
+`Sailwind.Api.Abstractions` DLL shipped by the Sailwind.API host plugin. Point the
+two paths at the top of the generated `.csproj` at your install, run `dotnet build`,
+and drop the result into your BepInEx `plugins` folder. Your mod never touches the
+game assembly directly; it reads the game only through Sailwind.API.
+
 ## What works today
 
 - The client plugin loads in-game and passes its startup compatibility check.

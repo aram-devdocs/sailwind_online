@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Sailwind.Mod.Sample — a worked example mod. It is a BepInEx plugin (net472) that
+    consumes ONLY the public Sailwind.API surface: the Sailwind.Api.Abstractions facade
+    (SailwindApi) and its reader interfaces. It never references the game assembly
+    (Assembly-CSharp) and never reaches into internal packages — a modder depends on
+    exactly this much.
+
+    Game-coupled only in that it needs BepInEx + the Unity engine to be a plugin, so it
+    references those from the gitignored lib/ (Private=false, never shipped) and is kept
+    OUT of SailwindOnline.CI.slnf. It builds in the local full-solution tier where lib/ is
+    present, exactly like apps/Sailwind.Online.Client. The template under templates/sailwind-mod
+    mirrors this project for `dotnet new`.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>Sailwind.Mod.Sample</AssemblyName>
+    <RootNamespace>Sailwind.Mod.Sample</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!-- net472 reference assemblies: compile hermetically without a machine-wide targeting pack. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- The public consumer surface, and the ONLY Sailwind.* edge. The Sailwind.API host plugin
+       ships the canonical Sailwind.Api.Abstractions.dll at runtime, so reference it Private=false:
+       the sample depends on the API but does not duplicate its DLL. -->
+  <ItemGroup>
+    <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" Private="false" />
+  </ItemGroup>
+
+  <!-- Just enough of the host to BE a BepInEx plugin: BepInEx (the plugin base, config, and
+       logging) and the Unity engine (the MonoBehaviour lifecycle). From lib/, Private=false:
+       they exist inside the game process and never leave the machine. NOTE: deliberately no
+       Assembly-CSharp reference — a mod reads the game only through Sailwind.API. -->
+  <ItemGroup>
+    <Reference Include="BepInEx" HintPath="$(Lib)\BepInEx.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(Lib)\UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(Lib)\UnityEngine.CoreModule.dll" Private="false" />
+  </ItemGroup>
+
+</Project>
