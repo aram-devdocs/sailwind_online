@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The mod-API contract other mods depend on: pure interfaces + POCOs (IGameClock,
+    IWindReader, IPlayerBoatReader, ISaveEvents, BoatPose, ApiCompat, SurfaceMember)
+    and the SailwindApi static facade. GAME-FREE by construction: zero UnityEngine /
+    Assembly-CSharp reference (poses use System.Numerics), so it builds in CI without
+    lib/ and is unit-testable. The concrete adapters live in Sailwind.Api.Adapters.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Sailwind.Api.Abstractions</AssemblyName>
+    <RootNamespace>Sailwind.Api</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System.Numerics.Vector3/Quaternion for BoatPose. Not in the netstandard2.0
+         default reference set; flows transitively to the net/sync packages. On net472
+         (the game process) this binds to the in-box System.Numerics.Vectors. -->
+    <PackageReference Include="System.Numerics.Vectors" Version="4.5.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The Sailwind.API app is the composition root that arms the facade's
+         internal setters and Ready signal. The sync tests drive StateReporter, which
+         reads SailwindApi.PlayerBoat, so they arm that same internal setter. -->
+    <InternalsVisibleTo Include="Sailwind.API" />
+    <InternalsVisibleTo Include="Sailwind.Online.Sync.Tests" />
+  </ItemGroup>
+
+</Project>

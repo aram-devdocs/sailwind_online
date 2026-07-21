@@ -9,9 +9,14 @@ between the client and the server.
 - `contracts/` holds the FlatBuffers schemas (`fbs/`), the generated C# runtime
   and bindings (`cs/`), and the pinned toolchain metadata. This is the single
   shared vocabulary between client and server.
-- `src/` holds the engine-facing C# plugins: `Sailwind.API` (the contract layer
-  over the game) and `Sailwind.Online.Client` (the multiplayer client plugin).
-  These are the only projects that reference game assemblies.
+- `packages/` holds the C# libraries that define behaviour. The pure ones build
+  game-free (`api-abstractions` — the mod-API contract; `net` — transport + wire
+  codec; `sync` — the snapshot cache and state reporter), and `api-adapters` is
+  the one game-coupled package (the reflection binders over the game assembly).
+- `apps/` holds the two thin net472 BepInEx plugins that compose those packages:
+  `Sailwind.API` (the contract layer over the game) and `Sailwind.Online.Client`
+  (the multiplayer client plugin). The apps and `api-adapters` are the only
+  projects that reference game assemblies.
 - `server/` holds the Rust cargo workspace: the authoritative server and its
   supporting crates (networking, world grid, economy, persistence, contracts
   bindings).

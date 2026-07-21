@@ -24,6 +24,8 @@ dotnet build SailwindOnline.CI.slnf -c Release
 
 echo "==> game-free dotnet tests"
 dotnet test tests/Sailwind.Contracts.Tests -c Release
+dotnet test tests/Sailwind.Online.Net.Tests -c Release
+dotnet test tests/Sailwind.Online.Sync.Tests -c Release
 
 echo "==> cargo fmt (check)"
 cargo fmt --all --check --manifest-path server/Cargo.toml

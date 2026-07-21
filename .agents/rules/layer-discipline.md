@@ -13,5 +13,6 @@ alwaysApply: true
 - Apps and plugins stay thin composition layers, because logic that lives in a
   composition root cannot be unit-tested game-free.
 - Game-touching code lives only in the designated engine-facing projects
-  (`src/Sailwind.API`, `src/Sailwind.Online.Client`), because every other
-  project MUST build in CI without game IP present.
+  (`apps/Sailwind.API`, `apps/Sailwind.Online.Client`, and the game-coupled
+  `packages/api-adapters`), because every other project — the pure packages
+  under `packages/` — MUST build in CI without game IP present.

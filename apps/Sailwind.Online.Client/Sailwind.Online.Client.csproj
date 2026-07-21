@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Sailwind Online — the MMO client BepInEx plugin (net472). Thin composition root:
+    hard-depends on Sailwind.API for all game reads, drives the pure Net + Sync
+    packages each frame, and owns the Unity IMGUI HUD. Game-coupled: imports
+    build/GameReferences.props (Unity + game DLLs from lib/) and build/Deploy.targets.
+    Cannot build in cloud CI (needs lib/ + a built Sailwind.API); intentionally absent
+    from SailwindOnline.CI.slnf and builds only where lib/ exists.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>Sailwind.Online.Client</AssemblyName>
+    <RootNamespace>Sailwind.Online.Client</RootNamespace>
+    <PluginName>SailwindOnline</PluginName>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!-- Reference assemblies so net472 compiles hermetically without a machine-wide targeting pack. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Game / Unity / BepInEx references (Publicize on Assembly-CSharp); all Private=false. -->
+  <Import Project="$(RepoRoot)build/GameReferences.props" />
+
+  <!-- Networking: real LiteNetLib 1.3.1 (net471/netstandard2.0 line, Unity/Mono compatible).
+       Private=true => ships beside the plugin. -->
+  <ItemGroup>
+    <PackageReference Include="LiteNetLib" Version="1.3.1" Private="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Pure transport + sync packages; ship in the plugin folder. -->
+    <ProjectReference Include="$(RepoRoot)packages/net/Sailwind.Online.Net/Sailwind.Online.Net.csproj" Private="true" />
+    <ProjectReference Include="$(RepoRoot)packages/sync/Sailwind.Online.Sync/Sailwind.Online.Sync.csproj" Private="true" />
+    <!-- FlatBuffers wire contracts; ships in the plugin folder. -->
+    <ProjectReference Include="$(RepoRoot)contracts/cs/Sailwind.Contracts/Sailwind.Contracts.csproj" Private="true" />
+    <!-- The mod-API contract. Host (Sailwind.API) ships the canonical copy, but shipping
+         a byte-identical copy here is harmless (single load by assembly name in Mono),
+         mirroring how the contracts DLL is shipped by both plugins. -->
+    <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" Private="true" />
+  </ItemGroup>
+
+  <!-- Post-build deploy into the Thunderstore profile (uses <PluginName>). -->
+  <Import Project="$(RepoRoot)build/Deploy.targets" />
+
+</Project>

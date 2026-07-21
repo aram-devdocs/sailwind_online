@@ -32,7 +32,8 @@ namespace Sailwind.ApiGen
         public string GameAssembly => Path.Combine(Root, "lib", "Assembly-CSharp.dll");
         public string GameBuildFile => Path.Combine(Root, "lib", "game-build.txt");
 
-        public string GeneratedDir => Path.Combine(Root, "src", "Sailwind.API", "Generated");
+        public string GeneratedDir =>
+            Path.Combine(Root, "packages", "api-adapters", "Sailwind.Api.Adapters", "Generated");
         public string GameRefFile => Path.Combine(GeneratedDir, "GameRef.g.cs");
         public string SurfaceManifestFile => Path.Combine(GeneratedDir, "SurfaceManifest.g.cs");
 
