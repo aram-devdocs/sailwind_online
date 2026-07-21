@@ -16,6 +16,6 @@ globs: ["docs/**", "*.md"]
   of `docs/` stays timeless.
 - No PM artifacts belong in the repo (status pages, dev logs, plan or backlog
   files), because GitHub issues and PRs are the durable state store. The only
-  sanctioned exception is `.claude/lessons-learned.md`.
+  sanctioned exception is `.agents/lessons-learned.md`.
 - The README MUST index every file under `docs/`, because an unindexed doc is
   a doc nobody finds.

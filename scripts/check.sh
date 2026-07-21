@@ -10,11 +10,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-echo "==> AGENTS.md / CLAUDE.md parity"
-if ! git diff --no-index --quiet AGENTS.md CLAUDE.md; then
-  echo "error: AGENTS.md and CLAUDE.md differ. Run: cp AGENTS.md CLAUDE.md" >&2
-  exit 1
-fi
+echo "==> instruction-layer conventions"
+bash scripts/check-conventions.sh
+
+echo "==> leak guard"
+bash scripts/check-no-leak.sh
 
 echo "==> guard: no game IP tracked"
 bash scripts/guard-no-game-ip.sh

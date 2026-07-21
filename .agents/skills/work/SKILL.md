@@ -81,7 +81,7 @@ If nothing is selectable, report that and stop.
 ### 5. Implement
 
 - Read the issue body fully: acceptance criteria, blockers, linked docs.
-- Discovery first: read the files and `.claude/rules/` entries that govern
+- Discovery first: read the files and `.agents/rules/` entries that govern
   the area before editing anything.
 - Write tests with the code, not after it. A change without a test needs a
   stated reason in the PR body.
@@ -113,7 +113,7 @@ If nothing is selectable, report that and stop.
 
 When the task surfaced a non-obvious fact (a game type behaves unexpectedly,
 a tool needs a flag, a Windows trap), append one dated line to
-`.claude/lessons-learned.md` inside the same PR. Skip when there is nothing
+`.agents/lessons-learned.md` inside the same PR. Skip when there is nothing
 new; an empty entry is noise.
 
 ### 9. Report

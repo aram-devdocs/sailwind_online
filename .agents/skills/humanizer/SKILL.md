@@ -13,7 +13,7 @@ allowed-tools: [Read, Edit, Grep]
 ## Purpose
 
 Make repository prose read like a person wrote it. The banned-vocabulary rule
-in `.claude/rules/documentation.md` is the gate; this skill is the technique
+in `.agents/rules/documentation.md` is the gate; this skill is the technique
 for passing it and for catching the softer tells the lint cannot see.
 
 ## Process
