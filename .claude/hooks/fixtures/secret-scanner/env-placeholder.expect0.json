@@ -1,0 +1,1 @@
+{"tool_name":"Write","tool_input":{"file_path":"server/.env.example","content":"# copy to .env and fill in\nPORT=8080\nDB_PASSWORD=\n"}}
