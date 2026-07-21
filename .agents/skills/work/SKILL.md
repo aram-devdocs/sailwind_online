@@ -1,50 +1,72 @@
 ---
 name: work
-version: 1.0.0
+version: 2.0.0
 description: |
-  Self-directed issue loop for this repository. Checks repo and board state,
-  picks the highest-priority unblocked GitHub issue, branches from dev,
-  implements with tests, opens a PR to dev, records lessons learned, and
-  reports. One issue per invocation.
+  The top-level self-driving loop. Orients against repo and run state, resumes
+  an active run or selects the highest-priority unblocked GitHub issue, routes
+  large issues through /gh-runbook and the rest straight to /gh-issue, drives
+  the issue to a green PR against dev through gated subagent phases, mirrors the
+  review locally with /gh-review, records lessons, reports, and stops. One
+  issue per invocation; does not merge its own PR.
+user-invocable: true
 ---
 
 # Work
 
 ## Purpose
 
-Drive one GitHub issue from open to a green pull request against `dev`
-without human steering. The issue list is the backlog; this skill is the
-executor.
+Drive one GitHub issue from open to a green pull request against `dev` without
+human steering, as a durable, resumable, subagent-driven run. The issue list is
+the backlog; this skill is the executor. The heavy lifting lives in
+`/gh-issue`; this loop selects the work, resumes crashed runs, and enforces the
+one-issue-per-invocation discipline.
+
+Reference: `/gh-runbook` (decomposing a large issue), `/gh-issue` (the
+per-issue lifecycle), `/gh-review` (the local review mirror), and
+`.agents/rules/subagent-workflow.md` plus the `subagent-driven-development`
+guidance (the orchestrator delegates, never implements).
 
 ## Preconditions
 
 Stop and report instead of proceeding when any of these fail:
 
 - `gh auth status` shows the aram-devdocs account.
-- `AGENTS.md` has been read this session.
-- The worktree state from step 1 has been reconciled.
+- `AGENTS.md` and the applicable `.agents/rules/` have been read this session.
+- The orient step below has reconciled any prior run.
 
 ## Process
 
-### 1. Orient (re-entry check)
+### 1. Orient and resume (re-entry first, always)
 
-Never assume a fresh world. A previous run may have died mid-task, and a
-worktree that is complete but uncommitted is the classic failure mode. In
-order:
+Never assume a fresh world. A previous run may have died mid-task; resume reads
+disk, not memory. In order:
 
     git fetch origin
     git status --porcelain
-    git branch --show-current
-    gh pr list --base dev --state open --json number,title,headRefName,statusCheckRollup
 
-- Dirty worktree on a `feat/*` branch: inspect the diff against the matching
-  issue, then finish, commit, or discard deliberately. Never blind-reset.
-- An open PR whose branch matches an issue you would pick: that issue is
-  taken. Resume it only when its CI is red and nothing else is active;
-  otherwise pick the next issue.
-- Clean state: `git switch dev && git pull --ff-only`.
+Then check for an active run:
+
+    cat .agents/runs/active 2>/dev/null
+
+If a run is active, do NOT start a new one. Reconcile it and resume:
+
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py validate-resume
+
+`validate-resume` reconciles the recorded phase against reality (worktree
+present and clean or dirty, branch exists, PR state, outstanding gates) and
+prints an action list. Hand the active run back to `/gh-issue`, which resumes
+from the earliest phase whose reality is incomplete. A complete-but-uncommitted
+worktree is the classic dead-run trap: inspect the diff, then finish or discard
+deliberately, never blind-reset. When the resumed run reaches `done`, report
+and stop; do not also pick a new issue this invocation.
+
+If no run is active and the tree is clean:
+
+    git switch dev && git pull --ff-only
 
 ### 2. Select an issue
+
+Only when no run is active.
 
     gh issue list --state open --limit 100 --json number,title,labels,milestone,assignees
 
@@ -59,7 +81,7 @@ Skip an issue when any of these hold:
 - It carries the `blocked` label.
 - Its body says `Blocked by #N` and issue N is still open
   (`gh issue view N --json state`).
-- It is assigned and shows activity newer than 24 hours.
+- It is assigned and shows activity newer than 24 hours (claimed).
 - An open PR already references it.
 
 If nothing is selectable, report that and stop.
@@ -69,62 +91,55 @@ If nothing is selectable, report that and stop.
     gh issue edit <N> --add-assignee @me
     gh issue comment <N> --body "Picking this up. Branch: feat/<N>-<slug>"
 
-### 4. Branch
+`<slug>` is 2-4 kebab-case words from the issue title.
 
-    git switch dev
-    git pull --ff-only
-    git switch -c feat/<N>-<slug>
+### 4. Route
 
-`<slug>` is 2-4 kebab-case words from the issue title. Never branch from
-`main`, never work directly on `dev`.
+Read the issue body fully first, then choose the path:
 
-### 5. Implement
+- **Large issue** (multiple deliverables, needs decomposition into ordered
+  sub-issues or a phased plan): delegate to `/gh-runbook`. It breaks the work
+  down and files or sequences the pieces; this loop then drives the first
+  actionable piece through `/gh-issue`.
+- **Right-sized issue** (a single coherent change): go straight to `/gh-issue`.
 
-- Read the issue body fully: acceptance criteria, blockers, linked docs.
-- Discovery first: read the files and `.agents/rules/` entries that govern
-  the area before editing anything.
-- Write tests with the code, not after it. A change without a test needs a
-  stated reason in the PR body.
-- Run `make check` after each meaningful step, not only at the end.
-- Stay inside the issue scope. File a new issue for adjacent problems you
-  find; do not fix them silently.
+### 5. Drive /gh-issue to a green PR
 
-### 6. Verify
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue <N> --slug <slug>
 
-- `make check` MUST pass locally before pushing, because CI runs the same
-  gates and a red push wastes a round trip.
-- Attempt cap: three fix cycles on the same failure, then Escalate.
-- Never `--no-verify`. Never weaken a test or rule to pass.
+Then run the `/gh-issue` lifecycle: investigate -> plan -> implement -> verify
+-> review -> pr -> wait-ci -> cleanup -> done. Every transition goes through
+`gh_issue_run.py`; the `implement` phase dispatches `01-implementer` (the
+orchestrator never edits files); the `review` phase runs `02` -> `03` -> `04`
+-> `05` in the fixed order with each verdict recorded through the state machine.
+`make validate` is the canonical gate and MUST pass locally before the PR.
+Attempt cap: three fix cycles on the same failure, then Escalate.
 
-### 7. Pull request
+### 6. Local review mirror
 
-    git push -u origin feat/<N>-<slug>
-    gh pr create --base dev --title "<type>(<scope>): <subject>" --body "<what changed and why>
+Before opening or finishing the PR, run `/gh-review` as the local mirror of the
+gate order, so the four reviewers see the whole change together and a
+REQUEST-CHANGES is fixed before CI (and before a human) ever sees it. Feed any
+REQUEST-CHANGES back into the `implement` phase, then re-run the gate.
 
-    Fixes #<N>"
-    gh pr checks --watch
+### 7. Record lessons
 
-- The title MUST be a Conventional Commit, because it becomes the squash
-  commit on `dev`.
-- Keep the PR green: fix CI failures immediately, same three-attempt cap.
-- Do not merge your own PR. Merging is a separate review step.
+When the task surfaced a non-obvious fact (a game type behaves unexpectedly, a
+tool needs a flag, a Windows trap), append one dated line to
+`.agents/lessons-learned.md` inside the same PR. Skip when there is nothing new;
+an empty entry is noise.
 
-### 8. Record lessons
-
-When the task surfaced a non-obvious fact (a game type behaves unexpectedly,
-a tool needs a flag, a Windows trap), append one dated line to
-`.agents/lessons-learned.md` inside the same PR. Skip when there is nothing
-new; an empty entry is noise.
-
-### 9. Report
+### 8. Report and stop
 
 End with exactly this summary, then stop. One issue per invocation.
 
     ## Work report
     - Issue: #<N> <title>
+    - Run: <N>-<slug> (phase: <final phase>)
     - Branch: feat/<N>-<slug>
     - PR: <url> (CI: green | red)
-    - Gates: make check <pass|fail>; CI <pass|fail>
+    - Gates: spec <v>; quality <v>; architecture <v>; security <v>
+    - make validate: <pass | fail>
     - Lessons recorded: <yes: one line | no>
     - Follow-ups filed: <#s | none>
     - Next selectable issue: #<N> (not started)
@@ -133,8 +148,8 @@ End with exactly this summary, then stop. One issue per invocation.
 
 After three failed attempts on the same gate or CI failure:
 
-1. Push the branch as-is, because finished-but-uncommitted work is the worst
-   possible end state.
+1. Record the run's state through `gh_issue_run.py` and push the branch as-is,
+   because finished-but-uncommitted work is the worst possible end state.
 2. Comment on the issue: what was tried, the exact failing output, the
    suspected cause.
 3. Add the `blocked` label to the issue.
@@ -142,8 +157,12 @@ After three failed attempts on the same gate or CI failure:
 
 ## Anti-patterns
 
-- Grading your own homework: reporting done without a green gate run.
-- Relaunching without the Orient step.
+- Grading your own homework: reporting done without a green gate run and
+  recorded verdicts.
+- Relaunching without the orient/resume step, or starting a new issue while a
+  run is active.
 - Batch mode: touching more than one issue in a single invocation.
+- Implementing in the orchestrator instead of dispatching `01-implementer`.
+- Hand-editing `state.json` instead of going through `gh_issue_run.py`.
 - Silent scope creep, silent test weakening, silent hook edits.
 - Merging your own PR.
