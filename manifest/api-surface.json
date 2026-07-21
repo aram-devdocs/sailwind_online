@@ -1,8 +1,86 @@
 {
   "header": {
-    "assemblyMvid": "00000000-0000-0000-0000-000000000000",
-    "gameBuildId": "unprovisioned",
+    "assemblyMvid": "fa39e939-d8e9-4d04-9648-4e10452ea8a3",
+    "gameBuildId": "23880593",
     "tool": "Sailwind.ApiGen/0.1.0"
   },
-  "members": []
+  "members": [
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "BoatMooringManager",
+      "static": false,
+      "type": "BoatMooringManager"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "BoatRefs",
+      "static": false,
+      "type": "BoatRefs"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "Currency",
+      "static": false,
+      "type": "Currency"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "GameState",
+      "static": false,
+      "type": "GameState"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "IslandMarket",
+      "static": false,
+      "type": "IslandMarket"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "NPCBoatController",
+      "static": false,
+      "type": "NPCBoatController"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "PlayerGold",
+      "static": false,
+      "type": "PlayerGold"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "SaveLoadManager",
+      "static": false,
+      "type": "SaveLoadManager"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "SaveSlots",
+      "static": false,
+      "type": "SaveSlots"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "Sun",
+      "static": false,
+      "type": "Sun"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "Wind",
+      "static": false,
+      "type": "Wind"
+    }
+  ]
 }

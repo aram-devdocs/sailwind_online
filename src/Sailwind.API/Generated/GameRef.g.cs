@@ -10,5 +10,16 @@ namespace Sailwind.Api.Generated
     /// resolved against the real assembly.</summary>
     internal static class GameRef
     {
+        public const string GameState = "GameState";
+        public const string Sun = "Sun";
+        public const string Wind = "Wind";
+        public const string BoatRefs = "BoatRefs";
+        public const string NPCBoatController = "NPCBoatController";
+        public const string SaveLoadManager = "SaveLoadManager";
+        public const string SaveSlots = "SaveSlots";
+        public const string BoatMooringManager = "BoatMooringManager";
+        public const string PlayerGold = "PlayerGold";
+        public const string Currency = "Currency";
+        public const string IslandMarket = "IslandMarket";
     }
 }

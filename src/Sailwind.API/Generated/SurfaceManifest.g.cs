@@ -12,12 +12,23 @@ namespace Sailwind.Api.Generated
     /// using <see cref="Members"/> and compares against <see cref="Hash"/>.</summary>
     internal static class SurfaceManifest
     {
-        public const string GameBuildId = "unprovisioned";
-        public const string Hash = "e717da78885e302bdebc8cd5aa36f64a6f901ee57375a140ecd6f9f433504ee1";
-        public const string Json = "{\n  \"header\": {\n    \"assemblyMvid\": \"00000000-0000-0000-0000-000000000000\",\n    \"gameBuildId\": \"unprovisioned\",\n    \"tool\": \"Sailwind.ApiGen/0.1.0\"\n  },\n  \"members\": []\n}\n";
+        public const string GameBuildId = "23880593";
+        public const string Hash = "792c8b4cb8cb05f9c6a747a581ceada6182ee47e4844b7a3cf1cc7c41e6cba59";
+        public const string Json = "{\n  \"header\": {\n    \"assemblyMvid\": \"fa39e939-d8e9-4d04-9648-4e10452ea8a3\",\n    \"gameBuildId\": \"23880593\",\n    \"tool\": \"Sailwind.ApiGen/0.1.0\"\n  },\n  \"members\": [\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"BoatMooringManager\",\n      \"static\": false,\n      \"type\": \"BoatMooringManager\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"BoatRefs\",\n      \"static\": false,\n      \"type\": \"BoatRefs\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"Currency\",\n      \"static\": false,\n      \"type\": \"Currency\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"GameState\",\n      \"static\": false,\n      \"type\": \"GameState\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"IslandMarket\",\n      \"static\": false,\n      \"type\": \"IslandMarket\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"NPCBoatController\",\n      \"static\": false,\n      \"type\": \"NPCBoatController\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"PlayerGold\",\n      \"static\": false,\n      \"type\": \"PlayerGold\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"SaveLoadManager\",\n      \"static\": false,\n      \"type\": \"SaveLoadManager\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"SaveSlots\",\n      \"static\": false,\n      \"type\": \"SaveSlots\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"Sun\",\n      \"static\": false,\n      \"type\": \"Sun\"\n    },\n    {\n      \"kind\": \"type\",\n      \"member\": \"\",\n      \"signature\": \"Wind\",\n      \"static\": false,\n      \"type\": \"Wind\"\n    }\n  ]\n}\n";
 
         public static readonly SurfaceMember[] Members = new SurfaceMember[]
         {
+            new SurfaceMember("BoatMooringManager", "", "type", false),
+            new SurfaceMember("BoatRefs", "", "type", false),
+            new SurfaceMember("Currency", "", "type", false),
+            new SurfaceMember("GameState", "", "type", false),
+            new SurfaceMember("IslandMarket", "", "type", false),
+            new SurfaceMember("NPCBoatController", "", "type", false),
+            new SurfaceMember("PlayerGold", "", "type", false),
+            new SurfaceMember("SaveLoadManager", "", "type", false),
+            new SurfaceMember("SaveSlots", "", "type", false),
+            new SurfaceMember("Sun", "", "type", false),
+            new SurfaceMember("Wind", "", "type", false),
         };
     }
 }
