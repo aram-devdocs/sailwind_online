@@ -8,9 +8,14 @@
 //! `make contracts`.
 
 // The generated code is verbatim compiler output; silence its lints locally so
-// the rest of this crate can stay clippy-clean under `-D warnings`.
+// the rest of this crate stays clean under the workspace deny floor. These allows
+// are scoped to this module alone and must name every group the workspace/crate
+// denies (a narrower deny group like `-D unused` outranks a broad `allow(warnings)`
+// no matter the scope). `allow(unsafe_code)` covers the flatbuffers accessor impls;
+// the crate's own hand-written code stays under the `unsafe_code` deny bar.
 mod generated {
-    #![allow(warnings)]
+    #![allow(unused, future_incompatible, nonstandard_style, unsafe_code)]
+    #![allow(clippy::all)]
     include!("generated/envelope_generated.rs");
 }
 

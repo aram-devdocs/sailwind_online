@@ -1,0 +1,3 @@
+# Formatting is machine-enforced: `cargo fmt --all --check` runs in the gate.
+edition = "2021"
+max_width = 100

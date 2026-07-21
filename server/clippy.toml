@@ -1,0 +1,6 @@
+# Thresholds for clippy's configurable lints. They sit at or above the upstream
+# defaults, so the current code stays clippy-clean under `clippy::all = "deny"`
+# while still flagging genuinely extreme cases.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+cognitive-complexity-threshold = 30

@@ -14,8 +14,31 @@ permissions:
   contents: read
 
 jobs:
-  # Pure C# tier: the game-free solution filter plus the always-run contract
-  # tests. No game DLLs ever enter cloud CI; the net472 plugins build locally.
+  # Repo guards: instruction-layer conventions, the leak scan, and the game-IP
+  # guard. Fast, and required. The leak blocklist comes from a repo secret; when
+  # it is unset the scan reports "skipped" and passes (external contributors are
+  # not blocked), so set the LEAK_BLOCKLIST secret to activate it in CI.
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instruction-layer conventions
+        run: bash scripts/check-conventions.sh
+      - name: Leak scan
+        env:
+          LEAK_BLOCKLIST: ${{ secrets.LEAK_BLOCKLIST }}
+        run: |
+          if [ -n "$LEAK_BLOCKLIST" ]; then
+            printf '%s' "$LEAK_BLOCKLIST" > "$RUNNER_TEMP/leak-blocklist.txt"
+            export SW_LEAK_BLOCKLIST="$RUNNER_TEMP/leak-blocklist.txt"
+          fi
+          bash scripts/check-no-leak.sh
+      - name: Game-IP guard
+        run: bash scripts/guard-no-game-ip.sh
+
+  # Pure C# tier: the game-free solution filter and every game-free test project
+  # (contracts, net, sync, and the Cecil architecture DAG). No game DLLs ever
+  # enter cloud CI; the net472 plugins build locally.
   dotnet:
     runs-on: ubuntu-latest
     steps:
@@ -23,12 +46,10 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
-      - name: Guard - no game IP or binaries tracked
-        run: bash scripts/guard-no-game-ip.sh
       - name: Build game-free solution filter
         run: dotnet build SailwindOnline.CI.slnf -c Release
-      - name: Contract codec tests
-        run: dotnet test tests/Sailwind.Contracts.Tests -c Release
+      - name: Game-free tests (contracts, net, sync, architecture)
+        run: dotnet test SailwindOnline.CI.slnf -c Release --no-build
 
   # Rust server workspace on both target OSes (home servers run on Windows).
   rust:
@@ -97,8 +118,8 @@ jobs:
   # The single required status check. It is trivial and only turns green once
   # its needs have all passed, so branch protection lists exactly this context.
   gate:
-    needs: [dotnet, rust, contracts]
+    needs: [guards, dotnet, rust, contracts]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed
-        run: echo "dotnet, rust and contracts are green."
+        run: echo "guards, dotnet, rust and contracts are green."
