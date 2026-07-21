@@ -18,8 +18,8 @@ SLN    := SailwindOnline.sln
 SLNF   := SailwindOnline.CI.slnf
 SERVER_MANIFEST := server/Cargo.toml
 
-.PHONY: help setup codegen contracts check audit build build-ci test \
-        server-build server-run smoke deploy clean
+.PHONY: help setup codegen contracts validate check audit build build-ci test \
+        server-build server-run smoke test-profile deploy run-modded clean
 
 help:  ## List available targets
 	@echo Sailwind Online - make targets
@@ -27,6 +27,7 @@ help:  ## List available targets
 	@echo   setup         Provision lib/ and the sandbox from a local Steam install
 	@echo   codegen       Regenerate the Sailwind.API surface from the game assembly
 	@echo   contracts     Regenerate FlatBuffers C# and Rust from contracts/fbs
+	@echo   validate      Canonical gate mirroring CI: conventions, leak scan, check
 	@echo   check         Fast gate: game-free build plus tests plus Rust checks
 	@echo   audit         Full gate: check plus the game-coupled tier when lib/ is present
 	@echo   build         Build the full solution in Release (needs lib/)
@@ -35,7 +36,9 @@ help:  ## List available targets
 	@echo   server-build  Build the Rust server workspace
 	@echo   server-run    Run the Rust server (sailwind-online-server)
 	@echo   smoke         Build the server in Release and run the protocol-smoke harness
-	@echo   deploy        Build Release; Deploy.targets copies plugins to the profile
+	@echo   test-profile  Create the dedicated SailwindOnline Thunderstore test profile
+	@echo   deploy        Build Release and deploy plugins to the test profile (opt-in)
+	@echo   run-modded    Start the server and launch Sailwind modded from the test profile
 	@echo   clean         Remove bin, obj, target, and artifacts
 
 setup:  ## Provision lib/ and the sandbox from a local Steam install
@@ -46,6 +49,9 @@ codegen:  ## Regenerate the Sailwind.API surface from the game assembly
 
 contracts:  ## Regenerate FlatBuffers C# and Rust from contracts/fbs
 	$(call runscript,gen-contracts)
+
+validate:  ## Canonical gate (mirrors CI): conventions, leak scan, game-free build, tests, Rust checks
+	$(call runscript,check)
 
 check:  ## Fast gate: game-free build plus tests plus Rust checks
 	$(call runscript,check)
@@ -73,8 +79,14 @@ smoke:  ## Build the server in Release and run the protocol-smoke harness
 	$(CARGO) build --release --manifest-path $(SERVER_MANIFEST)
 	$(DOTNET) run --project tools/protocol-smoke
 
-deploy:  ## Build Release; Deploy.targets copies plugins to the profile
-	$(DOTNET) build $(SLN) -c Release
+test-profile:  ## Create the dedicated SailwindOnline Thunderstore test profile
+	$(call runscript,setup-test-profile)
+
+deploy:  ## Build Release and deploy plugins to the dedicated test profile (opt-in)
+	$(DOTNET) build $(SLN) -c Release -p:Deploy=true
+
+run-modded:  ## Start the server and launch Sailwind modded from the test profile
+	$(call runscript,run-modded)
 
 clean:  ## Remove bin, obj, target, and artifacts
 ifeq ($(OS),Windows_NT)

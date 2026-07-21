@@ -1,26 +1,24 @@
 <Project>
 
   <!--
-    Deploy a built BepInEx plugin into the local Thunderstore Mod Manager
-    profile after a successful build.
+    Deploy a built BepInEx plugin into a LOCAL Thunderstore Mod Manager profile.
 
-    A csproj opts in by setting <PluginName>. When $(SailwindProfile) exists on
-    disk, the plugin assembly and its ship-local payload DLLs are copied to
-    <profile>\BepInEx\plugins\<PluginName>\.
+    Deployment is OPT-IN: it runs only when -p:Deploy=true is passed, so routine
+    builds (make build, make validate, CI) never touch a play profile. `make
+    deploy` and `make run-modded` set it.
 
-    Default profile: the Thunderstore Mod Manager "Default" profile under
-    %APPDATA%. Override with -p:SailwindProfile=<path>. Disable deployment
-    entirely by pointing at a nonexistent path, e.g.
-    -p:SailwindProfile=C:\__nodeploy__ (the Exists check then skips the copy).
+    Target profile defaults to a DEDICATED "SailwindOnline" test profile, never
+    the user's Default profile (which holds their own mod set). Override with
+    -p:SailwindProfile=<path>. A csproj opts a project in by setting <PluginName>.
   -->
 
   <PropertyGroup>
-    <SailwindProfile Condition="'$(SailwindProfile)' == ''">$(APPDATA)\Thunderstore Mod Manager\DataFolder\Sailwind\profiles\Default</SailwindProfile>
+    <SailwindProfile Condition="'$(SailwindProfile)' == ''">$(APPDATA)\Thunderstore Mod Manager\DataFolder\Sailwind\profiles\SailwindOnline</SailwindProfile>
   </PropertyGroup>
 
   <Target Name="DeployToSailwindProfile"
           AfterTargets="Build"
-          Condition="'$(PluginName)' != '' and Exists('$(SailwindProfile)')">
+          Condition="'$(Deploy)' == 'true' and '$(PluginName)' != '' and Exists('$(SailwindProfile)')">
 
     <PropertyGroup>
       <PluginDeployDir>$(SailwindProfile)\BepInEx\plugins\$(PluginName)</PluginDeployDir>
@@ -36,6 +34,12 @@
           DestinationFolder="$(PluginDeployDir)"
           SkipUnchangedFiles="true" />
     <Message Importance="high" Text="Deployed $(PluginName) -> $(PluginDeployDir)" />
+  </Target>
+
+  <Target Name="WarnDeployProfileMissing"
+          AfterTargets="Build"
+          Condition="'$(Deploy)' == 'true' and '$(PluginName)' != '' and !Exists('$(SailwindProfile)')">
+    <Message Importance="high" Text="Deploy requested but profile not found: $(SailwindProfile). Run scripts/setup-test-profile.ps1." />
   </Target>
 
 </Project>

@@ -21,3 +21,6 @@ server/target/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local, never-committed agent state (leak blocklist lives here)
+.agents/local/

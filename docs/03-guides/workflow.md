@@ -41,7 +41,7 @@ human steering. It orients against the current repo and board state (so a run
 that died mid-task resumes cleanly), picks the highest-priority unblocked issue,
 branches, implements with tests, opens the PR, records any lesson learned, and
 reports. One issue per invocation. The full loop is in
-`.claude/skills/work/SKILL.md`.
+`.agents/skills/work/SKILL.md`.
 
 Selection order is lowest milestone first, then priority label (P0, P1, P2),
 then lowest issue number. An issue is skipped when it is labeled blocked, when

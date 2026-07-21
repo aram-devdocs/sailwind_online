@@ -15,12 +15,8 @@ function Invoke-Step {
     }
 }
 
-Write-Host "==> AGENTS.md / CLAUDE.md parity"
-git diff --no-index --quiet AGENTS.md CLAUDE.md
-if ($LASTEXITCODE -ne 0) {
-    throw "AGENTS.md and CLAUDE.md differ. Run: Copy-Item AGENTS.md CLAUDE.md"
-}
-
+Invoke-Step "instruction-layer conventions" { bash scripts/check-conventions.sh }
+Invoke-Step "leak guard" { bash scripts/check-no-leak.sh }
 Invoke-Step "guard: no game IP tracked" { powershell -NoProfile -ExecutionPolicy Bypass -File scripts/guard-no-game-ip.ps1 }
 Invoke-Step "build game-free solution filter (Release)" { dotnet build SailwindOnline.CI.slnf -c Release }
 Invoke-Step "game-free dotnet tests" { dotnet test tests/Sailwind.Contracts.Tests -c Release }
