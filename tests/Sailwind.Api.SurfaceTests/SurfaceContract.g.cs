@@ -24,7 +24,19 @@ namespace Sailwind.Api.SurfaceTests
         public void GameState_type() => SurfaceProbe.RequireType("GameState");
 
         [Fact]
+        public void GameState_currentBoat_field() => SurfaceProbe.RequireMember("GameState", "currentBoat", "field", true);
+
+        [Fact]
+        public void GameState_day_field() => SurfaceProbe.RequireMember("GameState", "day", "field", true);
+
+        [Fact]
         public void IslandMarket_type() => SurfaceProbe.RequireType("IslandMarket");
+
+        [Fact]
+        public void Moon_type() => SurfaceProbe.RequireType("Moon");
+
+        [Fact]
+        public void Moon_currentPhase_field() => SurfaceProbe.RequireMember("Moon", "currentPhase", "field", false);
 
         [Fact]
         public void NPCBoatController_type() => SurfaceProbe.RequireType("NPCBoatController");
@@ -36,13 +48,25 @@ namespace Sailwind.Api.SurfaceTests
         public void SaveLoadManager_type() => SurfaceProbe.RequireType("SaveLoadManager");
 
         [Fact]
+        public void SaveLoadManager_LoadGame_method() => SurfaceProbe.RequireMember("SaveLoadManager", "LoadGame", "method", false);
+
+        [Fact]
+        public void SaveLoadManager_SaveGame_method() => SurfaceProbe.RequireMember("SaveLoadManager", "SaveGame", "method", false);
+
+        [Fact]
         public void SaveSlots_type() => SurfaceProbe.RequireType("SaveSlots");
 
         [Fact]
         public void Sun_type() => SurfaceProbe.RequireType("Sun");
 
         [Fact]
+        public void Sun_localTime_field() => SurfaceProbe.RequireMember("Sun", "localTime", "field", false);
+
+        [Fact]
         public void Wind_type() => SurfaceProbe.RequireType("Wind");
+
+        [Fact]
+        public void Wind_currentWind_field() => SurfaceProbe.RequireMember("Wind", "currentWind", "field", true);
 
     }
 }

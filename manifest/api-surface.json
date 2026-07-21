@@ -34,11 +34,39 @@
       "type": "GameState"
     },
     {
+      "kind": "field",
+      "member": "currentBoat",
+      "signature": "UnityEngine.Transform GameState.currentBoat",
+      "static": true,
+      "type": "GameState"
+    },
+    {
+      "kind": "field",
+      "member": "day",
+      "signature": "System.Int32 GameState.day",
+      "static": true,
+      "type": "GameState"
+    },
+    {
       "kind": "type",
       "member": "",
       "signature": "IslandMarket",
       "static": false,
       "type": "IslandMarket"
+    },
+    {
+      "kind": "type",
+      "member": "",
+      "signature": "Moon",
+      "static": false,
+      "type": "Moon"
+    },
+    {
+      "kind": "field",
+      "member": "currentPhase",
+      "signature": "System.Single Moon.currentPhase",
+      "static": false,
+      "type": "Moon"
     },
     {
       "kind": "type",
@@ -62,6 +90,20 @@
       "type": "SaveLoadManager"
     },
     {
+      "kind": "method",
+      "member": "LoadGame",
+      "signature": "System.Void SaveLoadManager.LoadGame(System.Int32)",
+      "static": false,
+      "type": "SaveLoadManager"
+    },
+    {
+      "kind": "method",
+      "member": "SaveGame",
+      "signature": "System.Void SaveLoadManager.SaveGame(System.Boolean)",
+      "static": false,
+      "type": "SaveLoadManager"
+    },
+    {
       "kind": "type",
       "member": "",
       "signature": "SaveSlots",
@@ -76,10 +118,24 @@
       "type": "Sun"
     },
     {
+      "kind": "field",
+      "member": "localTime",
+      "signature": "System.Single Sun.localTime",
+      "static": false,
+      "type": "Sun"
+    },
+    {
       "kind": "type",
       "member": "",
       "signature": "Wind",
       "static": false,
+      "type": "Wind"
+    },
+    {
+      "kind": "field",
+      "member": "currentWind",
+      "signature": "UnityEngine.Vector3 Wind.currentWind",
+      "static": true,
       "type": "Wind"
     }
   ]

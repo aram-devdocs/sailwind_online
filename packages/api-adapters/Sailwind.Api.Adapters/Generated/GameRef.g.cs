@@ -12,6 +12,7 @@ namespace Sailwind.Api.Generated
     {
         public const string GameState = "GameState";
         public const string Sun = "Sun";
+        public const string Moon = "Moon";
         public const string Wind = "Wind";
         public const string BoatRefs = "BoatRefs";
         public const string NPCBoatController = "NPCBoatController";
@@ -21,5 +22,12 @@ namespace Sailwind.Api.Generated
         public const string PlayerGold = "PlayerGold";
         public const string Currency = "Currency";
         public const string IslandMarket = "IslandMarket";
+        public const string GameState_day = "day";
+        public const string Sun_localTime = "localTime";
+        public const string Moon_currentPhase = "currentPhase";
+        public const string Wind_currentWind = "currentWind";
+        public const string GameState_currentBoat = "currentBoat";
+        public const string SaveLoadManager_LoadGame = "LoadGame";
+        public const string SaveLoadManager_SaveGame = "SaveGame";
     }
 }
