@@ -21,9 +21,11 @@ fails loudly and early when it cannot.
 ## Sailwind.Online
 
 A persistent-world multiplayer mod. A client plugin runs inside the game and
-talks over UDP to a standalone server that holds thin authority. Players see
-each other sail, moor boats that persist while they are offline, share one sky
-and clock, and trade against a shared economy ledger.
+talks over UDP to a standalone server that holds thin authority. You keep your
+own save and your own game; what you share with everyone else is the world and
+the map, not your character's progress. Players see each other sail, moor boats
+that persist while they are offline, share one sky and clock, and trade against
+a shared economy ledger.
 
 Who it is for: players who want to sail the same world together.
 

@@ -33,8 +33,10 @@ All facts below were confirmed by recon on the local install on 2026-07-21.
   and the `UnityEngine*.dll` set).
 - Steam app manifest (for buildid provenance):
   `steamapps\appmanifest_1764530.acf`.
-- Thunderstore Mod Manager profile (BepInEx core and deploy target):
-  `%APPDATA%\Thunderstore Mod Manager\DataFolder\Sailwind\profiles\Default\`.
+- Thunderstore Mod Manager profiles root:
+  `%APPDATA%\Thunderstore Mod Manager\DataFolder\Sailwind\profiles\`. Setup
+  reads the BepInEx core from the `Default` profile; deploy writes the built
+  plugins into the sibling `SailwindOnline` test profile, never into `Default`.
 
 ## Confirmed game type names
 
