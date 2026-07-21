@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sailwind.Architecture.Tests</AssemblyName>
+    <RootNamespace>Sailwind.Architecture.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- References NO repo projects. It scans the BUILT DLLs on disk via Cecil
+         metadata (never Assembly.Load), so it stays game-free and runs in CI on
+         whatever DLLs the game-free tier produced. Discovery walks the repo for
+         **/bin/Release/**/Sailwind.*.dll; a rule that finds no DLL for an assembly
+         passes vacuously, which is why every rule is also proven to bite against a
+         synthetic in-memory fixture. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+  </ItemGroup>
+
+</Project>

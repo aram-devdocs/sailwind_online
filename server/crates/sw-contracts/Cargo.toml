@@ -7,3 +7,18 @@ rust-version.workspace = true
 
 [dependencies]
 flatbuffers.workspace = true
+
+# This crate is the sanctioned exception to the workspace `unsafe_code = "forbid"`:
+# `src/generated/envelope_generated.rs` is verbatim `flatc` output whose accessor
+# impls are `unsafe`. It therefore declares its own lint table (deny, not forbid,
+# on unsafe_code) so the generated module's own `#![allow(warnings)]` can lift it
+# there; the crate's hand-written code stays deny-strict and clippy-clean, exactly
+# like every crate that inherits `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unused = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

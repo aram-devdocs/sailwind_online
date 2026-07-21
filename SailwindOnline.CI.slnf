@@ -8,6 +8,7 @@
       "packages\\sync\\Sailwind.Online.Sync\\Sailwind.Online.Sync.csproj",
       "tools\\Sailwind.ApiGen\\Sailwind.ApiGen.csproj",
       "tools\\protocol-smoke\\Sailwind.ProtocolSmoke.csproj",
+      "tests\\Sailwind.Architecture.Tests\\Sailwind.Architecture.Tests.csproj",
       "tests\\Sailwind.Contracts.Tests\\Sailwind.Contracts.Tests.csproj",
       "tests\\Sailwind.Online.Net.Tests\\Sailwind.Online.Net.Tests.csproj",
       "tests\\Sailwind.Online.Sync.Tests\\Sailwind.Online.Sync.Tests.csproj"

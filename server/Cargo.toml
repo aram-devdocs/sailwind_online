@@ -15,6 +15,26 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.86.0"
 
+# Machine-enforced lint floor for the whole workspace. Crates opt in with
+# `[lints] workspace = true`. Kept green by fixing findings, never by blanket
+# allows.
+#
+# `unsafe_code = "forbid"` is a hard cap the code cannot locally lift. The one
+# exception is `sw-contracts`, whose `src/generated/` FlatBuffers bindings are
+# verbatim compiler output built on the unsafe flatbuffers runtime; that crate
+# declares its own lint table (still deny-strict on everything else) instead of
+# inheriting the forbid. Every other crate inherits this table unchanged.
+# Groups carry priority -1 so the specific `unsafe_code` lint (priority 0) resolves
+# on top of them; cargo rejects a group and a lint sharing the same priority.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
 [workspace.dependencies]
 flatbuffers = "=25.2.10"
 rusqlite = { version = "0.32.1", features = ["bundled"] }

@@ -5,6 +5,8 @@
 //! snapshots, and flushes dirty state periodically and on shutdown. See
 //! `spec-tech.md` section 4 and the crate module docs for the design.
 
+#[cfg(test)]
+mod arch_dag;
 mod clock;
 mod codec;
 mod config;

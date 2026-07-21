@@ -7,3 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 # Pure ledger logic over a storage trait — std only.
+
+[lints]
+workspace = true
