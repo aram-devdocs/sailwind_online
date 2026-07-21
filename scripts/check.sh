@@ -30,6 +30,7 @@ dotnet test tests/Sailwind.Architecture.Tests -c Release
 dotnet test tests/Sailwind.Contracts.Tests -c Release
 dotnet test tests/Sailwind.Online.Net.Tests -c Release
 dotnet test tests/Sailwind.Online.Sync.Tests -c Release
+dotnet test tests/Sailwind.Api.SurfaceManifest.Tests -c Release
 
 echo "==> cargo fmt (check)"
 cargo fmt --all --check --manifest-path server/Cargo.toml

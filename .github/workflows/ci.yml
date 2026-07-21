@@ -95,6 +95,20 @@ jobs:
             exit 1
           fi
 
+  # Recompute the canonical SHA-256 of manifest/api-surface.json and fail on any
+  # drift from the committed api-surface.sha256 or the embedded SurfaceManifest.Hash.
+  # Game-free like the contracts drift job above: it reads only committed repo files
+  # and a source literal (no lib/, no game DLL), so it runs in cloud CI.
+  surface:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: API surface manifest integrity (hash chain)
+        run: dotnet test tests/Sailwind.Api.SurfaceManifest.Tests -c Release
+
   # End-to-end conformance: real LiteNetLib client against the real Rust server
   # over real FlatBuffers envelopes. Interop is milestone M3, so this job is
   # allowed to fail for now without blocking the gate.
@@ -120,8 +134,8 @@ jobs:
   # The single required status check. It is trivial and only turns green once
   # its needs have all passed, so branch protection lists exactly this context.
   gate:
-    needs: [guards, dotnet, rust, contracts]
+    needs: [guards, dotnet, rust, contracts, surface]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed
-        run: echo "guards, dotnet, rust and contracts are green."
+        run: echo "guards, dotnet, rust, contracts and surface are green."

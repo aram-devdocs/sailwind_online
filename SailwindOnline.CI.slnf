@@ -9,6 +9,7 @@
       "tools\\Sailwind.ApiGen\\Sailwind.ApiGen.csproj",
       "tools\\protocol-smoke\\Sailwind.ProtocolSmoke.csproj",
       "tests\\Sailwind.Architecture.Tests\\Sailwind.Architecture.Tests.csproj",
+      "tests\\Sailwind.Api.SurfaceManifest.Tests\\Sailwind.Api.SurfaceManifest.Tests.csproj",
       "tests\\Sailwind.Contracts.Tests\\Sailwind.Contracts.Tests.csproj",
       "tests\\Sailwind.Online.Net.Tests\\Sailwind.Online.Net.Tests.csproj",
       "tests\\Sailwind.Online.Sync.Tests\\Sailwind.Online.Sync.Tests.csproj"
