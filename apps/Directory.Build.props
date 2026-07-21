@@ -1,0 +1,14 @@
+<Project>
+
+  <!--
+    App tier: the net472 BepInEx plugins. These are thin composition roots that
+    wire the pure packages into the running game, so they stay pragmatic and just
+    inherit the repo-root base (nullable disabled, warnings-as-errors) rather than
+    the stricter pure-package analyzers.
+
+    Chain to the repo-root Directory.Build.props explicitly, because MSBuild imports
+    only the nearest Directory.Build.props by default.
+  -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+</Project>

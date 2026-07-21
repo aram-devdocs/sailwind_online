@@ -37,13 +37,13 @@ $clientVersion = "$($props.SailwindOnlineVersion)".Trim()
 
 if ($Package -eq 'api') {
     $version = $apiVersion
-    $project = 'src/Sailwind.API/Sailwind.API.csproj'
+    $project = 'apps/Sailwind.API/Sailwind.API.csproj'
     $pluginDir = 'Sailwind.API'
     $sourceDir = 'thunderstore/api'
     $extraDlls = @()
 } else {
     $version = $clientVersion
-    $project = 'src/Sailwind.Online.Client/Sailwind.Online.Client.csproj'
+    $project = 'apps/Sailwind.Online.Client/Sailwind.Online.Client.csproj'
     $pluginDir = 'Sailwind.Online'
     $sourceDir = 'thunderstore/client'
     $extraDlls = @('Sailwind.Contracts.dll', 'LiteNetLib.dll')

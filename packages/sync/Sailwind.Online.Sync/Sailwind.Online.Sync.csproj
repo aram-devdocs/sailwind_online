@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Client-side state synchronisation: the remote-entity snapshot cache and the
+    outbound state reporter cadence. GAME-FREE pure C# (no UnityEngine, no
+    FlatBuffers): it consumes the Sailwind.API abstractions (IPlayerBoatReader,
+    BoatPose) and drives the transport through a local interface, so it builds
+    without lib/ and is unit-tested in Sailwind.Online.Sync.Tests.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Sailwind.Online.Sync</AssemblyName>
+    <RootNamespace>Sailwind.Online.Client.Sync</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

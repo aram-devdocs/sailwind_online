@@ -19,7 +19,9 @@ Invoke-Step "instruction-layer conventions" { bash scripts/check-conventions.sh 
 Invoke-Step "leak guard" { bash scripts/check-no-leak.sh }
 Invoke-Step "guard: no game IP tracked" { powershell -NoProfile -ExecutionPolicy Bypass -File scripts/guard-no-game-ip.ps1 }
 Invoke-Step "build game-free solution filter (Release)" { dotnet build SailwindOnline.CI.slnf -c Release }
-Invoke-Step "game-free dotnet tests" { dotnet test tests/Sailwind.Contracts.Tests -c Release }
+Invoke-Step "game-free dotnet tests (contracts)" { dotnet test tests/Sailwind.Contracts.Tests -c Release }
+Invoke-Step "game-free dotnet tests (net)" { dotnet test tests/Sailwind.Online.Net.Tests -c Release }
+Invoke-Step "game-free dotnet tests (sync)" { dotnet test tests/Sailwind.Online.Sync.Tests -c Release }
 Invoke-Step "cargo fmt (check)" { cargo fmt --all --check --manifest-path server/Cargo.toml }
 Invoke-Step "cargo clippy (-D warnings)" { cargo clippy --workspace --all-targets --manifest-path server/Cargo.toml -- -D warnings }
 Invoke-Step "cargo test" { cargo test --workspace --manifest-path server/Cargo.toml }

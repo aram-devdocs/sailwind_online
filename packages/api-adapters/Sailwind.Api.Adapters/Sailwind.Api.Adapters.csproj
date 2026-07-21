@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Concrete game adapters implementing the Sailwind.API abstractions: the reflection
+    binders over Assembly-CSharp, the runtime surface check, and the ApiGen-generated
+    GameRef / SurfaceManifest. GAME-COUPLED (net472): imports build/GameReferences.props,
+    so it builds only where lib/ is present and is absent from SailwindOnline.CI.slnf.
+    It converts game UnityEngine.Vector3/Quaternion to System.Numerics at the boundary.
+
+    Although it lives under packages/, it is the one exception to the pure-package
+    strictness: reflection glue gains nothing from nullable annotation, so it opts out
+    of the Nullable/analyzer settings that packages/Directory.Build.props imposes.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>Sailwind.Api.Adapters</AssemblyName>
+    <RootNamespace>Sailwind.Api</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <Nullable>disable</Nullable>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+  </PropertyGroup>
+
+  <!-- System.Numerics.Vector3/Quaternion at the game boundary. Framework assembly
+       (part of the net472 runtime the game process already loads); Private=false so
+       it is never copied into plugin output. -->
+  <ItemGroup>
+    <Reference Include="System.Numerics.Vectors" Private="false" />
+  </ItemGroup>
+
+  <!-- Game + BepInEx + Unity references (Assembly-CSharp publicized). Imported ONLY by
+       engine-facing projects; this is what keeps CI game-free. Requires lib/. -->
+  <Import Project="$(RepoRoot)build\GameReferences.props" />
+
+  <ItemGroup>
+    <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" Private="false" />
+    <ProjectReference Include="$(RepoRoot)contracts/cs/Sailwind.Contracts/Sailwind.Contracts.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

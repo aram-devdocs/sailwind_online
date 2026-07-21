@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Pure client transport + wire codec: the LiteNetLib 1.3.1 session state machine,
+    the FlatBuffers envelope codec, and the main-thread dispatcher. GAME-FREE: it
+    logs through the INetLog seam (BepInEx glue stays in the app) and reports poses
+    through BoatPose, so it builds without lib/ and is unit-tested in
+    Sailwind.Online.Net.Tests. Feeds the snapshot cache in Sailwind.Online.Sync.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>Sailwind.Online.Net</AssemblyName>
+    <RootNamespace>Sailwind.Online.Client.Net</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LiteNetLib" Version="1.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(RepoRoot)contracts/cs/Sailwind.Contracts/Sailwind.Contracts.csproj" />
+    <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" />
+    <ProjectReference Include="$(RepoRoot)packages/sync/Sailwind.Online.Sync/Sailwind.Online.Sync.csproj" />
+  </ItemGroup>
+
+</Project>

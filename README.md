@@ -36,7 +36,8 @@ a package, or CI. Run `make` with no target to list every task.
 ## Repository map
 
 - `contracts/` FlatBuffers `.fbs` schemas (the single source of truth for every client-server message) plus the committed C# bindings under `contracts/cs/`.
-- `src/` the two net472 BepInEx plugins: `Sailwind.API` and `Sailwind.Online.Client`.
+- `packages/` the pure, game-free netstandard2.0 libraries (`api-abstractions`, `net`, `sync`) plus the game-coupled net472 `api-adapters`.
+- `apps/` the two thin net472 BepInEx plugins that compose the packages: `Sailwind.API` and `Sailwind.Online.Client`.
 - `server/` the Rust workspace: the `sw-server` binary and the `sw-net`, `sw-world`, `sw-econ`, `sw-persist`, and `sw-contracts` crates.
 - `tools/` net8 helpers: `Sailwind.ApiGen` (Cecil introspection codegen) and `protocol-smoke` (the wire-conformance harness).
 - `tests/` game-free test projects that run in CI, plus game-coupled surface tests that run locally.

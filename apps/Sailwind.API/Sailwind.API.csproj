@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Sailwind.API — the compatibility-host BepInEx plugin (net472). Thin composition
+    root: Plugin.cs runs the surface check and wires the concrete game adapters into
+    the SailwindApi facade. All game logic lives in the packages it composes; this
+    project only touches BepInEx/Harmony, so it imports build/GameReferences.props
+    and cannot build in cloud CI (needs lib/). It is the host that ships the shared
+    API + contracts DLLs, so downstream plugins bind to a single SailwindApi facade.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>Sailwind.API</AssemblyName>
+    <RootNamespace>Sailwind.Api</RootNamespace>
+    <!-- Drives build/Deploy.targets: the built plugin is copied into
+         <profile>/BepInEx/plugins/Sailwind.API/ after Build. -->
+    <PluginName>Sailwind.API</PluginName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- BepInEx + Harmony + Unity references. Imported ONLY by engine-facing projects;
+       this is what keeps CI game-free. Requires lib/ populated by scripts/setup-game. -->
+  <Import Project="$(RepoRoot)build\GameReferences.props" />
+
+  <ItemGroup>
+    <ProjectReference Include="$(RepoRoot)packages/api-adapters/Sailwind.Api.Adapters/Sailwind.Api.Adapters.csproj" />
+    <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" />
+    <ProjectReference Include="$(RepoRoot)contracts/cs/Sailwind.Contracts/Sailwind.Contracts.csproj" />
+  </ItemGroup>
+
+  <Import Project="$(RepoRoot)build\Deploy.targets" />
+
+</Project>

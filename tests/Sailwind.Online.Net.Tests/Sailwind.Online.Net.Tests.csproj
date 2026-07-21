@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Sailwind.Online.Net.Tests</AssemblyName>
+    <RootNamespace>Sailwind.Online.Net.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Exercises the extracted transport/codec directly, plus the FlatBuffers
+         accessors it round-trips against. -->
+    <ProjectReference Include="..\..\packages\net\Sailwind.Online.Net\Sailwind.Online.Net.csproj" />
+    <ProjectReference Include="..\..\contracts\cs\Sailwind.Contracts\Sailwind.Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

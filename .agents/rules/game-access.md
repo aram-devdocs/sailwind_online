@@ -1,5 +1,5 @@
 ---
-globs: ["src/**"]
+globs: ["apps/**", "packages/api-adapters/**"]
 ---
 
 # Game access

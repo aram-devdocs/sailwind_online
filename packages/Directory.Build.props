@@ -1,0 +1,26 @@
+<Project>
+
+  <!--
+    Pure, game-free package tier. Everything under packages/ builds WITHOUT lib/
+    and is unit-testable in a game-free process. These libraries are held to a
+    stricter bar than the net472 apps: nullable reference types on, .NET analyzers
+    on at the latest level, warnings promoted to errors. Real nullability/analyzer
+    findings are fixed here, never suppressed.
+
+    The game-coupled adapter package (packages/api-adapters) is the one exception:
+    it is net472 reflection glue and opts back out of nullable/analyzers in its own
+    csproj.
+
+    We chain to the repo-root Directory.Build.props explicitly, because MSBuild
+    imports only the nearest Directory.Build.props by default.
+  -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>
