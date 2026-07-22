@@ -50,25 +50,41 @@ require_in_ci() {
 # --- C# (game-free tier) ---
 if command -v reportgenerator >/dev/null 2>&1; then
   echo "==> C# coverage (game-free tier), floor ${CS_MIN}%"
-  # Exclude the Architecture DAG tests (Sailwind.Architecture.Tests) from the
-  # coverage MEASUREMENT run only. They Cecil-scan the built assemblies via
-  # AssemblyScanner; under coverlet's XPlat Code Coverage data collector on Linux
-  # the instrumented test host changes which assemblies the scanner enumerates,
-  # so a known game-free node (Sailwind.Api.Abstractions) drops out of the scanned
-  # set and ScanFindsTheGameFreeCore fails there. That failure is a
-  # Linux+coverage-instrumentation interaction: the same test passes in the
-  # unfiltered `dotnet` CI gate and on Windows. Being a structural graph scan it
-  # exercises ~no production line beyond the test project itself, so removing it
-  # from the MEASUREMENT changes coverage negligibly. Its enforcement is intact:
-  # it still runs UNFILTERED in the main `dotnet` gate job, which is where the DAG
-  # is actually gated. The filter matches only this project because "Architecture"
-  # appears in no other game-free test's fully-qualified name, so the other five
-  # tiers (Contracts, Online.Net, Online.Sync, Api.SurfaceManifest, Templates)
-  # still run and still emit coverage.
-  dotnet test SailwindOnline.CI.slnf -c Release \
-    --filter "FullyQualifiedName!~Architecture" \
-    --collect:"XPlat Code Coverage" \
-    --results-directory "$out/cs"
+  # Game-free UNIT-test set for coverage. This is every game-free test project in
+  # SailwindOnline.CI.slnf EXCEPT Sailwind.Architecture.Tests. A NEW game-free
+  # test project MUST be added to this list; scripts/check-conventions.sh asserts
+  # every game-free test project in the CI filter (except Architecture.Tests) is
+  # named here, so a future project can't be silently dropped from the coverage
+  # floor.
+  #
+  # Architecture.Tests is excluded from the MEASUREMENT because its Cecil
+  # AssemblyScanner is incompatible with coverlet instrumentation on Linux: under
+  # the XPlat Code Coverage data collector the instrumented test host changes
+  # which assemblies the scanner enumerates, so a known game-free node
+  # (Sailwind.Api.Abstractions) drops out of the scanned set and
+  # ScanFindsTheGameFreeCore fails there. The same test passes in the unfiltered
+  # `dotnet` CI gate and on Windows. Being a structural graph scan it exercises
+  # ~no production line beyond the test project itself, so excluding it changes
+  # coverage negligibly, and its enforcement is intact — it still runs UNFILTERED
+  # in the main `dotnet` gate job, which is where the DAG is actually gated.
+  #
+  # Measuring per project (rather than the whole slnf with a name filter) avoids
+  # the "No test matches the given testcase filter" zero-match error that a
+  # FullyQualifiedName filter triggers on Architecture.Tests: each project below
+  # has matching tests, so dotnet test never exits non-zero for zero matches.
+  # reportgenerator then merges every per-project coverage.cobertura.xml below.
+  cs_cov_projects=(
+    tests/Sailwind.Contracts.Tests
+    tests/Sailwind.Online.Net.Tests
+    tests/Sailwind.Online.Sync.Tests
+    tests/Sailwind.Api.SurfaceManifest.Tests
+    tests/Sailwind.Templates.Tests
+  )
+  for proj in "${cs_cov_projects[@]}"; do
+    dotnet test "$proj" -c Release \
+      --collect:"XPlat Code Coverage" \
+      --results-directory "$out/cs"
+  done
   reportgenerator \
     "-reports:$out/cs/**/coverage.cobertura.xml" \
     "-targetdir:$out/cs-report" \

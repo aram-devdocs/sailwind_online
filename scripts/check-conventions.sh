@@ -13,6 +13,10 @@
 #      required gate: coverlet.collector is referenced centrally, the ci.yml
 #      `coverage` job feeds the required `gate`, and both check scripts run
 #      C# + Rust coverage with a `--fail-under-lines` threshold.
+#   5. Coverage-set completeness: every game-free test project in
+#      SailwindOnline.CI.slnf except Sailwind.Architecture.Tests is named in
+#      scripts/coverage.sh, so a new game-free test project cannot silently drop
+#      out of the C# coverage measurement (and thus its floor).
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
@@ -84,6 +88,22 @@ for script in scripts/check.sh scripts/check.ps1; do
   have 'scripts/coverage\.sh' "$script" \
     || err "$script must run the coverage gate via scripts/coverage.sh."
 done
+
+# 5: coverage-set completeness. coverage.sh measures C# coverage over an explicit
+# list of game-free UNIT-test projects; Sailwind.Architecture.Tests is excluded
+# from that MEASUREMENT (its Cecil AssemblyScanner is incompatible with coverlet
+# instrumentation on Linux) but still runs unfiltered in the `dotnet` gate. A new
+# game-free test project could silently be added to SailwindOnline.CI.slnf but
+# left out of coverage.sh, quietly shrinking what the floor protects. Assert every
+# game-free test project in the CI filter, except Architecture.Tests, is named in
+# coverage.sh so the coverage set cannot regress by omission.
+slnf="SailwindOnline.CI.slnf"
+while IFS= read -r testproj; do
+  [ -n "$testproj" ] || continue
+  [ "$testproj" = "Sailwind.Architecture.Tests" ] && continue
+  have "$testproj" scripts/coverage.sh \
+    || err "$testproj is a game-free test project in $slnf but is absent from scripts/coverage.sh's coverage set."
+done < <(grep -oE 'Sailwind\.[A-Za-z.]+\.Tests\.csproj' "$slnf" | sed 's/\.csproj$//' | sort -u)
 
 if [ "$fail" -ne 0 ]; then
   echo "check-conventions: FAILED." >&2
