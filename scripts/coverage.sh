@@ -89,7 +89,7 @@ if command -v reportgenerator >/dev/null 2>&1; then
     "-reports:$out/cs/**/coverage.cobertura.xml" \
     "-targetdir:$out/cs-report" \
     "-reporttypes:TextSummary;Cobertura;Html"
-  rate="$(grep -oE 'line-rate="[0-9.]+"' "$out/cs-report/Cobertura.xml" | head -1 | grep -oE '[0-9.]+')"
+  rate="$(grep -m1 -oE 'line-rate="[0-9.]+"' "$out/cs-report/Cobertura.xml" | grep -oE '[0-9.]+')"
   pct="$(awk -v r="$rate" 'BEGIN{printf "%.1f", r*100}')"
   echo "C# line coverage: ${pct}% (floor ${CS_MIN}%)"
   awk -v p="$pct" -v m="$CS_MIN" 'BEGIN{exit !(p+0 >= m+0)}' \
