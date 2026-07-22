@@ -48,6 +48,9 @@ client_state_min_interval_ms = 20
 chat_min_interval_ms = 500
 # econ: caps new ledger transactions (replays of an applied txn are exempt).
 econ_min_interval_ms = 100
+# moor: caps new mooring commits (a MoorRequest writes a persistent moorage
+# record, so an unthrottled flood is a DoS on persistent state).
+moor_min_interval_ms = 250
 
 # Maximum length in bytes of any inbound wire string (chat text, econ note,
 # mooring name). A message carrying a longer string is rejected before it is

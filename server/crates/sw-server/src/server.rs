@@ -63,6 +63,7 @@ pub struct Server {
     client_state_limiter: RateLimiter,
     chat_limiter: RateLimiter,
     econ_limiter: RateLimiter,
+    moor_limiter: RateLimiter,
     running: Arc<AtomicBool>,
 }
 
@@ -91,6 +92,7 @@ impl Server {
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
 
         Ok(Server {
             cfg,
@@ -108,6 +110,7 @@ impl Server {
             client_state_limiter,
             chat_limiter,
             econ_limiter,
+            moor_limiter,
             running,
         })
     }
@@ -203,7 +206,7 @@ impl Server {
             }
             p::Payload::MoorRequest => {
                 if let Some(m) = env.payload_as_moor_request() {
-                    self.on_moor(peer, m)?;
+                    self.on_moor(peer, m, now_ms())?;
                 }
             }
             p::Payload::ChatSend => {
@@ -487,7 +490,12 @@ impl Server {
         Ok(())
     }
 
-    fn on_moor(&mut self, peer: PeerId, req: p::MoorRequest<'_>) -> anyhow::Result<()> {
+    fn on_moor(
+        &mut self,
+        peer: PeerId,
+        req: p::MoorRequest<'_>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
         let Some((owner, aboard)) = self
             .sessions
             .get(&peer)
@@ -513,8 +521,19 @@ impl Server {
             return Ok(());
         }
         let name = name.to_string();
+
+        // Per-player throttle: a MoorRequest commits a persistent moorage record,
+        // so an unthrottled flood is a real DoS on persistent state (the #21 trade
+        // class). Reject a new moor beyond the configured rate BEFORE the write,
+        // keyed by player so it is rotation-proof and memory-bounded exactly like
+        // the trade/econ/chat limiters.
+        if !self.moor_limiter.allow(owner, now_ms) {
+            tracing::debug!(owner, "moor request rate limited");
+            return Ok(());
+        }
+
         let cell = self.world.grid().cell_of(pos[0], pos[2]);
-        let created = now_ms();
+        let created = now_ms;
 
         let row = MooringRow {
             boat_id: boat_id as i64,
@@ -603,6 +622,7 @@ impl Server {
             self.client_state_limiter.clear(s.player_id);
             self.chat_limiter.clear(s.player_id);
             self.econ_limiter.clear(s.player_id);
+            self.moor_limiter.clear(s.player_id);
             self.db.touch_last_seen(s.player_id as i64, now_ms())?;
             tracing::info!(peer, player_id = s.player_id, ?reason, "peer disconnected");
         }
@@ -841,6 +861,7 @@ mod aoi_harden_tests {
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
             host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
             db: Db::open_in_memory().unwrap(),
@@ -856,6 +877,7 @@ mod aoi_harden_tests {
             client_state_limiter,
             chat_limiter,
             econ_limiter,
+            moor_limiter,
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
@@ -1033,6 +1055,7 @@ mod market_dispatch_tests {
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
             host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
             db: Db::open_in_memory().unwrap(),
@@ -1048,6 +1071,7 @@ mod market_dispatch_tests {
             client_state_limiter,
             chat_limiter,
             econ_limiter,
+            moor_limiter,
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
@@ -1253,6 +1277,7 @@ mod input_hardening_tests {
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
             host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
             db: Db::open_in_memory().unwrap(),
@@ -1268,6 +1293,7 @@ mod input_hardening_tests {
             client_state_limiter,
             chat_limiter,
             econ_limiter,
+            moor_limiter,
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
@@ -1337,6 +1363,29 @@ mod input_hardening_tests {
         let env = decode_envelope(env_bytes).unwrap();
         server
             .on_econ(peer, env.payload_as_econ_txn().unwrap(), now_ms)
+            .unwrap();
+    }
+
+    fn moor_envelope(x: f32, z: f32, name: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let pos = p::Vec3::new(x, 0.0, z);
+        let rot = p::QuatC::new(0.0, 0.0, 0.0, 1.0);
+        let name_off = fbb.create_string(name);
+        let req = p::MoorRequest::create(
+            &mut fbb,
+            &p::MoorRequestArgs {
+                pos: Some(&pos),
+                rot: Some(&rot),
+                name: Some(name_off),
+            },
+        );
+        finish_envelope(&mut fbb, 6, p::Payload::MoorRequest, req.as_union_value())
+    }
+
+    fn send_moor(server: &mut Server, peer: PeerId, env_bytes: &[u8], now_ms: i64) {
+        let env = decode_envelope(env_bytes).unwrap();
+        server
+            .on_moor(peer, env.payload_as_moor_request().unwrap(), now_ms)
             .unwrap();
     }
 
@@ -1515,6 +1564,64 @@ mod input_hardening_tests {
         assert_eq!(server.econ_limiter.tracked_count(), 1);
     }
 
+    #[test]
+    fn moor_flood_is_throttled_before_the_persistent_write() {
+        // MoorRequest mutates persistent state (it commits a moorage record), so an
+        // unthrottled flood is a real DoS -- the same class fixed for trades in #21.
+        // The per-player moor throttle must reject a new moor inside the window
+        // BEFORE the persistent write, mirroring on_trade/on_econ: the first moor
+        // lands, a flood inside the window never touches the DB, and the limiter is
+        // keyed by player so it stays bounded to exactly one entry.
+        let mut server = make_server(Config {
+            moor_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-moor");
+
+        // The mooring is keyed by boat_id, falling back to the player id (the
+        // player is not aboard a boat here), so every moor upserts the same row --
+        // the persisted `name` is what reveals whether a throttled moor committed.
+        let cell = server.world.grid().cell_of(0.0, 0.0);
+        let persisted_name = |s: &Server| {
+            s.db.moorings_in_cell(cell.cx, cell.cz).unwrap()[0]
+                .name
+                .clone()
+        };
+
+        // First moor at t=1000 lands and is persisted.
+        send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "first"), 1_000);
+        assert_eq!(persisted_name(&server), "first");
+
+        // A flood of further moors inside the 250ms window is rejected before the
+        // write: the persisted mooring keeps the first name and the limiter holds
+        // exactly one (per-player) entry no matter how many messages arrive.
+        for _ in 0..1_000 {
+            send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "flood"), 1_050);
+        }
+        assert_eq!(
+            persisted_name(&server),
+            "first",
+            "a moor inside the window must be rejected before the persistent write"
+        );
+        assert_eq!(server.moor_limiter.tracked_count(), 1);
+
+        // Once the window elapses the next moor is admitted and overwrites the row.
+        send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "third"), 1_300);
+        assert_eq!(persisted_name(&server), "third");
+
+        // Disconnect drops the departed player's moor throttle entry so connection
+        // churn cannot leave residue behind, mirroring the other message classes.
+        server
+            .on_disconnect(peer, DisconnectReason::Remote)
+            .unwrap();
+        assert_eq!(
+            server.moor_limiter.tracked_count(),
+            0,
+            "the disconnected player's moor limiter entry must be cleared"
+        );
+    }
+
     fn send_chat(server: &mut Server, peer: PeerId, text: &str, now_ms: i64) {
         let mut fbb = FlatBufferBuilder::new();
         let text_off = fbb.create_string(text);
@@ -1565,6 +1672,7 @@ mod input_hardening_tests {
             chat_min_interval_ms: 250,
             econ_min_interval_ms: 250,
             trade_min_interval_ms: 250,
+            moor_min_interval_ms: 250,
             ..Config::default()
         });
         let peer: PeerId = 1;
@@ -1578,6 +1686,7 @@ mod input_hardening_tests {
         );
         send_econ(&mut server, peer, &econ_envelope(1, 100, "a"), 1_000);
         send_chat(&mut server, peer, "hi", 1_000);
+        send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "m"), 1_000);
         // Seed the trade limiter directly (its handler needs a market envelope,
         // covered in the market dispatch suite); the point here is that
         // on_disconnect clears every class.
@@ -1586,6 +1695,7 @@ mod input_hardening_tests {
         assert_eq!(server.econ_limiter.tracked_count(), 1);
         assert_eq!(server.chat_limiter.tracked_count(), 1);
         assert_eq!(server.trade_limiter.tracked_count(), 1);
+        assert_eq!(server.moor_limiter.tracked_count(), 1);
 
         server
             .on_disconnect(peer, DisconnectReason::Remote)
@@ -1595,6 +1705,7 @@ mod input_hardening_tests {
         assert_eq!(server.econ_limiter.tracked_count(), 0);
         assert_eq!(server.chat_limiter.tracked_count(), 0);
         assert_eq!(server.trade_limiter.tracked_count(), 0);
+        assert_eq!(server.moor_limiter.tracked_count(), 0);
     }
 
     // ---- PART 3: headless load test ----

@@ -15,10 +15,10 @@ pub const MAX_AOI_RADIUS_CELLS: u32 = 16;
 const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 
 /// Upper bound on any aggregate per-player message-class min-interval, in
-/// milliseconds (market trade, client-state, chat, econ). Bounds the rate-limit
-/// knobs so a misconfiguration cannot wedge a message class behind an absurd
-/// cooldown, and so the saturating accessors have a finite ceiling. One hour is
-/// already far beyond any sane throttle.
+/// milliseconds (market trade, client-state, chat, econ, moor). Bounds the
+/// rate-limit knobs so a misconfiguration cannot wedge a message class behind an
+/// absurd cooldown, and so the saturating accessors have a finite ceiling. One
+/// hour is already far beyond any sane throttle.
 pub const MAX_TRADE_MIN_INTERVAL_MS: u32 = 3_600_000;
 
 /// Upper bound on the per-message wire-string length cap, in bytes. Bounds the
@@ -67,6 +67,12 @@ pub struct Config {
     /// replay of an already-applied txn is not throttled, exactly like trades.
     /// Bounded by [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
     pub econ_min_interval_ms: u32,
+    /// Minimum interval, in milliseconds, between two accepted mooring requests
+    /// from the same player (an aggregate per-player throttle). A `MoorRequest`
+    /// commits a persistent moorage record, so a new moor beyond this rate is
+    /// rejected before the write to bound the persistent-state churn. Bounded by
+    /// [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    pub moor_min_interval_ms: u32,
     /// Maximum length, in bytes, of any inbound wire string (chat text, econ
     /// note, mooring name). A message carrying a longer string is rejected.
     /// Bounded by [`MAX_WIRE_STRING_LEN`].
@@ -89,6 +95,7 @@ impl Default for Config {
             client_state_min_interval_ms: 20,
             chat_min_interval_ms: 500,
             econ_min_interval_ms: 100,
+            moor_min_interval_ms: 250,
             max_wire_string_len: 512,
             server_name: "Sailwind Online (dev)".to_string(),
         }
@@ -183,6 +190,7 @@ impl Config {
             ),
             ("chat_min_interval_ms", self.chat_min_interval_ms),
             ("econ_min_interval_ms", self.econ_min_interval_ms),
+            ("moor_min_interval_ms", self.moor_min_interval_ms),
         ] {
             if value > MAX_TRADE_MIN_INTERVAL_MS {
                 return Err(anyhow::anyhow!(
@@ -231,6 +239,12 @@ impl Config {
     /// at [`MAX_TRADE_MIN_INTERVAL_MS`].
     pub fn econ_min_interval_ms_i64(&self) -> i64 {
         self.econ_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Moor throttle min-interval as a bounded `i64` of milliseconds. Saturates
+    /// at [`MAX_TRADE_MIN_INTERVAL_MS`].
+    pub fn moor_min_interval_ms_i64(&self) -> i64 {
+        self.moor_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
     }
 
     /// Wire-string length cap as a bounded `usize` of bytes. Saturates at
@@ -440,6 +454,7 @@ mod tests {
         assert!(cfg.client_state_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.chat_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.econ_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        assert!(cfg.moor_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         // The client-state cap must not throttle a client sending at snapshot_hz
         // (a full snapshot period is far longer than the min-interval).
         let snapshot_period_ms = 1000 / cfg.snapshot_hz;
@@ -457,6 +472,10 @@ mod tests {
             cfg.econ_min_interval_ms_i64(),
             cfg.econ_min_interval_ms as i64
         );
+        assert_eq!(
+            cfg.moor_min_interval_ms_i64(),
+            cfg.moor_min_interval_ms as i64
+        );
     }
 
     #[test]
@@ -465,6 +484,7 @@ mod tests {
             |c: &mut Config| c.client_state_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.chat_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.econ_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
+            |c: &mut Config| c.moor_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
         ] {
             let mut cfg = Config::default();
             mutate(&mut cfg);
@@ -481,6 +501,7 @@ mod tests {
             client_state_min_interval_ms: u32::MAX,
             chat_min_interval_ms: u32::MAX,
             econ_min_interval_ms: u32::MAX,
+            moor_min_interval_ms: u32::MAX,
             ..Config::default()
         };
         assert_eq!(
@@ -493,6 +514,10 @@ mod tests {
         );
         assert_eq!(
             cfg.econ_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
+        assert_eq!(
+            cfg.moor_min_interval_ms_i64(),
             MAX_TRADE_MIN_INTERVAL_MS as i64
         );
     }
@@ -537,12 +562,14 @@ mod tests {
             client_state_min_interval_ms = 33
             chat_min_interval_ms = 750
             econ_min_interval_ms = 200
+            moor_min_interval_ms = 400
             max_wire_string_len = 256
         "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(cfg.client_state_min_interval_ms, 33);
         assert_eq!(cfg.chat_min_interval_ms, 750);
         assert_eq!(cfg.econ_min_interval_ms, 200);
+        assert_eq!(cfg.moor_min_interval_ms, 400);
         assert_eq!(cfg.max_wire_string_len, 256);
         cfg.validate().unwrap();
     }
