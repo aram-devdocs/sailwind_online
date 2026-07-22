@@ -14,11 +14,28 @@ pub const MAX_AOI_RADIUS_CELLS: u32 = 16;
 /// only needs `> 0`, but an absurd value is a misconfiguration.
 const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 
-/// Upper bound on the aggregate per-player market trade min-interval, in
-/// milliseconds. Bounds the rate-limit knob so a misconfiguration cannot wedge
-/// trading behind an absurd cooldown, and so the saturating accessor has a
-/// finite ceiling. One hour is already far beyond any sane throttle.
+/// Lower bound on the grid cell size, in metres. A sub-metre cell is nonsensical
+/// for the 1024 m-default sailing world, and a pathological *operator* value
+/// below 1 m shrinks the `(x / cell_size)` divisor enough to saturate the
+/// `.floor() as i32` cast in [`sw_world::Grid::cell_of`] — the same #19-class
+/// overflow the hostile-client position path is already guarded against. The
+/// per-coordinate [`crate::validate::MAX_WORLD_COORD_M`] clamp only bounds the
+/// numerator, so the divisor needs its own floor here.
+const MIN_CELL_SIZE_M: f32 = 1.0;
+
+/// Upper bound on any aggregate per-player message-class min-interval, in
+/// milliseconds (market trade, client-state, chat, econ, moor). Bounds the
+/// rate-limit knobs so a misconfiguration cannot wedge a message class behind an
+/// absurd cooldown, and so the saturating accessors have a finite ceiling. One
+/// hour is already far beyond any sane throttle.
 pub const MAX_TRADE_MIN_INTERVAL_MS: u32 = 3_600_000;
+
+/// Upper bound on the per-message wire-string length cap, in bytes. Bounds the
+/// [`Config::max_wire_string_len`] knob so a misconfiguration cannot admit an
+/// unbounded string, and so the saturating accessor has a finite ceiling. The
+/// datagram itself is already capped near the MTU by the transport, so this is
+/// a defense-in-depth ceiling on individual string fields.
+pub const MAX_WIRE_STRING_LEN: u32 = 4_096;
 
 /// Runtime configuration for the server (see `config.example.toml`).
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +62,30 @@ pub struct Config {
     /// idempotent replay of an already-applied trade is not throttled. Bounded
     /// by [`MAX_TRADE_MIN_INTERVAL_MS`].
     pub trade_min_interval_ms: u32,
+    /// Minimum interval, in milliseconds, between two processed `ClientState`
+    /// updates from the same player (an aggregate per-player throttle). A flood
+    /// beyond this rate is dropped before it can drive the grid/AoI recompute.
+    /// Bounded by [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    pub client_state_min_interval_ms: u32,
+    /// Minimum interval, in milliseconds, between two processed chat messages
+    /// from the same player (an aggregate per-player throttle). Bounded by
+    /// [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    pub chat_min_interval_ms: u32,
+    /// Minimum interval, in milliseconds, between two *new* econ transactions
+    /// from the same player (an aggregate per-player throttle). An idempotent
+    /// replay of an already-applied txn is not throttled, exactly like trades.
+    /// Bounded by [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    pub econ_min_interval_ms: u32,
+    /// Minimum interval, in milliseconds, between two accepted mooring requests
+    /// from the same player (an aggregate per-player throttle). A `MoorRequest`
+    /// commits a persistent moorage record, so a new moor beyond this rate is
+    /// rejected before the write to bound the persistent-state churn. Bounded by
+    /// [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    pub moor_min_interval_ms: u32,
+    /// Maximum length, in bytes, of any inbound wire string (chat text, econ
+    /// note, mooring name). A message carrying a longer string is rejected.
+    /// Bounded by [`MAX_WIRE_STRING_LEN`].
+    pub max_wire_string_len: u32,
     /// Human-readable server name in ServerHello.
     pub server_name: String,
 }
@@ -60,6 +101,11 @@ impl Default for Config {
             aoi_radius_cells: sw_world::AOI_RADIUS_CELLS as u32,
             cell_size_m: sw_world::Grid::DEFAULT_CELL_SIZE_M,
             trade_min_interval_ms: 250,
+            client_state_min_interval_ms: 20,
+            chat_min_interval_ms: 500,
+            econ_min_interval_ms: 100,
+            moor_min_interval_ms: 250,
+            max_wire_string_len: 512,
             server_name: "Sailwind Online (dev)".to_string(),
         }
     }
@@ -138,16 +184,32 @@ impl Config {
             ));
         }
         if !self.cell_size_m.is_finite()
-            || self.cell_size_m <= 0.0
+            || self.cell_size_m < MIN_CELL_SIZE_M
             || self.cell_size_m > MAX_CELL_SIZE_M
         {
             return Err(anyhow::anyhow!(
-                "cell_size_m must be a finite value in (0, {MAX_CELL_SIZE_M}]"
+                "cell_size_m must be a finite value in [{MIN_CELL_SIZE_M}, {MAX_CELL_SIZE_M}]"
             ));
         }
-        if self.trade_min_interval_ms > MAX_TRADE_MIN_INTERVAL_MS {
+        for (name, value) in [
+            ("trade_min_interval_ms", self.trade_min_interval_ms),
+            (
+                "client_state_min_interval_ms",
+                self.client_state_min_interval_ms,
+            ),
+            ("chat_min_interval_ms", self.chat_min_interval_ms),
+            ("econ_min_interval_ms", self.econ_min_interval_ms),
+            ("moor_min_interval_ms", self.moor_min_interval_ms),
+        ] {
+            if value > MAX_TRADE_MIN_INTERVAL_MS {
+                return Err(anyhow::anyhow!(
+                    "{name} must be in 0..={MAX_TRADE_MIN_INTERVAL_MS}"
+                ));
+            }
+        }
+        if self.max_wire_string_len == 0 || self.max_wire_string_len > MAX_WIRE_STRING_LEN {
             return Err(anyhow::anyhow!(
-                "trade_min_interval_ms must be in 0..={MAX_TRADE_MIN_INTERVAL_MS}"
+                "max_wire_string_len must be in 1..={MAX_WIRE_STRING_LEN}"
             ));
         }
         Ok(())
@@ -168,14 +230,52 @@ impl Config {
         self.trade_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
     }
 
+    /// Client-state throttle min-interval as a bounded `i64` of milliseconds.
+    /// Saturates at [`MAX_TRADE_MIN_INTERVAL_MS`] so the limiter math stays
+    /// finite even if a caller bypasses [`Config::validate`].
+    pub fn client_state_min_interval_ms_i64(&self) -> i64 {
+        self.client_state_min_interval_ms
+            .min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Chat throttle min-interval as a bounded `i64` of milliseconds. Saturates
+    /// at [`MAX_TRADE_MIN_INTERVAL_MS`].
+    pub fn chat_min_interval_ms_i64(&self) -> i64 {
+        self.chat_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Econ throttle min-interval as a bounded `i64` of milliseconds. Saturates
+    /// at [`MAX_TRADE_MIN_INTERVAL_MS`].
+    pub fn econ_min_interval_ms_i64(&self) -> i64 {
+        self.econ_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Moor throttle min-interval as a bounded `i64` of milliseconds. Saturates
+    /// at [`MAX_TRADE_MIN_INTERVAL_MS`].
+    pub fn moor_min_interval_ms_i64(&self) -> i64 {
+        self.moor_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Wire-string length cap as a bounded `usize` of bytes. Saturates at
+    /// [`MAX_WIRE_STRING_LEN`] so the guard has a finite ceiling even if a
+    /// caller bypasses [`Config::validate`].
+    pub fn max_wire_string_len_usize(&self) -> usize {
+        self.max_wire_string_len.min(MAX_WIRE_STRING_LEN) as usize
+    }
+
     /// Number of ticks between snapshot broadcasts.
     pub fn ticks_per_snapshot(&self) -> u64 {
         (self.tick_hz / self.snapshot_hz).max(1) as u64
     }
 
-    /// Number of ticks between standalone world-clock broadcasts.
+    /// Number of ticks between standalone world-clock broadcasts. Uses a
+    /// saturating multiply for parity with the other cadence accessors, so the
+    /// `tick_hz * clock_broadcast_secs` product can never overflow even if a
+    /// caller bypasses [`Config::validate`] or supplies a hostile pair.
     pub fn ticks_per_clock_broadcast(&self) -> u64 {
-        (self.tick_hz * self.clock_broadcast_secs).max(1) as u64
+        self.tick_hz
+            .saturating_mul(self.clock_broadcast_secs)
+            .max(1) as u64
     }
 }
 
@@ -213,6 +313,21 @@ mod tests {
     }
 
     #[test]
+    fn ticks_per_clock_broadcast_saturates_and_never_overflows() {
+        // Parity with the other cadence accessors: `tick_hz * clock_broadcast_secs`
+        // is an unbounded `u32` multiply, so a hostile/misconfigured pair would
+        // overflow (panic in debug, wrap in release) before this fix. The
+        // accessor must saturate instead, so the tick cadence math can never
+        // overflow no matter how the values were supplied (#17 nit).
+        let cfg = Config {
+            tick_hz: u32::MAX,
+            clock_broadcast_secs: u32::MAX,
+            ..Config::default()
+        };
+        assert_eq!(cfg.ticks_per_clock_broadcast(), u32::MAX as u64);
+    }
+
+    #[test]
     fn rejects_bad_snapshot_rate() {
         let cfg = Config {
             snapshot_hz: 100,
@@ -239,6 +354,31 @@ mod tests {
             };
             assert!(cfg.validate().is_err(), "cell_size {bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn rejects_sub_metre_cell_size() {
+        // A sub-metre cell is nonsensical for the 1024 m-default sailing world and
+        // would let a pathological *operator* value shrink the `(x / cell_size)`
+        // divisor enough to saturate the `.floor() as i32` cast in
+        // `sw_world::Grid::cell_of` — the same #19-class overflow the client path
+        // is already guarded against. The validator must floor the cell at 1.0 m.
+        for bad in [0.5f32, 0.999, f32::MIN_POSITIVE] {
+            let cfg = Config {
+                cell_size_m: bad,
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "sub-metre cell_size {bad} must be rejected"
+            );
+        }
+        // The lower bound is inclusive: exactly 1.0 m is the smallest sane cell.
+        let ok = Config {
+            cell_size_m: MIN_CELL_SIZE_M,
+            ..Config::default()
+        };
+        ok.validate().unwrap();
     }
 
     #[test]
@@ -337,6 +477,134 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(cfg.trade_min_interval_ms, 500);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn message_rate_limit_defaults_are_valid_and_bounded() {
+        let cfg = Config::default();
+        cfg.validate().unwrap();
+        // A permissive-but-finite default for each per-class throttle.
+        assert!(cfg.client_state_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        assert!(cfg.chat_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        assert!(cfg.econ_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        assert!(cfg.moor_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        // The client-state cap must not throttle a client sending at snapshot_hz
+        // (a full snapshot period is far longer than the min-interval).
+        let snapshot_period_ms = 1000 / cfg.snapshot_hz;
+        assert!(cfg.client_state_min_interval_ms < snapshot_period_ms);
+        // The bounded accessors mirror the config values for sane defaults.
+        assert_eq!(
+            cfg.client_state_min_interval_ms_i64(),
+            cfg.client_state_min_interval_ms as i64
+        );
+        assert_eq!(
+            cfg.chat_min_interval_ms_i64(),
+            cfg.chat_min_interval_ms as i64
+        );
+        assert_eq!(
+            cfg.econ_min_interval_ms_i64(),
+            cfg.econ_min_interval_ms as i64
+        );
+        assert_eq!(
+            cfg.moor_min_interval_ms_i64(),
+            cfg.moor_min_interval_ms as i64
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_message_intervals() {
+        for mutate in [
+            |c: &mut Config| c.client_state_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
+            |c: &mut Config| c.chat_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
+            |c: &mut Config| c.econ_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
+            |c: &mut Config| c.moor_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
+        ] {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            assert!(
+                cfg.validate().is_err(),
+                "an interval past the bound must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn message_interval_accessors_saturate_at_the_bound() {
+        let cfg = Config {
+            client_state_min_interval_ms: u32::MAX,
+            chat_min_interval_ms: u32::MAX,
+            econ_min_interval_ms: u32::MAX,
+            moor_min_interval_ms: u32::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.client_state_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
+        assert_eq!(
+            cfg.chat_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
+        assert_eq!(
+            cfg.econ_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
+        assert_eq!(
+            cfg.moor_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
+    }
+
+    #[test]
+    fn wire_string_len_default_is_valid_and_accessor_saturates() {
+        let cfg = Config::default();
+        cfg.validate().unwrap();
+        assert!(cfg.max_wire_string_len > 0);
+        assert!(cfg.max_wire_string_len <= MAX_WIRE_STRING_LEN);
+        assert_eq!(
+            cfg.max_wire_string_len_usize(),
+            cfg.max_wire_string_len as usize
+        );
+        let huge = Config {
+            max_wire_string_len: u32::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            huge.max_wire_string_len_usize(),
+            MAX_WIRE_STRING_LEN as usize
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_wire_string_len() {
+        let zero = Config {
+            max_wire_string_len: 0,
+            ..Config::default()
+        };
+        assert!(zero.validate().is_err(), "a zero-length cap is rejected");
+        let huge = Config {
+            max_wire_string_len: MAX_WIRE_STRING_LEN + 1,
+            ..Config::default()
+        };
+        assert!(huge.validate().is_err(), "a cap past the bound is rejected");
+    }
+
+    #[test]
+    fn parses_new_hardening_keys() {
+        let toml_text = r#"
+            client_state_min_interval_ms = 33
+            chat_min_interval_ms = 750
+            econ_min_interval_ms = 200
+            moor_min_interval_ms = 400
+            max_wire_string_len = 256
+        "#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.client_state_min_interval_ms, 33);
+        assert_eq!(cfg.chat_min_interval_ms, 750);
+        assert_eq!(cfg.econ_min_interval_ms, 200);
+        assert_eq!(cfg.moor_min_interval_ms, 400);
+        assert_eq!(cfg.max_wire_string_len, 256);
         cfg.validate().unwrap();
     }
 

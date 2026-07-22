@@ -36,5 +36,26 @@ cell_size_m = 1024.0
 # throttled. Must be in 0..=3600000 (0 disables the throttle).
 trade_min_interval_ms = 250
 
+# Per-player throttles (milliseconds) for the other inbound message classes,
+# mirroring the rotation-proof, memory-bounded trade limiter above. A message
+# beyond the configured rate is dropped before it drives work; an idempotent
+# econ replay is never throttled. Each must be in 0..=3600000 (0 disables it).
+#
+# client_state: caps how often a player's position update drives the grid/AoI
+# recompute. Keep it well below the client's send period (1000 / snapshot_hz).
+client_state_min_interval_ms = 20
+# chat: caps outbound chat fan-out to AoI subscribers.
+chat_min_interval_ms = 500
+# econ: caps new ledger transactions (replays of an applied txn are exempt).
+econ_min_interval_ms = 100
+# moor: caps new mooring commits (a MoorRequest writes a persistent moorage
+# record, so an unthrottled flood is a DoS on persistent state).
+moor_min_interval_ms = 250
+
+# Maximum length in bytes of any inbound wire string (chat text, econ note,
+# mooring name). A message carrying a longer string is rejected before it is
+# stored or rebroadcast. Must be in 1..=4096.
+max_wire_string_len = 512
+
 # Human-readable server name returned in ServerHello.
 server_name = "Sailwind Online (dev)"

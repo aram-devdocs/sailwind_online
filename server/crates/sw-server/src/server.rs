@@ -5,6 +5,7 @@ use crate::codec::{self, BoatSnap, Caps, MooringSnap, PlayerSnap};
 use crate::config::Config;
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
 use crate::ratelimit::RateLimiter;
+use crate::validate;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,10 @@ pub struct Server {
     weather_seed: u64,
     weather_epoch_day: u32,
     trade_limiter: RateLimiter,
+    client_state_limiter: RateLimiter,
+    chat_limiter: RateLimiter,
+    econ_limiter: RateLimiter,
+    moor_limiter: RateLimiter,
     running: Arc<AtomicBool>,
 }
 
@@ -84,6 +89,10 @@ impl Server {
         let host = Host::bind(&cfg.bind, CONNECT_KEY)?;
         let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
+        let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
+        let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
+        let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
 
         Ok(Server {
             cfg,
@@ -98,6 +107,10 @@ impl Server {
             weather_seed,
             weather_epoch_day,
             trade_limiter,
+            client_state_limiter,
+            chat_limiter,
+            econ_limiter,
+            moor_limiter,
             running,
         })
     }
@@ -178,12 +191,12 @@ impl Server {
             }
             p::Payload::ClientState => {
                 if let Some(cs) = env.payload_as_client_state() {
-                    self.on_client_state(peer, cs);
+                    self.on_client_state(peer, cs, now_ms());
                 }
             }
             p::Payload::EconTxn => {
                 if let Some(t) = env.payload_as_econ_txn() {
-                    self.on_econ(peer, t)?;
+                    self.on_econ(peer, t, now_ms())?;
                 }
             }
             p::Payload::MarketTradeRequest => {
@@ -193,12 +206,12 @@ impl Server {
             }
             p::Payload::MoorRequest => {
                 if let Some(m) = env.payload_as_moor_request() {
-                    self.on_moor(peer, m)?;
+                    self.on_moor(peer, m, now_ms())?;
                 }
             }
             p::Payload::ChatSend => {
                 if let Some(c) = env.payload_as_chat_send() {
-                    self.on_chat(peer, c);
+                    self.on_chat(peer, c, now_ms());
                 }
             }
             _ => {}
@@ -290,15 +303,37 @@ impl Server {
         Ok(())
     }
 
-    fn on_client_state(&mut self, peer: PeerId, cs: p::ClientState<'_>) {
+    fn on_client_state(&mut self, peer: PeerId, cs: p::ClientState<'_>, now_ms: i64) {
+        let Some(player_id) = self.sessions.get(&peer).map(|s| s.player_id) else {
+            return;
+        };
+
+        // Per-player throttle: a client-state flood beyond the configured rate is
+        // dropped before it can drive the grid/AoI recompute. Keyed by player, so
+        // it is rotation-proof and memory-bounded exactly like the trade limiter.
+        if !self.client_state_limiter.allow(player_id, now_ms) {
+            return;
+        }
+
+        // Value validation beyond the FlatBuffers verifier: a non-finite (NaN/Inf)
+        // pos/rot/vel drops the message, and an out-of-bounds finite coordinate is
+        // clamped, BEFORE any of it reaches the cell math. Without this a hostile
+        // Inf position saturates the `as i32` cast to `i32::MAX` and the block-offset
+        // add in `cells_in_radius` overflows (fixes the #19 nit).
+        let Some(motion) =
+            validate::sanitize_motion(vec3_of(cs.pos()), quat_of(cs.rot()), vec3_of(cs.vel()))
+        else {
+            return;
+        };
+
         let aoi;
         {
             let Some(s) = self.sessions.get_mut(&peer) else {
                 return;
             };
-            s.pos = vec3_of(cs.pos());
-            s.rot = quat_of(cs.rot());
-            s.vel = vec3_of(cs.vel());
+            s.pos = motion.pos;
+            s.rot = motion.rot;
+            s.vel = motion.vel;
             s.aboard_boat = cs.aboard_boat();
             s.t_ms = cs.t_ms();
             s.dirty = true;
@@ -340,19 +375,39 @@ impl Server {
         }
     }
 
-    fn on_econ(&mut self, peer: PeerId, txn: p::EconTxn<'_>) -> anyhow::Result<()> {
+    fn on_econ(&mut self, peer: PeerId, txn: p::EconTxn<'_>, now_ms: i64) -> anyhow::Result<()> {
         let Some(player_id) = self.sessions.get(&peer).map(|s| s.player_id) else {
             return Ok(());
         };
+
+        // Reject an over-long note before it can be stored/logged. The scalar
+        // amount is left to the ledger, which already guards overflow and the
+        // non-negative-balance invariant with checked math.
+        let note = txn.note().unwrap_or("");
+        if !validate::string_within_limit(note, self.cfg.max_wire_string_len_usize()) {
+            return Ok(());
+        }
+
+        // Idempotency-first: a replay of an already-committed txn returns the
+        // recorded balance and is never throttled, so an app-level resend after
+        // packet loss stays safe under the rate limit. Only a genuinely new txn is
+        // charged against the aggregate per-player econ throttle.
+        let txn_id = txn.txn_id();
+        let already_applied = self.db.lookup_txn(txn_id as i64)?.is_some();
+        if !already_applied && !self.econ_limiter.allow(player_id, now_ms) {
+            tracing::debug!(player_id, txn_id, "econ txn rate limited");
+            return Ok(());
+        }
+
         let txn = Txn {
-            txn_id: txn.txn_id(),
+            txn_id,
             amount_gold: txn.amount_gold(),
             kind: txn.kind(),
-            note: txn.note().unwrap_or("").to_string(),
+            note: note.to_string(),
         };
 
         let ack = {
-            let mut ledger = Ledger::new(DbLedgerStore::new(&self.db, now_ms()));
+            let mut ledger = Ledger::new(DbLedgerStore::new(&self.db, now_ms));
             ledger.apply(player_id, &txn)?
         };
         tracing::debug!(
@@ -435,7 +490,12 @@ impl Server {
         Ok(())
     }
 
-    fn on_moor(&mut self, peer: PeerId, req: p::MoorRequest<'_>) -> anyhow::Result<()> {
+    fn on_moor(
+        &mut self,
+        peer: PeerId,
+        req: p::MoorRequest<'_>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
         let Some((owner, aboard)) = self
             .sessions
             .get(&peer)
@@ -445,11 +505,35 @@ impl Server {
         };
         // Use the boarded boat id, falling back to the player id as a stable key.
         let boat_id = if aboard != 0 { aboard } else { owner };
-        let pos = vec3_of(req.pos());
-        let rot = quat_of(req.rot());
-        let name = req.name().unwrap_or("mooring").to_string();
+
+        // Value validation: a non-finite/out-of-bounds mooring pose is rejected or
+        // clamped before it reaches `cell_of` (same overflow class as ClientState),
+        // and an over-long name is rejected before it is persisted.
+        let Some(motion) =
+            validate::sanitize_motion(vec3_of(req.pos()), quat_of(req.rot()), [0.0; 3])
+        else {
+            return Ok(());
+        };
+        let pos = motion.pos;
+        let rot = motion.rot;
+        let name = req.name().unwrap_or("mooring");
+        if !validate::string_within_limit(name, self.cfg.max_wire_string_len_usize()) {
+            return Ok(());
+        }
+        let name = name.to_string();
+
+        // Per-player throttle: a MoorRequest commits a persistent moorage record,
+        // so an unthrottled flood is a real DoS on persistent state (the #21 trade
+        // class). Reject a new moor beyond the configured rate BEFORE the write,
+        // keyed by player so it is rotation-proof and memory-bounded exactly like
+        // the trade/econ/chat limiters.
+        if !self.moor_limiter.allow(owner, now_ms) {
+            tracing::debug!(owner, "moor request rate limited");
+            return Ok(());
+        }
+
         let cell = self.world.grid().cell_of(pos[0], pos[2]);
-        let created = now_ms();
+        let created = now_ms;
 
         let row = MooringRow {
             boat_id: boat_id as i64,
@@ -484,7 +568,7 @@ impl Server {
         Ok(())
     }
 
-    fn on_chat(&mut self, peer: PeerId, chat: p::ChatSend<'_>) {
+    fn on_chat(&mut self, peer: PeerId, chat: p::ChatSend<'_>, now_ms: i64) {
         let Some((sender_player, name, cell)) = self
             .sessions
             .get(&peer)
@@ -495,7 +579,21 @@ impl Server {
         let Some(cell) = cell else {
             return;
         };
-        let text = chat.text().unwrap_or("").to_string();
+
+        // Reject an over-long line before it is broadcast (a single datagram must
+        // not amplify into unbounded rebroadcast bytes).
+        let text = chat.text().unwrap_or("");
+        if !validate::string_within_limit(text, self.cfg.max_wire_string_len_usize()) {
+            return;
+        }
+
+        // Per-player chat throttle: a flood beyond the configured rate is dropped
+        // before it fans out to every AoI subscriber.
+        if !self.chat_limiter.allow(sender_player, now_ms) {
+            return;
+        }
+
+        let text = text.to_string();
         let channel = chat.channel();
         let t_ms = self.uptime_ms();
 
@@ -517,10 +615,14 @@ impl Server {
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
         if let Some(s) = self.sessions.remove(&peer) {
             self.world.remove(s.player_id);
-            // Drop the player's throttle state: a departed player's entry is
-            // useless and leaving it behind would let connection churn accrete
-            // stale entries in the limiter map.
+            // Drop the player's throttle state across every message class: a
+            // departed player's entries are useless and leaving them behind would
+            // let connection churn accrete stale entries in the limiter maps.
             self.trade_limiter.clear(s.player_id);
+            self.client_state_limiter.clear(s.player_id);
+            self.chat_limiter.clear(s.player_id);
+            self.econ_limiter.clear(s.player_id);
+            self.moor_limiter.clear(s.player_id);
             self.db.touch_last_seen(s.player_id as i64, now_ms())?;
             tracing::info!(peer, player_id = s.player_id, ?reason, "peer disconnected");
         }
@@ -756,6 +858,10 @@ mod aoi_harden_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
+        let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
+        let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
+        let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
             host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
             db: Db::open_in_memory().unwrap(),
@@ -768,6 +874,10 @@ mod aoi_harden_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             trade_limiter,
+            client_state_limiter,
+            chat_limiter,
+            econ_limiter,
+            moor_limiter,
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
@@ -848,7 +958,7 @@ mod aoi_harden_tests {
         let far_x = 10.0 * server.world.grid().cell_size_m;
         let state_bytes = state_envelope(far_x, 0.0);
         let cs = decode_envelope(&state_bytes).unwrap();
-        server.on_client_state(peer, cs.payload_as_client_state().unwrap());
+        server.on_client_state(peer, cs.payload_as_client_state().unwrap(), 1_000);
 
         let after = server.sessions[&peer].sub.cells();
         let new_center = server.world.grid().cell_of(far_x, 0.0);
@@ -942,6 +1052,10 @@ mod market_dispatch_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
+        let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
+        let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
+        let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
             host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
             db: Db::open_in_memory().unwrap(),
@@ -954,6 +1068,10 @@ mod market_dispatch_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             trade_limiter,
+            client_state_limiter,
+            chat_limiter,
+            econ_limiter,
+            moor_limiter,
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
@@ -1135,6 +1253,548 @@ mod market_dispatch_tests {
             server.trade_limiter.tracked_count(),
             0,
             "the disconnected player's limiter entry must be cleared"
+        );
+    }
+}
+
+/// Server-hardening (#24): per-message input validation and per-class rate
+/// limits exercised against the real handlers. These pin that a hostile
+/// ClientState (non-finite / absurd pos) is rejected or clamped before it can
+/// drive unbounded cell math (the #19 nit), that an over-long wire string is
+/// refused, and that every throttled message class (client-state, chat, econ)
+/// drops a flooding client while staying memory-bounded and clearing on
+/// disconnect — mirroring the rotation-proof trade limiter from #21.
+#[cfg(test)]
+mod input_hardening_tests {
+    use super::*;
+    use flatbuffers::FlatBufferBuilder;
+    use sw_contracts::{decode_envelope, finish_envelope};
+    use sw_world::Grid;
+
+    fn make_server(cfg: Config) -> Server {
+        let world = World::new(Grid::new(cfg.cell_size_m));
+        let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
+        let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
+        let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
+        let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
+        let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
+        Server {
+            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            db: Db::open_in_memory().unwrap(),
+            world,
+            sessions: HashMap::new(),
+            seq: 0,
+            snapshot_tick: 0,
+            boot: Instant::now(),
+            epoch_ms: 0,
+            weather_seed: 0,
+            weather_epoch_day: 0,
+            trade_limiter,
+            client_state_limiter,
+            chat_limiter,
+            econ_limiter,
+            moor_limiter,
+            running: Arc::new(AtomicBool::new(true)),
+            cfg,
+        }
+    }
+
+    fn join(server: &mut Server, peer: PeerId, token: &str) -> u64 {
+        let mut fbb = FlatBufferBuilder::new();
+        let token_off = fbb.create_string(token);
+        let name_off = fbb.create_string("Sailor");
+        let hello = p::ClientHello::create(
+            &mut fbb,
+            &p::ClientHelloArgs {
+                protocol_version: sw_contracts::PROTOCOL_VERSION,
+                display_name: Some(name_off),
+                token: Some(token_off),
+                ..Default::default()
+            },
+        );
+        let bytes = finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value());
+        let env = decode_envelope(&bytes).unwrap();
+        server
+            .on_hello(peer, env.payload_as_client_hello().unwrap())
+            .unwrap();
+        server.sessions[&peer].player_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn motion_envelope(px: f32, py: f32, pz: f32, vx: f32, vy: f32, vz: f32) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let pos = p::Vec3::new(px, py, pz);
+        let rot = p::QuatC::new(0.0, 0.0, 0.0, 1.0);
+        let vel = p::Vec3::new(vx, vy, vz);
+        let cs = p::ClientState::create(
+            &mut fbb,
+            &p::ClientStateArgs {
+                pos: Some(&pos),
+                rot: Some(&rot),
+                vel: Some(&vel),
+                aboard_boat: 0,
+                t_ms: 0,
+            },
+        );
+        finish_envelope(&mut fbb, 2, p::Payload::ClientState, cs.as_union_value())
+    }
+
+    fn send_state(server: &mut Server, peer: PeerId, env_bytes: &[u8], now_ms: i64) {
+        let env = decode_envelope(env_bytes).unwrap();
+        server.on_client_state(peer, env.payload_as_client_state().unwrap(), now_ms);
+    }
+
+    fn econ_envelope(txn_id: u64, amount: i64, note: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let note_off = fbb.create_string(note);
+        let txn = p::EconTxn::create(
+            &mut fbb,
+            &p::EconTxnArgs {
+                txn_id,
+                amount_gold: amount,
+                kind: 0,
+                note: Some(note_off),
+            },
+        );
+        finish_envelope(&mut fbb, 3, p::Payload::EconTxn, txn.as_union_value())
+    }
+
+    fn send_econ(server: &mut Server, peer: PeerId, env_bytes: &[u8], now_ms: i64) {
+        let env = decode_envelope(env_bytes).unwrap();
+        server
+            .on_econ(peer, env.payload_as_econ_txn().unwrap(), now_ms)
+            .unwrap();
+    }
+
+    fn moor_envelope(x: f32, z: f32, name: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let pos = p::Vec3::new(x, 0.0, z);
+        let rot = p::QuatC::new(0.0, 0.0, 0.0, 1.0);
+        let name_off = fbb.create_string(name);
+        let req = p::MoorRequest::create(
+            &mut fbb,
+            &p::MoorRequestArgs {
+                pos: Some(&pos),
+                rot: Some(&rot),
+                name: Some(name_off),
+            },
+        );
+        finish_envelope(&mut fbb, 6, p::Payload::MoorRequest, req.as_union_value())
+    }
+
+    fn send_moor(server: &mut Server, peer: PeerId, env_bytes: &[u8], now_ms: i64) {
+        let env = decode_envelope(env_bytes).unwrap();
+        server
+            .on_moor(peer, env.payload_as_moor_request().unwrap(), now_ms)
+            .unwrap();
+    }
+
+    // ---- PART 1a: per-message input validation ----
+
+    #[test]
+    fn nonfinite_client_state_is_dropped_and_cannot_drive_unbounded_cell_math() {
+        // The #19 nit: a hostile Inf/NaN position saturates the `as i32` cast to
+        // `i32::MAX`, and the `center.cx + dx` block offset in `cells_in_radius`
+        // then overflows (panics in debug, wraps in release). The handler must
+        // drop the message before any of it reaches the grid — so this call must
+        // NOT panic and must leave the player at its origin cell.
+        let cfg = Config::default();
+        // Stagger each variant past the client-state throttle window so EVERY
+        // non-finite variant clears the per-player throttle and genuinely reaches
+        // `validate::sanitize_motion`. Sent at one `now_ms` they would all fall
+        // inside the 20 ms window and only the first would exercise the guard —
+        // the rest would drop VACUOUSLY at the limiter, hiding a regression.
+        let throttle_step = cfg.client_state_min_interval_ms as i64 + 1;
+        let mut server = make_server(cfg);
+        let peer: PeerId = 1;
+        let pid = join(&mut server, peer, "tok-nan");
+        let origin = server.world.grid().cell_of(0.0, 0.0);
+
+        for (i, (px, py, pz)) in [
+            (f32::INFINITY, 0.0, 0.0),
+            (f32::NEG_INFINITY, 0.0, 0.0),
+            (f32::NAN, 0.0, f32::NAN),
+            (0.0, 0.0, f32::INFINITY),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now_ms = 1_000 + i as i64 * throttle_step;
+            let env = motion_envelope(px, py, pz, 0.0, 0.0, 0.0);
+            send_state(&mut server, peer, &env, now_ms);
+            // Dropped by sanitize_motion (not the throttle): the player never
+            // moved off its origin cell. Fails for ANY variant if the guard is gone.
+            assert_eq!(server.sessions[&peer].pos, [0.0, 0.0, 0.0]);
+            assert_eq!(server.world.cell_of_entity(pid), Some(origin));
+        }
+    }
+
+    #[test]
+    fn huge_finite_client_state_is_clamped_to_a_bounded_cell() {
+        // A finite-but-absurd coordinate is clamped to the world-coordinate bound
+        // before it reaches the grid, so the resulting cell is finite and far from
+        // the i32 saturation edge — no overflow, bounded work.
+        let mut server = make_server(Config::default());
+        let peer: PeerId = 1;
+        let pid = join(&mut server, peer, "tok-huge");
+
+        let env = motion_envelope(1.0e30, 0.0, -1.0e30, 1.0e12, 0.0, 0.0);
+        send_state(&mut server, peer, &env, 1_000);
+
+        let clamped_cell = server
+            .world
+            .grid()
+            .cell_of(validate::MAX_WORLD_COORD_M, -validate::MAX_WORLD_COORD_M);
+        assert_eq!(server.world.cell_of_entity(pid), Some(clamped_cell));
+        assert_eq!(server.sessions[&peer].pos[0], validate::MAX_WORLD_COORD_M);
+        assert_eq!(server.sessions[&peer].pos[2], -validate::MAX_WORLD_COORD_M);
+        // Velocity was clamped too.
+        assert_eq!(server.sessions[&peer].vel[0], validate::MAX_VELOCITY_MPS);
+    }
+
+    #[test]
+    fn oversized_chat_and_econ_note_are_rejected() {
+        let mut server = make_server(Config {
+            max_wire_string_len: 16,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-str");
+
+        // An econ note past the cap drops the whole txn: nothing is committed.
+        let long_note: String = "x".repeat(64);
+        let env = econ_envelope(1, 100, &long_note);
+        send_econ(&mut server, peer, &env, 1_000);
+        assert!(
+            server.db.lookup_txn(1).unwrap().is_none(),
+            "an over-long econ note must be rejected before the ledger"
+        );
+
+        // A within-cap note is accepted.
+        let env = econ_envelope(2, 100, "ok");
+        send_econ(&mut server, peer, &env, 1_000);
+        assert!(server.db.lookup_txn(2).unwrap().is_some());
+
+        // An over-long chat line is a safe no-op (no panic, no broadcast work).
+        let mut fbb = FlatBufferBuilder::new();
+        let text_off = fbb.create_string(&"y".repeat(64));
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text_off),
+                channel: 0,
+            },
+        );
+        let bytes = finish_envelope(&mut fbb, 4, p::Payload::ChatSend, chat.as_union_value());
+        let env = decode_envelope(&bytes).unwrap();
+        server.on_chat(peer, env.payload_as_chat_send().unwrap(), 1_000);
+        // The over-long chat was refused before it reached the limiter.
+        assert_eq!(server.chat_limiter.tracked_count(), 0);
+    }
+
+    // ---- PART 1b: per-class rate limits ----
+
+    #[test]
+    fn client_state_flood_is_throttled_per_player() {
+        // A per-player client-state throttle drops a flood before it drives the
+        // grid/AoI recompute. The first update in the window lands and moves the
+        // player; every further update inside the window is dropped, so the player
+        // stays at the first accepted position.
+        let mut server = make_server(Config {
+            client_state_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        let pid = join(&mut server, peer, "tok-cs");
+
+        let step = server.world.grid().cell_size_m;
+        // First update at t=1000 lands.
+        send_state(
+            &mut server,
+            peer,
+            &motion_envelope(step * 3.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            1_000,
+        );
+        let cell_after_first = server.world.cell_of_entity(pid);
+        assert_eq!(server.sessions[&peer].pos[0], step * 3.0);
+
+        // A flood of further updates inside the 250ms window is dropped: the
+        // player never advances past the first accepted position, and the limiter
+        // is keyed by player so it holds exactly one entry.
+        for i in 0..1_000 {
+            send_state(
+                &mut server,
+                peer,
+                &motion_envelope(step * (10 + i) as f32, 0.0, 0.0, 0.0, 0.0, 0.0),
+                1_050,
+            );
+        }
+        assert_eq!(server.sessions[&peer].pos[0], step * 3.0);
+        assert_eq!(server.world.cell_of_entity(pid), cell_after_first);
+        assert_eq!(server.client_state_limiter.tracked_count(), 1);
+
+        // Once the window elapses the next update is admitted.
+        send_state(
+            &mut server,
+            peer,
+            &motion_envelope(step * 20.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            1_300,
+        );
+        assert_eq!(server.sessions[&peer].pos[0], step * 20.0);
+    }
+
+    #[test]
+    fn new_econ_txn_flood_is_throttled_but_idempotent_replay_is_not() {
+        let mut server = make_server(Config {
+            econ_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-econ");
+
+        // First txn at t=1000 lands.
+        send_econ(&mut server, peer, &econ_envelope(1, 100, "a"), 1_000);
+        assert!(server.db.lookup_txn(1).unwrap().is_some());
+
+        // A *new* txn inside the window is throttled: nothing is committed.
+        send_econ(&mut server, peer, &econ_envelope(2, 50, "b"), 1_050);
+        assert!(
+            server.db.lookup_txn(2).unwrap().is_none(),
+            "a new econ txn inside the window must be throttled"
+        );
+
+        // A replay of the already-applied txn 1 inside the window is NOT throttled
+        // (idempotency-first), so an app-level resend after packet loss stays safe.
+        send_econ(&mut server, peer, &econ_envelope(1, 100, "a"), 1_050);
+        assert!(server.db.lookup_txn(1).unwrap().is_some());
+
+        // Once the window elapses the new txn is admitted.
+        send_econ(&mut server, peer, &econ_envelope(2, 50, "b"), 1_300);
+        assert!(server.db.lookup_txn(2).unwrap().is_some());
+
+        // The limiter is keyed by player, so it holds exactly one entry.
+        assert_eq!(server.econ_limiter.tracked_count(), 1);
+    }
+
+    #[test]
+    fn moor_flood_is_throttled_before_the_persistent_write() {
+        // MoorRequest mutates persistent state (it commits a moorage record), so an
+        // unthrottled flood is a real DoS -- the same class fixed for trades in #21.
+        // The per-player moor throttle must reject a new moor inside the window
+        // BEFORE the persistent write, mirroring on_trade/on_econ: the first moor
+        // lands, a flood inside the window never touches the DB, and the limiter is
+        // keyed by player so it stays bounded to exactly one entry.
+        let mut server = make_server(Config {
+            moor_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-moor");
+
+        // The mooring is keyed by boat_id, falling back to the player id (the
+        // player is not aboard a boat here), so every moor upserts the same row --
+        // the persisted `name` is what reveals whether a throttled moor committed.
+        let cell = server.world.grid().cell_of(0.0, 0.0);
+        let persisted_name = |s: &Server| {
+            s.db.moorings_in_cell(cell.cx, cell.cz).unwrap()[0]
+                .name
+                .clone()
+        };
+
+        // First moor at t=1000 lands and is persisted.
+        send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "first"), 1_000);
+        assert_eq!(persisted_name(&server), "first");
+
+        // A flood of further moors inside the 250ms window is rejected before the
+        // write: the persisted mooring keeps the first name and the limiter holds
+        // exactly one (per-player) entry no matter how many messages arrive.
+        for _ in 0..1_000 {
+            send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "flood"), 1_050);
+        }
+        assert_eq!(
+            persisted_name(&server),
+            "first",
+            "a moor inside the window must be rejected before the persistent write"
+        );
+        assert_eq!(server.moor_limiter.tracked_count(), 1);
+
+        // Once the window elapses the next moor is admitted and overwrites the row.
+        send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "third"), 1_300);
+        assert_eq!(persisted_name(&server), "third");
+
+        // Disconnect drops the departed player's moor throttle entry so connection
+        // churn cannot leave residue behind, mirroring the other message classes.
+        server
+            .on_disconnect(peer, DisconnectReason::Remote)
+            .unwrap();
+        assert_eq!(
+            server.moor_limiter.tracked_count(),
+            0,
+            "the disconnected player's moor limiter entry must be cleared"
+        );
+    }
+
+    fn send_chat(server: &mut Server, peer: PeerId, text: &str, now_ms: i64) {
+        let mut fbb = FlatBufferBuilder::new();
+        let text_off = fbb.create_string(text);
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text_off),
+                channel: 0,
+            },
+        );
+        let bytes = finish_envelope(&mut fbb, 5, p::Payload::ChatSend, chat.as_union_value());
+        let env = decode_envelope(&bytes).unwrap();
+        server.on_chat(peer, env.payload_as_chat_send().unwrap(), now_ms);
+    }
+
+    #[test]
+    fn chat_handler_is_wired_to_a_memory_bounded_per_player_throttle() {
+        // The chat handler consults the per-player throttle before it fans a line
+        // out to every AoI subscriber. Driving the real handler with a flood must
+        // leave the limiter keyed by exactly one player (rotation-proof, stale-
+        // evicting), so connection/traffic churn cannot grow it without bound. The
+        // shared RateLimiter's own unit tests pin that within-window messages are
+        // dropped; here we pin that the handler is wired to it and stays bounded.
+        let mut server = make_server(Config {
+            chat_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-chat");
+
+        // A flood of chat lines inside one window from the same player.
+        for _ in 0..1_000 {
+            send_chat(&mut server, peer, "flood", 1_050);
+        }
+        assert_eq!(
+            server.chat_limiter.tracked_count(),
+            1,
+            "the chat throttle must be keyed by player and stay bounded under a flood"
+        );
+    }
+
+    // ---- disconnect clears every class ----
+
+    #[test]
+    fn disconnect_clears_every_message_class_limiter() {
+        let mut server = make_server(Config {
+            client_state_min_interval_ms: 250,
+            chat_min_interval_ms: 250,
+            econ_min_interval_ms: 250,
+            trade_min_interval_ms: 250,
+            moor_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        let pid = join(&mut server, peer, "tok-dc-all");
+
+        send_state(
+            &mut server,
+            peer,
+            &motion_envelope(1.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+            1_000,
+        );
+        send_econ(&mut server, peer, &econ_envelope(1, 100, "a"), 1_000);
+        send_chat(&mut server, peer, "hi", 1_000);
+        send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "m"), 1_000);
+        // Seed the trade limiter directly (its handler needs a market envelope,
+        // covered in the market dispatch suite); the point here is that
+        // on_disconnect clears every class.
+        server.trade_limiter.allow(pid, 1_000);
+        assert_eq!(server.client_state_limiter.tracked_count(), 1);
+        assert_eq!(server.econ_limiter.tracked_count(), 1);
+        assert_eq!(server.chat_limiter.tracked_count(), 1);
+        assert_eq!(server.trade_limiter.tracked_count(), 1);
+        assert_eq!(server.moor_limiter.tracked_count(), 1);
+
+        server
+            .on_disconnect(peer, DisconnectReason::Remote)
+            .unwrap();
+
+        assert_eq!(server.client_state_limiter.tracked_count(), 0);
+        assert_eq!(server.econ_limiter.tracked_count(), 0);
+        assert_eq!(server.chat_limiter.tracked_count(), 0);
+        assert_eq!(server.trade_limiter.tracked_count(), 0);
+        assert_eq!(server.moor_limiter.tracked_count(), 0);
+    }
+
+    // ---- PART 3: headless load test ----
+
+    #[test]
+    #[ignore = "load/perf test: wall-clock timed; run via `make load-test` or the non-blocking CI load job"]
+    fn load_n_clients_stay_within_the_tick_budget() {
+        // Headless load: N simulated clients drive the *real* client-state handler
+        // and snapshot broadcast every tick against the in-memory server. The
+        // per-tick server work must stay under the fixed-tick budget (1 / tick_hz),
+        // i.e. the server keeps up with real time at N clients. Timing is
+        // wall-clock, so this is `#[ignore]`d out of the required gate (`cargo test`
+        // skips it) and run only by the non-blocking load job / `make load-test`.
+        const N: u32 = 200;
+        const TICKS: u32 = 60;
+
+        let cfg = Config::default();
+        let tick_dt = Duration::from_secs_f64(1.0 / cfg.tick_hz as f64);
+        let cell = cfg.cell_size_m;
+        let mut server = make_server(cfg);
+
+        // Join N clients, each seeded into a distinct cell on a roughly square
+        // grid so AoI density is realistic and bounded, not all stacked together.
+        let side = (N as f64).sqrt().ceil() as u32;
+        for i in 0..N {
+            let peer = (i + 1) as PeerId;
+            join(&mut server, peer, &format!("tok-load-{i}"));
+            let cx = (i % side) as f32;
+            let cz = (i / side) as f32;
+            // The seed time advances per client so the client-state throttle never
+            // drops a placement.
+            send_state(
+                &mut server,
+                peer,
+                &motion_envelope(cx * cell + 1.0, 0.0, cz * cell + 1.0, 0.0, 0.0, 0.0),
+                1_000 + i as i64,
+            );
+        }
+        assert_eq!(server.world.len(), N as usize);
+
+        // Drive TICKS simulated ticks and measure the wall-clock server work. The
+        // simulated clock advances by a full tick each round so every client's
+        // per-tick update clears the throttle window (worst-case load).
+        let step_ms = tick_dt.as_millis() as i64 + 1;
+        let start = Instant::now();
+        for t in 0..TICKS {
+            let now = 10_000 + (t as i64) * step_ms;
+            for i in 0..N {
+                let peer = (i + 1) as PeerId;
+                let cx = (i % side) as f32;
+                let cz = (i / side) as f32;
+                let jitter = (t % 8) as f32; // small in-cell movement
+                send_state(
+                    &mut server,
+                    peer,
+                    &motion_envelope(
+                        cx * cell + 1.0 + jitter,
+                        0.0,
+                        cz * cell + 1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ),
+                    now,
+                );
+            }
+            server.broadcast_snapshots();
+        }
+        let elapsed = start.elapsed();
+        let per_tick = elapsed / TICKS;
+
+        println!(
+            "load: {N} clients x {TICKS} ticks in {elapsed:?} => {per_tick:?}/tick (real-time budget {tick_dt:?})"
+        );
+        assert!(
+            per_tick < tick_dt,
+            "per-tick server work {per_tick:?} exceeded the {tick_dt:?} real-time budget at {N} clients"
         );
     }
 }

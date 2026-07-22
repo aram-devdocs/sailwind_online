@@ -13,6 +13,7 @@ mod config;
 mod econ_store;
 mod ratelimit;
 mod server;
+mod validate;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

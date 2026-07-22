@@ -7,6 +7,11 @@ members = [
     "crates/sw-persist",
     "crates/sw-server",
 ]
+# The cargo-fuzz crate is deliberately excluded: libfuzzer-sys needs a nightly
+# toolchain, so the fuzz target must never be built by the stable `make validate`
+# / CI workspace. It carries its own `[workspace]` too, and is built only by the
+# non-blocking nightly fuzz CI job.
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

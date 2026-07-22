@@ -1,0 +1,30 @@
+# cargo-fuzz crate for the wire decoder. DELIBERATELY OUTSIDE the stable server
+# workspace: `libfuzzer-sys` requires a nightly toolchain and the sanitizer
+# runtime, so this crate must never be built by the stable `make validate` / CI
+# workspace. It is excluded by the parent `[workspace] exclude` AND carries its
+# own empty `[workspace]` below so cargo treats it as an independent root. It is
+# built only by the non-blocking nightly `fuzz` CI job.
+[package]
+name = "sw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The single source of truth for the wire decoder under test.
+sw-contracts = { path = "../crates/sw-contracts" }
+
+[[bin]]
+name = "decode_envelope"
+path = "fuzz_targets/decode_envelope.rs"
+test = false
+doc = false
+bench = false
+
+# Independent workspace root: keeps this crate out of the stable server
+# workspace even if the parent `exclude` were ever dropped.
+[workspace]
