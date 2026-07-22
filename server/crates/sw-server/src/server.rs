@@ -108,6 +108,7 @@ impl Server {
 
         let tick_dt = Duration::from_secs_f64(1.0 / self.cfg.tick_hz as f64);
         let ticks_per_snapshot = self.cfg.ticks_per_snapshot();
+        let ticks_per_clock_broadcast = self.cfg.ticks_per_clock_broadcast();
         let mut tick: u64 = 0;
         let mut last_flush = Instant::now();
 
@@ -123,6 +124,10 @@ impl Server {
 
             if tick % ticks_per_snapshot == 0 {
                 self.broadcast_snapshots();
+            }
+
+            if tick % ticks_per_clock_broadcast == 0 {
+                self.broadcast_clock();
             }
 
             if frame_start.duration_since(last_flush) >= FLUSH_INTERVAL {
@@ -470,6 +475,18 @@ impl Server {
                 continue;
             }
             let bytes = codec::snapshot_delta(self.next_seq(), server_tick, &players, &boats);
+            self.send(peer, &bytes);
+        }
+    }
+
+    /// Broadcast the current world clock to every connected session. The clock
+    /// is derived authority (see [`clock_from_epoch`]); the weather seed is
+    /// join-only in `ServerHello` and is deliberately not rebroadcast here.
+    fn broadcast_clock(&mut self) {
+        let clock = self.clock_now();
+        let peers: Vec<PeerId> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            let bytes = codec::world_clock(self.next_seq(), clock);
             self.send(peer, &bytes);
         }
     }
