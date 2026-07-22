@@ -109,6 +109,43 @@ jobs:
       - name: API surface manifest integrity (hash chain)
         run: dotnet test tests/Sailwind.Api.SurfaceManifest.Tests -c Release
 
+  # Line-coverage gate for the game-free tiers: the C# solution filter
+  # (coverlet.collector -> Cobertura, merged by ReportGenerator) and the Rust
+  # server workspace (cargo llvm-cov), each enforced against a fail-under floor
+  # by scripts/coverage.sh so a coverage regression fails the required gate.
+  # Deterministic: pinned dotnet, a pinned Rust toolchain with the
+  # llvm-tools-preview component, and pinned coverage tools. Game-free like the
+  # dotnet job (no lib/, no game DLL). The merged report is published as an
+  # artifact.
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Install pinned coverage tools
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool --version 5.3.11
+          cargo install cargo-llvm-cov --version 0.6.16 --locked
+      - name: Coverage gates (C# + Rust, with thresholds)
+        run: bash scripts/coverage.sh
+      - name: Publish coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: artifacts/coverage
+          if-no-files-found: error
+
   # End-to-end conformance: real LiteNetLib client against the real Rust server
   # over real FlatBuffers envelopes. Interop is milestone M3, so this job is
   # allowed to fail for now without blocking the gate.
@@ -173,8 +210,8 @@ jobs:
   # The single required status check. It is trivial and only turns green once
   # its needs have all passed, so branch protection lists exactly this context.
   gate:
-    needs: [guards, dotnet, rust, contracts, surface]
+    needs: [guards, dotnet, rust, contracts, surface, coverage]
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs passed
-        run: echo "guards, dotnet, rust, contracts and surface are green."
+        run: echo "guards, dotnet, rust, contracts, surface and coverage are green."
