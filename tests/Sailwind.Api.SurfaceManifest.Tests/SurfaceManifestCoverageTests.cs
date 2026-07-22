@@ -51,8 +51,11 @@ namespace Sailwind.Api.SurfaceManifest.Tests
         }
 
         [Fact]
-        public void Plugin_Polls_CommonWorldReadyMarker_InsteadOfLoadOnlyEvent()
+        public void Plugin_SourceWiring_PollsCommonWorldReadyMarkerInsteadOfLoadOnlyEvent()
         {
+            // The plugin is game-coupled and cannot be referenced by this game-free
+            // suite. WorldReadyPollerTests cover behavior; this assertion covers only
+            // the Unity composition-root wiring that is otherwise inaccessible here.
             var pluginPath = Path.Combine(
                 SurfaceManifestIntegrity.RepoRoot(), "apps", "Sailwind.API", "Plugin.cs");
             var source = File.ReadAllText(pluginPath);

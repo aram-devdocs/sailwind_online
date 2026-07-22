@@ -1,3 +1,4 @@
+using System;
 using BepInEx;
 using HarmonyLib;
 using Sailwind.Api.Adapters;
@@ -19,7 +20,8 @@ namespace Sailwind.Api
         public const string Version = "0.1.0";
 
         private readonly WorldReadyPoller _worldReady = new WorldReadyPoller();
-        private ISaveEvents _saveEvents;
+        private Func<bool> _isWorldReady;
+        private Action _signalReady;
 
         private void Awake()
         {
@@ -33,8 +35,9 @@ namespace Sailwind.Api
             SailwindApi.PlayerBoat = new PlayerBoatAdapter();
 
             var saveEvents = new SaveEventsAdapter(new Harmony(Guid));
-            _saveEvents = saveEvents;
             SailwindApi.SaveEvents = saveEvents;
+            _isWorldReady = () => saveEvents.IsWorldReady;
+            _signalReady = SailwindApi.SignalReady;
 
             Logger.LogInfo(
                 $"[Sailwind.API] Surface check {(compat.IsOk ? "OK" : "DRIFTED")} " +
@@ -47,13 +50,7 @@ namespace Sailwind.Api
 
         private void Update()
         {
-            var saveEvents = _saveEvents;
-            if (saveEvents == null)
-            {
-                return;
-            }
-
-            _worldReady.Poll(() => saveEvents.IsWorldReady, SailwindApi.SignalReady);
+            _worldReady.Poll(_isWorldReady, _signalReady);
         }
 
         private static string Hash8(string hash) =>
