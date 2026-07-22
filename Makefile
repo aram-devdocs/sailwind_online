@@ -19,7 +19,7 @@ SLNF   := SailwindOnline.CI.slnf
 SERVER_MANIFEST := server/Cargo.toml
 
 .PHONY: help setup codegen contracts validate check audit build build-ci test \
-        test-hooks template server-build server-run smoke test-profile deploy run-modded clean
+        test-hooks template server-build server-run smoke load-test test-profile deploy run-modded clean
 
 help:  ## List available targets
 	@echo Sailwind Online - make targets
@@ -38,6 +38,7 @@ help:  ## List available targets
 	@echo   server-build  Build the Rust server workspace
 	@echo   server-run    Run the Rust server (sailwind-online-server)
 	@echo   smoke         Build the server in Release and run the protocol-smoke harness
+	@echo   load-test     Headless N-client load test asserting the server tick budget
 	@echo   test-profile  Create the dedicated SailwindOnline Thunderstore test profile
 	@echo   deploy        Build Release and deploy plugins to the test profile (opt-in)
 	@echo   run-modded    Start the server and launch Sailwind modded from the test profile
@@ -87,6 +88,9 @@ server-run:  ## Run the Rust server
 smoke:  ## Build the server in Release and run the protocol-smoke harness
 	$(CARGO) build --release --manifest-path $(SERVER_MANIFEST)
 	$(DOTNET) run --project tools/protocol-smoke
+
+load-test:  ## Headless N-client load test asserting the server tick budget (excluded from validate)
+	$(CARGO) test --manifest-path $(SERVER_MANIFEST) -p sailwind-online-server --release -- --ignored --nocapture load_
 
 test-profile:  ## Create the dedicated SailwindOnline Thunderstore test profile
 	$(call runscript,setup-test-profile)

@@ -1596,4 +1596,82 @@ mod input_hardening_tests {
         assert_eq!(server.chat_limiter.tracked_count(), 0);
         assert_eq!(server.trade_limiter.tracked_count(), 0);
     }
+
+    // ---- PART 3: headless load test ----
+
+    #[test]
+    #[ignore = "load/perf test: wall-clock timed; run via `make load-test` or the non-blocking CI load job"]
+    fn load_n_clients_stay_within_the_tick_budget() {
+        // Headless load: N simulated clients drive the *real* client-state handler
+        // and snapshot broadcast every tick against the in-memory server. The
+        // per-tick server work must stay under the fixed-tick budget (1 / tick_hz),
+        // i.e. the server keeps up with real time at N clients. Timing is
+        // wall-clock, so this is `#[ignore]`d out of the required gate (`cargo test`
+        // skips it) and run only by the non-blocking load job / `make load-test`.
+        const N: u32 = 200;
+        const TICKS: u32 = 60;
+
+        let cfg = Config::default();
+        let tick_dt = Duration::from_secs_f64(1.0 / cfg.tick_hz as f64);
+        let cell = cfg.cell_size_m;
+        let mut server = make_server(cfg);
+
+        // Join N clients, each seeded into a distinct cell on a roughly square
+        // grid so AoI density is realistic and bounded, not all stacked together.
+        let side = (N as f64).sqrt().ceil() as u32;
+        for i in 0..N {
+            let peer = (i + 1) as PeerId;
+            join(&mut server, peer, &format!("tok-load-{i}"));
+            let cx = (i % side) as f32;
+            let cz = (i / side) as f32;
+            // The seed time advances per client so the client-state throttle never
+            // drops a placement.
+            send_state(
+                &mut server,
+                peer,
+                &motion_envelope(cx * cell + 1.0, 0.0, cz * cell + 1.0, 0.0, 0.0, 0.0),
+                1_000 + i as i64,
+            );
+        }
+        assert_eq!(server.world.len(), N as usize);
+
+        // Drive TICKS simulated ticks and measure the wall-clock server work. The
+        // simulated clock advances by a full tick each round so every client's
+        // per-tick update clears the throttle window (worst-case load).
+        let step_ms = tick_dt.as_millis() as i64 + 1;
+        let start = Instant::now();
+        for t in 0..TICKS {
+            let now = 10_000 + (t as i64) * step_ms;
+            for i in 0..N {
+                let peer = (i + 1) as PeerId;
+                let cx = (i % side) as f32;
+                let cz = (i / side) as f32;
+                let jitter = (t % 8) as f32; // small in-cell movement
+                send_state(
+                    &mut server,
+                    peer,
+                    &motion_envelope(
+                        cx * cell + 1.0 + jitter,
+                        0.0,
+                        cz * cell + 1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ),
+                    now,
+                );
+            }
+            server.broadcast_snapshots();
+        }
+        let elapsed = start.elapsed();
+        let per_tick = elapsed / TICKS;
+
+        println!(
+            "load: {N} clients x {TICKS} ticks in {elapsed:?} => {per_tick:?}/tick (real-time budget {tick_dt:?})"
+        );
+        assert!(
+            per_tick < tick_dt,
+            "per-tick server work {per_tick:?} exceeded the {tick_dt:?} real-time budget at {N} clients"
+        );
+    }
 }

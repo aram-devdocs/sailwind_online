@@ -149,6 +149,25 @@ jobs:
         working-directory: server/fuzz
         run: cargo +nightly fuzz run decode_envelope -- -max_total_time=30
 
+  # Headless load test: N simulated clients drive the real message handlers and
+  # snapshot broadcast, and the per-tick work must stay under the real-time tick
+  # budget. It is wall-clock timed, so it lives as an `#[ignore]`d test kept out
+  # of the required `rust` job (which must stay deterministic) and is run here
+  # allowed-to-fail.
+  load:
+    needs: [rust]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Run the headless load test
+        working-directory: server
+        run: cargo test -p sailwind-online-server --release -- --ignored --nocapture load_
+
   # The single required status check. It is trivial and only turns green once
   # its needs have all passed, so branch protection lists exactly this context.
   gate:
