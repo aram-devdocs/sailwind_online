@@ -329,6 +329,13 @@ namespace Sailwind.Online.Client.Net
 
         void IServerMessageHandler.OnServerHello(ServerHello hello, uint seq)
         {
+            if (_status != ConnectionStatus.Handshaking)
+            {
+                _log.LogDebug(
+                    "[Sailwind.Online] Ignored ServerHello (seq " + seq + ") while " + StatusText + ".");
+                return;
+            }
+
             if (!hello.Accepted)
             {
                 RejectHandshake("[Sailwind.Online] ServerHello rejected: " + (hello.Reason ?? "no reason"));
@@ -518,10 +525,10 @@ namespace Sailwind.Online.Client.Net
 
         private void RejectHandshake(string warning)
         {
-            _transport.DropPeer();
             _status = ConnectionStatus.Disconnected;
             ResetPositionObservability();
             ScheduleReconnect();
+            _transport.DropPeer();
             _log.LogWarning(warning);
         }
 

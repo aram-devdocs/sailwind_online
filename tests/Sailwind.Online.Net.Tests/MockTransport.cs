@@ -25,6 +25,9 @@ namespace Sailwind.Online.Net.Tests
         public int DropPeerCalls;
         public int PollCalls;
 
+        /// <summary>Optional callback invoked during <see cref="DropPeer"/> to model queued callbacks.</summary>
+        public Action DropPeerCallback;
+
         public string LastHost;
         public int LastPort;
         public string LastKey;
@@ -75,6 +78,7 @@ namespace Sailwind.Online.Net.Tests
             DropPeerCalls++;
             _peerConnected = false;
             Ping = -1;
+            DropPeerCallback?.Invoke();
         }
 
         public void Send(byte[] data, DeliveryMethod deliveryMethod)

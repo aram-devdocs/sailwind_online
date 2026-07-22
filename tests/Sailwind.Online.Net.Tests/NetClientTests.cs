@@ -118,6 +118,92 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
+        public void Handshake_RejectedThenQueuedAcceptedHello_IgnoresStaleAcceptance()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            long now = 0;
+            var net = new NetClient(log, transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            transport.DropPeerCallback = () => transport.RaiseNetworkReceive(
+                ServerHelloEnvelope(accepted: true, playerId: 99, snapshotHz: 12));
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: false, playerId: 0, snapshotHz: 0));
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.False(net.HandshakeComplete);
+            Assert.Equal(0ul, net.PlayerId);
+            Assert.Equal((byte)4, net.SnapshotHz);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.Single(log.Warnings);
+            Assert.Single(log.Debugs);
+
+            now = NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(1, transport.ConnectCalls);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 101, snapshotHz: 16));
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+            Assert.Equal(0ul, net.PlayerId);
+            Assert.Equal((byte)4, net.SnapshotHz);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.Equal(2, log.Debugs.Count);
+        }
+
+        [Fact]
+        public void Handshake_MultipleQueuedRejections_OnlyFirstChangesReconnectState()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            long now = 0;
+            var net = new NetClient(log, transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+
+            byte[] rejection = ServerHelloEnvelope(accepted: false, playerId: 0, snapshotHz: 0);
+            transport.RaiseNetworkReceive(rejection);
+            transport.RaiseNetworkReceive(rejection);
+            transport.RaiseNetworkReceive(rejection);
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.Single(log.Warnings);
+            Assert.Equal(2, log.Debugs.Count);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+        }
+
+        [Fact]
+        public void ReadySession_DuplicateAcceptedHello_DoesNotReplaceIdentityOrCapabilities()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            var net = new NetClient(log, transport, () => 0);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 77, snapshotHz: 8));
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 99, snapshotHz: 12));
+
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+            Assert.True(net.HandshakeComplete);
+            Assert.Equal(77ul, net.PlayerId);
+            Assert.Equal((byte)8, net.SnapshotHz);
+            Assert.Equal(0, transport.DropPeerCalls);
+            Assert.Empty(log.Warnings);
+            Assert.Single(log.Debugs);
+        }
+
+        [Fact]
         public void Handshake_AcceptedServerHelloWithWrongProtocol_ReturnsToDisconnected()
         {
             var transport = new MockTransport();
@@ -601,11 +687,12 @@ namespace Sailwind.Online.Net.Tests
 
         private sealed class RecordingLog : INetLog
         {
+            public readonly List<string> Debugs = new List<string>();
             public readonly List<string> Errors = new List<string>();
             public readonly List<string> Infos = new List<string>();
             public readonly List<string> Warnings = new List<string>();
 
-            public void LogDebug(string message) { }
+            public void LogDebug(string message) { Debugs.Add(message); }
             public void LogInfo(string message) { Infos.Add(message); }
             public void LogWarning(string message) { Warnings.Add(message); }
             public void LogError(string message) { Errors.Add(message); }
