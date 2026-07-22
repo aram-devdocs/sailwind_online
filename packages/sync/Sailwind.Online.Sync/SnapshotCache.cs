@@ -94,6 +94,21 @@ namespace Sailwind.Online.Client.Sync
         }
 
         /// <summary>
+        /// Sample a smoothed pose for this entity at <paramref name="renderTimeMs"/> (on the
+        /// wire-authored <see cref="EntitySample.TMs"/> timeline): LERP position and SLERP rotation
+        /// between the snapshots bracketing (renderTime - <paramref name="interpolationDelayMs"/>),
+        /// extrapolating from the latest velocity (capped at <paramref name="maxExtrapolationMs"/>)
+        /// once the render time runs past the newest snapshot. Returns <c>null</c> when empty.
+        /// </summary>
+        public SampledPose? SampleAt(
+            long renderTimeMs,
+            long interpolationDelayMs = Interpolator.DefaultInterpolationDelayMs,
+            long maxExtrapolationMs = Interpolator.DefaultMaxExtrapolationMs)
+        {
+            return Interpolator.SampleAt(this, renderTimeMs, interpolationDelayMs, maxExtrapolationMs);
+        }
+
+        /// <summary>
         /// Retrieve a retained sample, index 0 = oldest .. SampleCount-1 = newest.
         /// Returns false when the index is out of range.
         /// </summary>
