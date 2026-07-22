@@ -50,12 +50,11 @@ namespace Sailwind.Online.Client.Net
         private readonly INetLog _log;
         private readonly Codec _codec = new Codec();
         private readonly SnapshotCache _cache = new SnapshotCache();
-        private readonly EventBasedNetListener _listener = new EventBasedNetListener();
-        private readonly NetManager _manager;
+        private readonly ITransport _transport;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly Func<long> _nowMs;
 
         private ConnectOptions? _options;
-        private NetPeer? _peer;
         private ConnectionStatus _status = ConnectionStatus.Disconnected;
         private uint _seq;
 
@@ -68,20 +67,27 @@ namespace Sailwind.Online.Client.Net
         private uint _serverDay;
         private float _serverTimeOfDay;
 
+        /// <summary>Production constructor: drives the real LiteNetLib 1.3.1 transport.</summary>
         public NetClient(INetLog log)
+            : this(log, new LiteNetLibTransport(), null)
+        {
+        }
+
+        /// <summary>
+        /// Seam constructor: inject an <see cref="ITransport"/> (and optional monotonic clock) so the
+        /// session state machine can be unit-tested against a fake. <paramref name="nowMs"/> defaults
+        /// to the internal <see cref="Stopwatch"/>, so production timing is unchanged.
+        /// </summary>
+        public NetClient(INetLog log, ITransport transport, Func<long>? nowMs = null)
         {
             _log = log;
-            _manager = new NetManager(_listener)
-            {
-                UnsyncedEvents = false,
-                AutoRecycle = false,
-                DisconnectTimeout = DisconnectTimeoutMs
-            };
+            _transport = transport;
+            _nowMs = nowMs ?? (() => _clock.ElapsedMilliseconds);
 
-            _listener.PeerConnectedEvent += OnPeerConnected;
-            _listener.PeerDisconnectedEvent += OnPeerDisconnected;
-            _listener.NetworkReceiveEvent += OnNetworkReceive;
-            _listener.NetworkErrorEvent += OnNetworkError;
+            _transport.PeerConnected += OnPeerConnected;
+            _transport.PeerDisconnected += OnPeerDisconnected;
+            _transport.NetworkReceive += OnNetworkReceive;
+            _transport.NetworkError += OnNetworkError;
         }
 
         public SnapshotCache Cache
@@ -123,13 +129,13 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Current round-trip estimate in milliseconds, or -1 when not connected.</summary>
         public int Ping
         {
-            get { return _peer != null ? _peer.Ping : -1; }
+            get { return _transport.Ping; }
         }
 
         /// <summary>Monotonic millisecond clock shared by all timing in the plugin.</summary>
         public long NowMs
         {
-            get { return _clock.ElapsedMilliseconds; }
+            get { return _nowMs(); }
         }
 
         public string StatusText
@@ -155,7 +161,7 @@ namespace Sailwind.Online.Client.Net
         {
             _options = options;
 
-            if (!_manager.IsRunning && !_manager.Start())
+            if (!_transport.IsRunning && !_transport.Start())
             {
                 _log.LogError("[Sailwind.Online] Failed to start LiteNetLib NetManager.");
                 return;
@@ -167,9 +173,9 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Poll the transport and service the handshake/reconnect timers. Call every frame.</summary>
         public void Poll()
         {
-            if (_manager.IsRunning)
+            if (_transport.IsRunning)
             {
-                _manager.PollEvents();
+                _transport.PollEvents();
             }
 
             long now = NowMs;
@@ -207,12 +213,7 @@ namespace Sailwind.Online.Client.Net
 
         public void Dispose()
         {
-            if (_manager.IsRunning)
-            {
-                _manager.Stop();
-            }
-
-            _peer = null;
+            _transport.Stop();
             _status = ConnectionStatus.Disconnected;
         }
 
@@ -225,7 +226,7 @@ namespace Sailwind.Online.Client.Net
             }
 
             _cache.Clear();
-            _peer = _manager.Connect(options.Host, options.Port, ConnectKey);
+            _transport.Connect(options.Host, options.Port, ConnectKey);
             _status = ConnectionStatus.Connecting;
             _log.LogInfo("[Sailwind.Online] Connecting to " + options.Host + ":" + options.Port + " ...");
         }
@@ -265,7 +266,7 @@ namespace Sailwind.Online.Client.Net
 
         private void SendRaw(byte[] bytes)
         {
-            if (_peer == null || _peer.ConnectionState != LiteNetLib.ConnectionState.Connected)
+            if (!_transport.IsPeerConnected)
             {
                 return;
             }
@@ -276,32 +277,27 @@ namespace Sailwind.Online.Client.Net
                 return;
             }
 
-            _peer.Send(bytes, DeliveryMethod.Unreliable);
+            _transport.Send(bytes, DeliveryMethod.Unreliable);
         }
 
-        private void OnPeerConnected(NetPeer peer)
+        private void OnPeerConnected()
         {
-            _peer = peer;
             _status = ConnectionStatus.Handshaking;
             _reconnectBackoffMs = DefaultReconnectMs;
             SendHello();
             _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
         }
 
-        private void OnPeerDisconnected(NetPeer peer, DisconnectInfo info)
+        private void OnPeerDisconnected(string reason)
         {
-            _peer = null;
             _status = ConnectionStatus.Disconnected;
             _cache.Clear();
             ScheduleReconnect();
-            _log.LogInfo("[Sailwind.Online] Disconnected (" + info.Reason + "); will retry.");
+            _log.LogInfo("[Sailwind.Online] Disconnected (" + reason + "); will retry.");
         }
 
-        private void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
+        private void OnNetworkReceive(byte[] data)
         {
-            byte[] data = reader.GetRemainingBytes();
-            reader.Recycle();
-
             if (!_codec.TryDispatch(data, this))
             {
                 _log.LogDebug("[Sailwind.Online] Ignored malformed datagram (" + data.Length + " bytes).");

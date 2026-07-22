@@ -1,0 +1,368 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using Google.FlatBuffers;
+using Sailwind.Api;
+using Sailwind.Online.Client.Net;
+using SwProto;
+using Xunit;
+
+namespace Sailwind.Online.Net.Tests
+{
+    /// <summary>
+    /// Exercises the <see cref="NetClient"/> session state machine against a <see cref="MockTransport"/>
+    /// and a controllable clock: transport-up to Ready, the 250 ms ClientHello resend loop, the
+    /// exponential reconnect backoff on disconnect, the keepalive/Ping surface, and receive dispatch
+    /// through the real <see cref="Codec"/>. No sockets, no wall-clock waits.
+    /// </summary>
+    public sealed class NetClientTests
+    {
+        private static readonly ConnectOptions Options = new ConnectOptions
+        {
+            Host = "test-host",
+            Port = 4242,
+            DisplayName = "Ari",
+            Token = "tok",
+            GameBuild = "build",
+            ModVersion = "0.1.0",
+            ApiSurfaceHash = "hash"
+        };
+
+        [Fact]
+        public void Connect_StartsTransportAndOpensPeer_EntersConnecting()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+
+            net.Connect(Options);
+
+            Assert.Equal(1, transport.StartCalls);
+            Assert.Equal(1, transport.ConnectCalls);
+            Assert.Equal("test-host", transport.LastHost);
+            Assert.Equal(4242, transport.LastPort);
+            Assert.Equal(NetClient.ConnectKey, transport.LastKey);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+        }
+
+        [Fact]
+        public void Connect_WhenTransportStartFails_LogsAndDoesNotOpenPeer()
+        {
+            var transport = new MockTransport { StartResult = false };
+            var log = new RecordingLog();
+            var net = new NetClient(log, transport, () => 0);
+
+            net.Connect(Options);
+
+            Assert.Equal(1, transport.StartCalls);
+            Assert.Equal(0, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.NotEmpty(log.Errors);
+        }
+
+        [Fact]
+        public void Handshake_PeerConnectedThenServerHello_ReachesReady()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            Assert.Single(transport.Sent);
+            Envelope hello = Decode(transport.Sent[0]);
+            Assert.Equal(Payload.ClientHello, hello.PayloadType);
+            Assert.Equal("Ari", hello.PayloadAsClientHello().DisplayName);
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 77, snapshotHz: 8));
+
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+            Assert.True(net.HandshakeComplete);
+            Assert.Equal(77ul, net.PlayerId);
+            Assert.Equal((byte)8, net.SnapshotHz);
+        }
+
+        [Fact]
+        public void Handshake_ServerHelloRejected_ReturnsToDisconnected()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: false, playerId: 0, snapshotHz: 0));
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.False(net.HandshakeComplete);
+        }
+
+        [Fact]
+        public void ClientHello_ResendsEveryIntervalUntilServerHello()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+
+            transport.RaisePeerConnected(); // hello #1 at t=0
+            Assert.Single(transport.Sent);
+
+            now = NetClient.HelloRetryMs - 1;
+            net.Poll(); // too soon
+            Assert.Single(transport.Sent);
+
+            now = NetClient.HelloRetryMs;
+            net.Poll(); // hello #2
+            Assert.Equal(2, transport.Sent.Count);
+
+            now = NetClient.HelloRetryMs * 2;
+            net.Poll(); // hello #3
+            Assert.Equal(3, transport.Sent.Count);
+
+            // ServerHello arrives; the resend loop must stop.
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 1, snapshotHz: 4));
+            now = NetClient.HelloRetryMs * 10;
+            net.Poll();
+            net.Poll();
+            Assert.Equal(3, transport.Sent.Count);
+        }
+
+        [Fact]
+        public void Disconnect_ReconnectsWithExponentialBackoff()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected(); // resets backoff to the default
+            Assert.Equal(1, transport.ConnectCalls);
+
+            // First drop: reconnect must wait DefaultReconnectMs.
+            now = 0;
+            transport.RaisePeerDisconnected();
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+
+            now = NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(1, transport.ConnectCalls); // still waiting
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls); // reconnect fired
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            // Second drop without a successful connect in between: the gap must double.
+            transport.RaisePeerDisconnected();
+            long secondGap = 2 * NetClient.DefaultReconnectMs;
+
+            now = NetClient.DefaultReconnectMs + secondGap - 1;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls); // still waiting the doubled gap
+
+            now = NetClient.DefaultReconnectMs + secondGap;
+            net.Poll();
+            Assert.Equal(3, transport.ConnectCalls);
+        }
+
+        [Fact]
+        public void Reconnect_BackoffIsCappedAtMax()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+
+            // Keep failing to connect; the backoff climbs 1s, 2s, 4s, 8s and then holds at 8s.
+            long expectedGap = NetClient.DefaultReconnectMs;
+            int connects = transport.ConnectCalls;
+            for (int i = 0; i < 6; i++)
+            {
+                transport.RaisePeerDisconnected();
+                now += expectedGap;
+                net.Poll();
+                connects++;
+                Assert.Equal(connects, transport.ConnectCalls);
+                expectedGap = Math.Min(expectedGap * 2, NetClient.MaxReconnectMs);
+            }
+        }
+
+        [Fact]
+        public void Ping_ReflectsTransportKeepalive()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+
+            Assert.Equal(-1, net.Ping); // no peer yet
+
+            transport.Ping = 42;
+            transport.RaisePeerConnected();
+            Assert.Equal(42, net.Ping);
+        }
+
+        [Fact]
+        public void Poll_WhileReady_PumpsTransportWithoutResendingHello()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 1, snapshotHz: 4));
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+
+            int sentAfterHandshake = transport.Sent.Count;
+            int pollsBefore = transport.PollCalls;
+
+            now = NetClient.HelloRetryMs * 20;
+            net.Poll();
+            net.Poll();
+            net.Poll();
+
+            // The transport keeps being pumped (keepalive), but no ClientHello is resent once Ready.
+            Assert.Equal(pollsBefore + 3, transport.PollCalls);
+            Assert.Equal(sentAfterHandshake, transport.Sent.Count);
+        }
+
+        [Fact]
+        public void SendClientState_OnlySendsOnceReady()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            var pose = new BoatPose();
+
+            net.SendClientState(pose); // not connected: dropped
+            Assert.Empty(transport.Sent);
+
+            net.Connect(Options);
+            transport.RaisePeerConnected(); // Handshaking (hello #1) — still not Ready
+            transport.Sent.Clear();
+            net.SendClientState(pose);
+            Assert.Empty(transport.Sent);
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 1, snapshotHz: 4));
+            net.SendClientState(pose);
+
+            Assert.Single(transport.Sent);
+            Assert.Equal(Payload.ClientState, Decode(transport.Sent[0]).PayloadType);
+        }
+
+        [Fact]
+        public void Receive_WorldClock_DispatchesThroughCodecIntoState()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 1, snapshotHz: 4));
+
+            transport.RaiseNetworkReceive(WorldClockEnvelope(day: 12, timeOfDay: 0.5f));
+
+            Assert.Equal(12u, net.ServerDay);
+            Assert.Equal(0.5f, net.ServerTimeOfDay);
+        }
+
+        [Fact]
+        public void Receive_GarbageDatagram_IsIgnoredWithoutThrow()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            var net = new NetClient(log, transport, () => 0);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+
+            transport.RaiseNetworkReceive(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });
+
+            Assert.NotEqual(ConnectionStatus.Ready, net.Status);
+        }
+
+        [Fact]
+        public void NetworkError_IsSurfacedAsWarning_WithoutThrow()
+        {
+            // Regression: the NetworkError seam event must stay wired to a signature-compatible
+            // handler. It is the one transport event no other test drives, so a mis-wired
+            // Action<IPEndPoint, SocketError> handler (as in the half-migrated NetClient) would
+            // slip past every other test and surface only as a production compile break.
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            var net = new NetClient(log, transport, () => 0);
+            net.Connect(Options);
+
+            transport.RaiseNetworkError(new IPEndPoint(IPAddress.Loopback, 4242), SocketError.ConnectionReset);
+
+            Assert.NotEmpty(log.Warnings);
+            Assert.NotEqual(ConnectionStatus.Ready, net.Status);
+        }
+
+        [Fact]
+        public void Dispose_StopsTransport()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            net.Connect(Options);
+
+            net.Dispose();
+
+            Assert.Equal(1, transport.StopCalls);
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+        }
+
+        private static Envelope Decode(byte[] bytes)
+        {
+            return Envelope.GetRootAsEnvelope(new ByteBuffer(bytes));
+        }
+
+        private static byte[] ServerHelloEnvelope(bool accepted, ulong playerId, byte snapshotHz)
+        {
+            var b = new FlatBufferBuilder(128);
+            StringOffset reason = b.CreateString(string.Empty);
+            StringOffset serverName = b.CreateString("test-server");
+            Offset<CapabilityManifest> caps = CapabilityManifest.CreateCapabilityManifest(
+                b, protocol_version: NetClient.ProtocolVersion, snapshot_hz: snapshotHz);
+            Offset<ServerHello> hello = ServerHello.CreateServerHello(
+                b,
+                accepted: accepted,
+                reasonOffset: reason,
+                player_id: playerId,
+                server_nameOffset: serverName,
+                balance_gold: 0,
+                capabilitiesOffset: caps);
+            return Wrap(b, 1, Payload.ServerHello, hello.Value);
+        }
+
+        private static byte[] WorldClockEnvelope(uint day, float timeOfDay)
+        {
+            var b = new FlatBufferBuilder(64);
+            Offset<WorldClock> clock = WorldClock.CreateWorldClock(b, day: day, time_of_day: timeOfDay, moon_phase: 0f);
+            return Wrap(b, 2, Payload.WorldClock, clock.Value);
+        }
+
+        private static byte[] Wrap(FlatBufferBuilder b, uint seq, Payload type, int payloadOffset)
+        {
+            Offset<Envelope> env = Envelope.CreateEnvelope(b, seq, type, payloadOffset);
+            Envelope.FinishEnvelopeBuffer(b, env);
+            return b.SizedByteArray();
+        }
+
+        private sealed class NullNetLog : INetLog
+        {
+            public void LogDebug(string message) { }
+            public void LogInfo(string message) { }
+            public void LogWarning(string message) { }
+            public void LogError(string message) { }
+        }
+
+        private sealed class RecordingLog : INetLog
+        {
+            public readonly List<string> Errors = new List<string>();
+            public readonly List<string> Warnings = new List<string>();
+
+            public void LogDebug(string message) { }
+            public void LogInfo(string message) { }
+            public void LogWarning(string message) { Warnings.Add(message); }
+            public void LogError(string message) { Errors.Add(message); }
+        }
+    }
+}
