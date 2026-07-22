@@ -18,6 +18,9 @@ Makefile text eol=lf
 *.md text
 *.json text
 
+# Deliberate CRLF fixture keeps the hook runner's env parsing cross-platform
+.claude/hooks/fixtures/dangerous-cmd-guard/reset-dirty.env text eol=crlf
+
 # Binary assets
 *.dll binary
 *.png binary

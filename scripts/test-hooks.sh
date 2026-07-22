@@ -57,7 +57,7 @@ for fixture in $(find "$fixtures_dir" -type f -name '*.expect0.json' -o -type f 
     if [ -f "$env_file" ]; then
       set -a
       # shellcheck disable=SC1090
-      . "$env_file"
+      . <(tr -d '\r' <"$env_file")
       set +a
     fi
     bash "$hook" <"$fixture" >/dev/null 2>&1
