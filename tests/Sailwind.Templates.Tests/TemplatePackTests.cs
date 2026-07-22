@@ -76,6 +76,13 @@ namespace Sailwind.Templates.Tests
             // The mod reaches the game only through the API, so it must not REFERENCE the game
             // assembly (a comment may still name it). No <Reference>/<ProjectReference> to it.
             Assert.DoesNotContain("Include=\"Assembly-CSharp", csprojText);
+            // Plugin.cs reads System.Numerics.Vector3 (wind.Ambient, pose.Position/Velocity).
+            // The sample gets that type transitively via a ProjectReference to the abstractions,
+            // but the template references the API as a plain DLL, which carries no transitive
+            // package deps — so the scaffolded net472 mod must pull System.Numerics.Vectors in
+            // directly or it fails to compile. (A real scaffold+build verifies the compile; this
+            // game-free grep only guards the reference's presence.)
+            Assert.Contains("System.Numerics.Vectors", csprojText);
 
             var pluginText = File.ReadAllText(plugin);
             Assert.Contains("using Sailwind.Api;", pluginText);

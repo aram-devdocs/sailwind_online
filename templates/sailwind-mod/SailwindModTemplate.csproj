@@ -33,6 +33,14 @@
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>
 
+  <!-- System.Numerics.Vector3 for the API's wind/boat-pose reads (Plugin.cs). The sample gets
+       this transitively through a ProjectReference to Sailwind.Api.Abstractions; the template
+       references the API as a plain DLL, which carries no transitive package deps, so it pulls
+       the same 4.5.0 in directly. On net472 this binds to the in-box System.Numerics.Vectors. -->
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Vectors" Version="4.5.0" />
+  </ItemGroup>
+
   <!-- The public consumer surface. The Sailwind.API host plugin ships this DLL, so reference
        it Private=false: your mod depends on the API but does not duplicate its DLL. -->
   <ItemGroup>
