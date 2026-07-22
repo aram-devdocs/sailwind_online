@@ -14,6 +14,15 @@ pub const MAX_AOI_RADIUS_CELLS: u32 = 16;
 /// only needs `> 0`, but an absurd value is a misconfiguration.
 const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 
+/// Lower bound on the grid cell size, in metres. A sub-metre cell is nonsensical
+/// for the 1024 m-default sailing world, and a pathological *operator* value
+/// below 1 m shrinks the `(x / cell_size)` divisor enough to saturate the
+/// `.floor() as i32` cast in [`sw_world::Grid::cell_of`] — the same #19-class
+/// overflow the hostile-client position path is already guarded against. The
+/// per-coordinate [`crate::validate::MAX_WORLD_COORD_M`] clamp only bounds the
+/// numerator, so the divisor needs its own floor here.
+const MIN_CELL_SIZE_M: f32 = 1.0;
+
 /// Upper bound on any aggregate per-player message-class min-interval, in
 /// milliseconds (market trade, client-state, chat, econ, moor). Bounds the
 /// rate-limit knobs so a misconfiguration cannot wedge a message class behind an
@@ -175,11 +184,11 @@ impl Config {
             ));
         }
         if !self.cell_size_m.is_finite()
-            || self.cell_size_m <= 0.0
+            || self.cell_size_m < MIN_CELL_SIZE_M
             || self.cell_size_m > MAX_CELL_SIZE_M
         {
             return Err(anyhow::anyhow!(
-                "cell_size_m must be a finite value in (0, {MAX_CELL_SIZE_M}]"
+                "cell_size_m must be a finite value in [{MIN_CELL_SIZE_M}, {MAX_CELL_SIZE_M}]"
             ));
         }
         for (name, value) in [
@@ -345,6 +354,31 @@ mod tests {
             };
             assert!(cfg.validate().is_err(), "cell_size {bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn rejects_sub_metre_cell_size() {
+        // A sub-metre cell is nonsensical for the 1024 m-default sailing world and
+        // would let a pathological *operator* value shrink the `(x / cell_size)`
+        // divisor enough to saturate the `.floor() as i32` cast in
+        // `sw_world::Grid::cell_of` — the same #19-class overflow the client path
+        // is already guarded against. The validator must floor the cell at 1.0 m.
+        for bad in [0.5f32, 0.999, f32::MIN_POSITIVE] {
+            let cfg = Config {
+                cell_size_m: bad,
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "sub-metre cell_size {bad} must be rejected"
+            );
+        }
+        // The lower bound is inclusive: exactly 1.0 m is the smallest sane cell.
+        let ok = Config {
+            cell_size_m: MIN_CELL_SIZE_M,
+            ..Config::default()
+        };
+        ok.validate().unwrap();
     }
 
     #[test]

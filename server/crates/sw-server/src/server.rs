@@ -1398,20 +1398,32 @@ mod input_hardening_tests {
         // then overflows (panics in debug, wraps in release). The handler must
         // drop the message before any of it reaches the grid — so this call must
         // NOT panic and must leave the player at its origin cell.
-        let mut server = make_server(Config::default());
+        let cfg = Config::default();
+        // Stagger each variant past the client-state throttle window so EVERY
+        // non-finite variant clears the per-player throttle and genuinely reaches
+        // `validate::sanitize_motion`. Sent at one `now_ms` they would all fall
+        // inside the 20 ms window and only the first would exercise the guard —
+        // the rest would drop VACUOUSLY at the limiter, hiding a regression.
+        let throttle_step = cfg.client_state_min_interval_ms as i64 + 1;
+        let mut server = make_server(cfg);
         let peer: PeerId = 1;
         let pid = join(&mut server, peer, "tok-nan");
         let origin = server.world.grid().cell_of(0.0, 0.0);
 
-        for (px, py, pz) in [
+        for (i, (px, py, pz)) in [
             (f32::INFINITY, 0.0, 0.0),
             (f32::NEG_INFINITY, 0.0, 0.0),
             (f32::NAN, 0.0, f32::NAN),
             (0.0, 0.0, f32::INFINITY),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now_ms = 1_000 + i as i64 * throttle_step;
             let env = motion_envelope(px, py, pz, 0.0, 0.0, 0.0);
-            send_state(&mut server, peer, &env, 1_000);
-            // Dropped: the player never moved off its origin cell.
+            send_state(&mut server, peer, &env, now_ms);
+            // Dropped by sanitize_motion (not the throttle): the player never
+            // moved off its origin cell. Fails for ANY variant if the guard is gone.
             assert_eq!(server.sessions[&peer].pos, [0.0, 0.0, 0.0]);
             assert_eq!(server.world.cell_of_entity(pid), Some(origin));
         }
