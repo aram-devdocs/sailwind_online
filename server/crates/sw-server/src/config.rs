@@ -14,7 +14,7 @@ pub const MAX_AOI_RADIUS_CELLS: u32 = 16;
 /// only needs `> 0`, but an absurd value is a misconfiguration.
 const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 
-/// Upper bound on the per-(player, port) market trade min-interval, in
+/// Upper bound on the aggregate per-player market trade min-interval, in
 /// milliseconds. Bounds the rate-limit knob so a misconfiguration cannot wedge
 /// trading behind an absurd cooldown, and so the saturating accessor has a
 /// finite ceiling. One hour is already far beyond any sane throttle.
@@ -40,10 +40,10 @@ pub struct Config {
     /// Grid cell size, in metres (advertised to clients).
     pub cell_size_m: f32,
     /// Minimum interval, in milliseconds, between two accepted market trades by
-    /// the same player at the same port (a per-(player, port) throttle). A new
-    /// trade inside this window is rejected; an idempotent replay of an
-    /// already-applied trade is not throttled. Bounded by
-    /// [`MAX_TRADE_MIN_INTERVAL_MS`].
+    /// the same player (an aggregate per-player throttle, independent of which
+    /// port the request names). A new trade inside this window is rejected; an
+    /// idempotent replay of an already-applied trade is not throttled. Bounded
+    /// by [`MAX_TRADE_MIN_INTERVAL_MS`].
     pub trade_min_interval_ms: u32,
     /// Human-readable server name in ServerHello.
     pub server_name: String,

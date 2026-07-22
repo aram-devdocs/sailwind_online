@@ -368,9 +368,9 @@ impl Server {
         Ok(())
     }
 
-    /// Handle a shared-market trade: throttle new trades per (player, port),
-    /// apply the trade idempotently against the authoritative per-port
-    /// stock/price, and reply with the resulting state.
+    /// Handle a shared-market trade: throttle new trades with the aggregate
+    /// per-player limiter, apply the trade idempotently against the
+    /// authoritative per-port stock/price, and reply with the resulting state.
     fn on_trade(
         &mut self,
         peer: PeerId,
@@ -390,10 +390,12 @@ impl Server {
 
         // Idempotency-first: a replay of an already-committed trade returns the
         // recorded state and is never throttled, so an app-level resend after
-        // packet loss stays safe even under the per-port rate limit. Only a
-        // genuinely new trade is charged against the token bucket.
+        // packet loss stays safe even under the rate limit. Only a genuinely new
+        // trade is charged against the aggregate per-player throttle — the
+        // attacker-supplied `port_id` never opens a fresh bucket, so rotating it
+        // cannot raise a player's trade throughput.
         let already_applied = self.db.lookup_trade(trade.txn_id)?.is_some();
-        if !already_applied && !self.trade_limiter.allow(player_id, trade.port_id, now_ms) {
+        if !already_applied && !self.trade_limiter.allow(player_id, now_ms) {
             let (stock, price) = self
                 .db
                 .market_state(trade.port_id, trade.item_id)?
@@ -515,6 +517,10 @@ impl Server {
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
         if let Some(s) = self.sessions.remove(&peer) {
             self.world.remove(s.player_id);
+            // Drop the player's throttle state: a departed player's entry is
+            // useless and leaving it behind would let connection churn accrete
+            // stale entries in the limiter map.
+            self.trade_limiter.clear(s.player_id);
             self.db.touch_last_seen(s.player_id as i64, now_ms())?;
             tracing::info!(peer, player_id = s.player_id, ?reason, "peer disconnected");
         }
@@ -921,10 +927,11 @@ mod aoi_harden_tests {
 }
 
 /// Shared-market dispatch: these exercise the real `on_trade` handler against an
-/// in-memory server, pinning the three acceptance properties for #21 — a trade
+/// in-memory server, pinning the acceptance properties for #21 — a trade
 /// mutates the shared per-port stock, a replay of the same txn_id never
-/// double-applies (and is not throttled), and a genuinely new trade inside the
-/// per-(player, port) window is rejected.
+/// double-applies (and is not throttled), a genuinely new trade inside the
+/// aggregate per-player window is rejected, and rotating the port_id cannot
+/// bypass that throttle or grow the limiter map.
 #[cfg(test)]
 mod market_dispatch_tests {
     use super::*;
@@ -1061,5 +1068,73 @@ mod market_dispatch_tests {
         let mut server = make_server(Config::default());
         apply_trade(&mut server, 99, 1, 10, 5, 40, 100, 1000);
         assert_eq!(server.db.market_state(10, 5).unwrap(), None);
+    }
+
+    #[test]
+    fn port_rotation_does_not_bypass_the_per_player_throttle() {
+        // Regression for the security review's DoS finding: an attacker that
+        // sends a fresh, attacker-chosen port_id on every message must NOT get a
+        // fresh throttle bucket. The throttle is aggregate per PLAYER, so only
+        // the first trade in the window lands regardless of how many distinct
+        // ports are rotated through; the rest never touch the DB.
+        let mut server = make_server(Config {
+            trade_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-rotate");
+
+        // First trade (port 100, t=1000) is admitted.
+        apply_trade(&mut server, peer, 1, 100, 5, 10, 100, 1000);
+        assert_eq!(server.db.market_state(100, 5).unwrap(), Some((10, 100)));
+
+        // Rotate distinct, attacker-chosen port_ids inside the window, each with
+        // a fresh txn_id (so idempotency does not cover it). Every one must be
+        // throttled by the per-player bound and leave the DB untouched.
+        for port in 200u32..1_200 {
+            apply_trade(
+                &mut server,
+                peer,
+                1_000 + port as u64,
+                port,
+                5,
+                10,
+                100,
+                1_001,
+            );
+            assert_eq!(
+                server.db.market_state(port, 5).unwrap(),
+                None,
+                "rotated port {port} must not bypass the per-player throttle"
+            );
+        }
+
+        // The limiter is keyed by player, so 2^32 distinct port_ids cannot grow
+        // it: it holds exactly the one player key.
+        assert_eq!(server.trade_limiter.tracked_count(), 1);
+    }
+
+    #[test]
+    fn disconnect_clears_the_players_limiter_entry() {
+        // A stale entry for a departed player is useless memory; on_disconnect
+        // must drop it so attacker connection churn cannot leave residue behind.
+        let mut server = make_server(Config {
+            trade_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-dc");
+
+        apply_trade(&mut server, peer, 1, 10, 5, 10, 100, 1000);
+        assert_eq!(server.trade_limiter.tracked_count(), 1);
+
+        server
+            .on_disconnect(peer, DisconnectReason::Remote)
+            .unwrap();
+        assert_eq!(
+            server.trade_limiter.tracked_count(),
+            0,
+            "the disconnected player's limiter entry must be cleared"
+        );
     }
 }
