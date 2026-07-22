@@ -27,6 +27,7 @@ namespace Sailwind.Api.Generated
         public const string Moon_currentPhase = "currentPhase";
         public const string Wind_currentWind = "currentWind";
         public const string GameState_currentBoat = "currentBoat";
+        public const string SaveLoadManager_readyToSave = "readyToSave";
         public const string SaveLoadManager_LoadGame = "LoadGame";
         public const string SaveLoadManager_SaveGame = "SaveGame";
     }

@@ -71,7 +71,8 @@ namespace Sailwind.ApiGen
             new("Wind",      "currentWind", Kinds.Field, Static: true,  Note: "IWindReader.Ambient: static current wind vector (the widely-read wind)"),
             // IPlayerBoatReader (PlayerBoatAdapter)
             new("GameState", "currentBoat", Kinds.Field, Static: true,  Note: "player-boat handle: static Transform of the player's current boat"),
-            // ISaveEvents (SaveEventsAdapter) — the two Harmony postfix targets
+            // ISaveEvents (SaveEventsAdapter) — common readiness + Harmony postfix targets
+            new("SaveLoadManager", "readyToSave", Kinds.Field, Static: true, Note: "common world-ready marker set by both new-game and continue flows"),
             new("SaveLoadManager", "LoadGame", Kinds.Method, Static: false, Note: "ISaveEvents.WorldLoaded postfix target (closes the #5 unverified-method trap)"),
             new("SaveLoadManager", "SaveGame", Kinds.Method, Static: false, Note: "ISaveEvents.SaveCompleted postfix target"),
         };

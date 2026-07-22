@@ -29,6 +29,7 @@ namespace Sailwind.Api.SurfaceManifest.Tests
             data.Add("Wind", "currentWind", "field");           // IWindReader.Ambient
             data.Add("SaveLoadManager", "LoadGame", "method");  // ISaveEvents.WorldLoaded patch target
             data.Add("SaveLoadManager", "SaveGame", "method");  // ISaveEvents.SaveCompleted patch target
+            data.Add("SaveLoadManager", "readyToSave", "field"); // common new-game/continue world-ready marker
             return data;
         }
 
@@ -47,6 +48,18 @@ namespace Sailwind.Api.SurfaceManifest.Tests
             Assert.True(found,
                 $"surface manifest does not cover {type}.{member} ({kind}); the adapter " +
                 "would bind an unverified name and degrade silently on the next game update");
+        }
+
+        [Fact]
+        public void Plugin_Polls_CommonWorldReadyMarker_InsteadOfLoadOnlyEvent()
+        {
+            var pluginPath = Path.Combine(
+                SurfaceManifestIntegrity.RepoRoot(), "apps", "Sailwind.API", "Plugin.cs");
+            var source = File.ReadAllText(pluginPath);
+
+            Assert.Contains("WorldReadyPoller", source);
+            Assert.Contains("saveEvents.IsWorldReady", source);
+            Assert.DoesNotContain("WorldLoaded += SailwindApi.SignalReady", source);
         }
     }
 }

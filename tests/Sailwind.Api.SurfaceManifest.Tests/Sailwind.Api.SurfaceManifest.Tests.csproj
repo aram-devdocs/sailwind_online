@@ -18,4 +18,8 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\..\packages\api-abstractions\Sailwind.Api.Abstractions\Sailwind.Api.Abstractions.csproj" />
+  </ItemGroup>
+
 </Project>

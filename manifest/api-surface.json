@@ -104,6 +104,13 @@
       "type": "SaveLoadManager"
     },
     {
+      "kind": "field",
+      "member": "readyToSave",
+      "signature": "System.Boolean SaveLoadManager.readyToSave",
+      "static": true,
+      "type": "SaveLoadManager"
+    },
+    {
       "kind": "type",
       "member": "",
       "signature": "SaveSlots",

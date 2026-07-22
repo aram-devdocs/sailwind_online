@@ -18,6 +18,9 @@ namespace Sailwind.Api
         public const string Name = "Sailwind.API";
         public const string Version = "0.1.0";
 
+        private readonly WorldReadyPoller _worldReady = new WorldReadyPoller();
+        private ISaveEvents _saveEvents;
+
         private void Awake()
         {
             var compat = SurfaceCheck.Run();
@@ -30,6 +33,7 @@ namespace Sailwind.Api
             SailwindApi.PlayerBoat = new PlayerBoatAdapter();
 
             var saveEvents = new SaveEventsAdapter(new Harmony(Guid));
+            _saveEvents = saveEvents;
             SailwindApi.SaveEvents = saveEvents;
 
             Logger.LogInfo(
@@ -39,9 +43,17 @@ namespace Sailwind.Api
             if (!compat.IsOk)
                 foreach (var m in compat.Missing)
                     Logger.LogWarning($"[Sailwind.API] surface drift: {m}");
+        }
 
-            // Ready fires once the world is loaded (surface already verified above).
-            saveEvents.WorldLoaded += SailwindApi.SignalReady;
+        private void Update()
+        {
+            var saveEvents = _saveEvents;
+            if (saveEvents == null)
+            {
+                return;
+            }
+
+            _worldReady.Poll(() => saveEvents.IsWorldReady, SailwindApi.SignalReady);
         }
 
         private static string Hash8(string hash) =>
