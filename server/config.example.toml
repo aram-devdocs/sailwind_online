@@ -28,11 +28,12 @@ aoi_radius_cells = 2
 # cells); smaller cells mean tighter culling at more boundary crossings.
 cell_size_m = 1024.0
 
-# Minimum interval in milliseconds between two accepted shared-market trades by
-# the same player at the same port (a per-(player, port) throttle). A new trade
-# inside this window is rejected with a MarketStateAck; an idempotent replay of
-# an already-applied trade is never throttled. Must be in 0..=3600000 (0 disables
-# the throttle).
+# Minimum interval in milliseconds between any two accepted shared-market trades
+# by the same player, aggregated across all ports (a per-player throttle). It is
+# rotation-proof: a player cannot exceed the configured rate no matter how many
+# distinct ports they trade at. A new trade inside this window is rejected with a
+# MarketStateAck; an idempotent replay of an already-applied trade is never
+# throttled. Must be in 0..=3600000 (0 disables the throttle).
 trade_min_interval_ms = 250
 
 # Human-readable server name returned in ServerHello.
