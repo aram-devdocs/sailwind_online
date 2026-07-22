@@ -131,6 +131,24 @@ jobs:
       - name: Run protocol-smoke against the built server
         run: dotnet run --project tools/protocol-smoke -c Release -- --server server/target/release/sw-server
 
+  # Coverage-guided fuzzing of the wire decoder. cargo-fuzz needs a nightly
+  # toolchain and the sanitizer runtime, so the fuzz crate lives OUTSIDE the
+  # stable server workspace (server/fuzz, excluded) and this job is allowed to
+  # fail without blocking the gate. A short run per push; a crash surfaces as a
+  # reproducer artifact under server/fuzz/artifacts.
+  fuzz:
+    needs: [rust]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz decode_envelope (short)
+        working-directory: server/fuzz
+        run: cargo +nightly fuzz run decode_envelope -- -max_total_time=30
+
   # The single required status check. It is trivial and only turns green once
   # its needs have all passed, so branch protection lists exactly this context.
   gate:
