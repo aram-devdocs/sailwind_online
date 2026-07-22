@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    A Sailwind mod: a BepInEx plugin (net472) that consumes the public Sailwind.API
+    surface. There is no public NuGet feed for the API, so this project references the
+    shipped DLLs directly:
+      * Sailwind.Api.Abstractions.dll — the consumer surface, shipped by the Sailwind.API
+        host plugin (in its BepInEx/plugins/Sailwind.API folder).
+      * BepInEx.dll + the Unity engine DLLs — from your BepInEx install and the game's
+        managed folder.
+    Point the two properties below at your install, then `dotnet build`. The plugin drops
+    into your BepInEx/plugins folder. It never references the game assembly (Assembly-CSharp):
+    a mod reads the game only through Sailwind.API.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>SailwindModTemplate</AssemblyName>
+    <RootNamespace>SailwindModTemplate</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <!-- EDIT THESE two paths to match your machine. -->
+    <!-- The BepInEx/plugins folder of your modded Sailwind profile. -->
+    <BepInExPluginsDir>C:\Path\To\BepInEx\plugins</BepInExPluginsDir>
+    <!-- The game's managed folder: Sailwind_Data\Managed (holds the Unity engine DLLs). -->
+    <GameManagedDir>C:\Path\To\Sailwind_Data\Managed</GameManagedDir>
+  </PropertyGroup>
+
+  <!-- net472 reference assemblies: compile hermetically without a machine-wide targeting pack. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- System.Numerics.Vector3 for the API's wind/boat-pose reads (Plugin.cs). The sample gets
+       this transitively through a ProjectReference to Sailwind.Api.Abstractions; the template
+       references the API as a plain DLL, which carries no transitive package deps, so it pulls
+       the same 4.5.0 in directly. On net472 this binds to the in-box System.Numerics.Vectors. -->
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Vectors" Version="4.5.0" />
+  </ItemGroup>
+
+  <!-- The public consumer surface. The Sailwind.API host plugin ships this DLL, so reference
+       it Private=false: your mod depends on the API but does not duplicate its DLL. -->
+  <ItemGroup>
+    <Reference Include="Sailwind.Api.Abstractions" HintPath="$(BepInExPluginsDir)\Sailwind.API\Sailwind.Api.Abstractions.dll" Private="false" />
+  </ItemGroup>
+
+  <!-- Just enough of the host to BE a BepInEx plugin. Private=false: these exist at runtime
+       inside the game process and must never be copied into your mod's output. -->
+  <ItemGroup>
+    <Reference Include="BepInEx" HintPath="$(BepInExPluginsDir)\..\core\BepInEx.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(GameManagedDir)\UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(GameManagedDir)\UnityEngine.CoreModule.dll" Private="false" />
+  </ItemGroup>
+
+</Project>

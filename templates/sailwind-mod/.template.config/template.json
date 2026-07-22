@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "Aram",
+  "classifications": [ "Sailwind", "BepInEx", "Mod", "Plugin" ],
+  "identity": "Sailwind.Mod.Template",
+  "name": "Sailwind mod (BepInEx plugin)",
+  "description": "A BepInEx plugin that consumes the public Sailwind.API surface: the world clock, the wind, the player's boat, and save events.",
+  "shortName": "sailwind-mod",
+  "tags": {
+    "language": "C#",
+    "type": "project"
+  },
+  "sourceName": "SailwindModTemplate",
+  "preferNameDirectory": true,
+  "symbols": {
+    "guidPrefix": {
+      "type": "parameter",
+      "datatype": "string",
+      "defaultValue": "com.example",
+      "replaces": "REPLACE_GUID_PREFIX",
+      "description": "Reverse-DNS prefix for your BepInEx plugin GUID; the GUID becomes <prefix>.<mod name>."
+    }
+  }
+}

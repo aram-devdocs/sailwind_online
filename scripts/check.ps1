@@ -25,6 +25,7 @@ Invoke-Step "game-free dotnet tests (contracts)" { dotnet test tests/Sailwind.Co
 Invoke-Step "game-free dotnet tests (net)" { dotnet test tests/Sailwind.Online.Net.Tests -c Release }
 Invoke-Step "game-free dotnet tests (sync)" { dotnet test tests/Sailwind.Online.Sync.Tests -c Release }
 Invoke-Step "game-free dotnet tests (surface manifest integrity)" { dotnet test tests/Sailwind.Api.SurfaceManifest.Tests -c Release }
+Invoke-Step "game-free dotnet tests (template pack)" { dotnet test tests/Sailwind.Templates.Tests -c Release }
 Invoke-Step "cargo fmt (check)" { cargo fmt --all --check --manifest-path server/Cargo.toml }
 Invoke-Step "cargo clippy (-D warnings)" { cargo clippy --workspace --all-targets --manifest-path server/Cargo.toml -- -D warnings }
 Invoke-Step "cargo test" { cargo test --workspace --manifest-path server/Cargo.toml }

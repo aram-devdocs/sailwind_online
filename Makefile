@@ -19,7 +19,7 @@ SLNF   := SailwindOnline.CI.slnf
 SERVER_MANIFEST := server/Cargo.toml
 
 .PHONY: help setup codegen contracts validate check audit build build-ci test \
-        test-hooks server-build server-run smoke test-profile deploy run-modded clean
+        test-hooks template server-build server-run smoke test-profile deploy run-modded clean
 
 help:  ## List available targets
 	@echo Sailwind Online - make targets
@@ -34,6 +34,7 @@ help:  ## List available targets
 	@echo   build-ci      Build the game-free solution filter in Release
 	@echo   test          Game-free dotnet tests plus cargo test
 	@echo   test-hooks    Run the governance hook golden-fixture suite
+	@echo   template      Install the dotnet new mod template and run its game-free test
 	@echo   server-build  Build the Rust server workspace
 	@echo   server-run    Run the Rust server (sailwind-online-server)
 	@echo   smoke         Build the server in Release and run the protocol-smoke harness
@@ -72,6 +73,10 @@ test:  ## Game-free dotnet tests plus cargo test
 
 test-hooks:  ## Run the governance hook golden-fixture suite
 	bash scripts/test-hooks.sh
+
+template:  ## Install the dotnet new mod template locally and run its game-free verification test
+	$(DOTNET) new install ./templates/sailwind-mod --force
+	$(DOTNET) test tests/Sailwind.Templates.Tests -c Release
 
 server-build:  ## Build the Rust server workspace
 	$(CARGO) build --manifest-path $(SERVER_MANIFEST)
