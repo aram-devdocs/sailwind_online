@@ -435,7 +435,8 @@ namespace Sailwind.ProtocolSmoke
 
         private ServerHello? DoHello(SmokeClient c, string name, string token)
         {
-            var hello = Codec.EncodeClientHello(_seq++, name, token, "smoke", "0.0.0", string.Empty);
+            const string apiSurfaceHashSentinel = "protocol-smoke-surface-hash";
+            var hello = Codec.EncodeClientHello(_seq++, name, token, "smoke", "0.0.0", apiSurfaceHashSentinel);
             var env = SendAndWait(c, hello, e => e.PayloadType == Payload.ServerHello, 6000, 250);
             return env.HasValue ? env.Value.PayloadAsServerHello() : (ServerHello?)null;
         }

@@ -220,24 +220,38 @@ impl Server {
     }
 
     fn on_hello(&mut self, peer: PeerId, hello: p::ClientHello<'_>) -> anyhow::Result<()> {
+        if hello.protocol_version() != sw_contracts::PROTOCOL_VERSION {
+            let reason = format!(
+                "protocol version mismatch: client {}, server {}",
+                hello.protocol_version(),
+                sw_contracts::PROTOCOL_VERSION
+            );
+            self.reject_hello(peer, &reason);
+            return Ok(());
+        }
+
+        let max_string_len = self.cfg.max_wire_string_len_usize();
+        let Some(api_surface_hash) = hello.api_surface_hash() else {
+            self.reject_hello(peer, "missing API surface hash");
+            return Ok(());
+        };
+        if api_surface_hash.is_empty() {
+            self.reject_hello(peer, "missing API surface hash");
+            return Ok(());
+        }
+        if !validate::string_within_limit(api_surface_hash, max_string_len) {
+            let reason =
+                format!("API surface hash exceeds maximum length ({max_string_len} bytes)");
+            self.reject_hello(peer, &reason);
+            return Ok(());
+        }
+
         let token = hello.token().unwrap_or("");
         let name = hello.display_name().unwrap_or("sailor").to_string();
 
         if token.is_empty() {
             // Auth is assertion-only, but a token must at least be present.
-            let bytes = codec::server_hello(
-                self.next_seq(),
-                false,
-                "missing token",
-                0,
-                &self.cfg.server_name,
-                0,
-                &self.caps(),
-                self.clock_now(),
-                self.weather_seed,
-                self.weather_epoch_day,
-            );
-            self.send(peer, &bytes);
+            self.reject_hello(peer, "missing token");
             return Ok(());
         }
 
@@ -301,6 +315,22 @@ impl Server {
         // without having to first cross a cell boundary.
         self.emit_aoi(peer, &aoi);
         Ok(())
+    }
+
+    fn reject_hello(&mut self, peer: PeerId, reason: &str) {
+        let bytes = codec::server_hello(
+            self.next_seq(),
+            false,
+            reason,
+            0,
+            &self.cfg.server_name,
+            0,
+            &self.caps(),
+            self.clock_now(),
+            self.weather_seed,
+            self.weather_epoch_day,
+        );
+        self.send(peer, &bytes);
     }
 
     fn on_client_state(&mut self, peer: PeerId, cs: p::ClientState<'_>, now_ms: i64) {
@@ -843,6 +873,155 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use flatbuffers::FlatBufferBuilder;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+    use sw_contracts::{decode_envelope, finish_envelope};
+    use sw_net::{protocol, Event};
+    use sw_world::Grid;
+
+    fn make_server() -> Server {
+        let cfg = Config::default();
+        let world = World::new(Grid::new(cfg.cell_size_m));
+        Server {
+            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            db: Db::open_in_memory().unwrap(),
+            world,
+            sessions: HashMap::new(),
+            seq: 0,
+            snapshot_tick: 0,
+            boot: Instant::now(),
+            epoch_ms: 0,
+            weather_seed: 0,
+            weather_epoch_day: 0,
+            trade_limiter: RateLimiter::new(cfg.trade_min_interval_ms_i64()),
+            client_state_limiter: RateLimiter::new(cfg.client_state_min_interval_ms_i64()),
+            chat_limiter: RateLimiter::new(cfg.chat_min_interval_ms_i64()),
+            econ_limiter: RateLimiter::new(cfg.econ_min_interval_ms_i64()),
+            moor_limiter: RateLimiter::new(cfg.moor_min_interval_ms_i64()),
+            running: Arc::new(AtomicBool::new(true)),
+            cfg,
+        }
+    }
+
+    fn hello_envelope(protocol_version: u16, api_surface_hash: Option<&str>) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let token = fbb.create_string("handshake-token");
+        let name = fbb.create_string("Sailor");
+        let api_hash = api_surface_hash.map(|value| fbb.create_string(value));
+        let hello = p::ClientHello::create(
+            &mut fbb,
+            &p::ClientHelloArgs {
+                protocol_version,
+                display_name: Some(name),
+                token: Some(token),
+                api_surface_hash: api_hash,
+                ..Default::default()
+            },
+        );
+        finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value())
+    }
+
+    fn deliver_hello(server: &mut Server, peer: PeerId, bytes: &[u8]) {
+        let env = decode_envelope(bytes).unwrap();
+        server
+            .on_hello(peer, env.payload_as_client_hello().unwrap())
+            .unwrap();
+    }
+
+    fn connect_peer(server: &mut Server) -> (UdpSocket, PeerId) {
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.host.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let connect_data = protocol::write_litenet_string(CONNECT_KEY);
+        let request = protocol::build_connect_request(0, 1, 1, 16, &connect_data);
+        client.send(&request).unwrap();
+
+        let peer = match server.host.poll(Instant::now()).as_slice() {
+            [Event::Connected(peer)] => *peer,
+            events => panic!("expected one connected peer, got {events:?}"),
+        };
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        client.recv(&mut accept).unwrap();
+        (client, peer)
+    }
+
+    fn receive_server_hello(client: &UdpSocket) -> (bool, String) {
+        let mut packet = [0u8; protocol::MTU];
+        let received = client.recv(&mut packet).unwrap();
+        assert_eq!(
+            protocol::Header::from_byte(packet[0]).property,
+            protocol::property::UNRELIABLE
+        );
+        let env = decode_envelope(&packet[protocol::HEADER_SIZE..received]).unwrap();
+        let hello = env.payload_as_server_hello().unwrap();
+        (hello.accepted(), hello.reason().unwrap_or("").to_string())
+    }
+
+    #[test]
+    fn protocol_mismatch_is_rejected_before_session_creation() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let bytes = hello_envelope(sw_contracts::PROTOCOL_VERSION + 1, Some("surface-hash"));
+
+        deliver_hello(&mut server, peer, &bytes);
+
+        assert!(!server.sessions.contains_key(&peer));
+        assert_eq!(
+            receive_server_hello(&client),
+            (
+                false,
+                format!(
+                    "protocol version mismatch: client {}, server {}",
+                    sw_contracts::PROTOCOL_VERSION + 1,
+                    sw_contracts::PROTOCOL_VERSION
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn api_surface_hash_must_be_present_nonempty_and_bounded() {
+        let max_len = Config::default().max_wire_string_len_usize();
+        let too_long = "x".repeat(max_len + 1);
+        let cases = [
+            (None, "missing API surface hash".to_string()),
+            (Some(""), "missing API surface hash".to_string()),
+            (
+                Some(too_long.as_str()),
+                format!("API surface hash exceeds maximum length ({max_len} bytes)"),
+            ),
+        ];
+
+        for (hash, expected_reason) in cases {
+            let mut server = make_server();
+            let (client, peer) = connect_peer(&mut server);
+            let bytes = hello_envelope(sw_contracts::PROTOCOL_VERSION, hash);
+            deliver_hello(&mut server, peer, &bytes);
+            assert!(
+                !server.sessions.contains_key(&peer),
+                "invalid API surface hash created a session"
+            );
+            assert_eq!(receive_server_hello(&client), (false, expected_reason));
+        }
+    }
+
+    #[test]
+    fn valid_protocol_and_api_surface_hash_create_session() {
+        let mut server = make_server();
+        let bytes = hello_envelope(sw_contracts::PROTOCOL_VERSION, Some("surface-hash"));
+
+        deliver_hello(&mut server, 1, &bytes);
+
+        assert!(server.sessions.contains_key(&1));
+    }
+}
+
 /// Interest-management hardening: these exercise the real message handlers and
 /// the per-recipient visibility decision against an in-memory server, pinning
 /// the quantitative AoI acceptance (initial interest set on join, added/removed
@@ -887,12 +1066,14 @@ mod aoi_harden_tests {
         let mut fbb = FlatBufferBuilder::new();
         let token_off = fbb.create_string(token);
         let name_off = fbb.create_string(name);
+        let api_hash_off = fbb.create_string("test-api-surface");
         let hello = p::ClientHello::create(
             &mut fbb,
             &p::ClientHelloArgs {
                 protocol_version: sw_contracts::PROTOCOL_VERSION,
                 display_name: Some(name_off),
                 token: Some(token_off),
+                api_surface_hash: Some(api_hash_off),
                 ..Default::default()
             },
         );
@@ -1081,12 +1262,14 @@ mod market_dispatch_tests {
         let mut fbb = FlatBufferBuilder::new();
         let token_off = fbb.create_string(token);
         let name_off = fbb.create_string(name);
+        let api_hash_off = fbb.create_string("test-api-surface");
         let hello = p::ClientHello::create(
             &mut fbb,
             &p::ClientHelloArgs {
                 protocol_version: sw_contracts::PROTOCOL_VERSION,
                 display_name: Some(name_off),
                 token: Some(token_off),
+                api_surface_hash: Some(api_hash_off),
                 ..Default::default()
             },
         );
@@ -1303,12 +1486,14 @@ mod input_hardening_tests {
         let mut fbb = FlatBufferBuilder::new();
         let token_off = fbb.create_string(token);
         let name_off = fbb.create_string("Sailor");
+        let api_hash_off = fbb.create_string("test-api-surface");
         let hello = p::ClientHello::create(
             &mut fbb,
             &p::ClientHelloArgs {
                 protocol_version: sw_contracts::PROTOCOL_VERSION,
                 display_name: Some(name_off),
                 token: Some(token_off),
+                api_surface_hash: Some(api_hash_off),
                 ..Default::default()
             },
         );

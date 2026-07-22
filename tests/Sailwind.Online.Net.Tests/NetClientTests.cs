@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Numerics;
 using Google.FlatBuffers;
 using Sailwind.Api;
 using Sailwind.Online.Client.Net;
@@ -97,6 +98,33 @@ namespace Sailwind.Online.Net.Tests
 
             Assert.Equal(ConnectionStatus.Disconnected, net.Status);
             Assert.False(net.HandshakeComplete);
+        }
+
+        [Fact]
+        public void Handshake_AcceptedServerHelloWithWrongProtocol_ReturnsToDisconnected()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            long now = 0;
+            var net = new NetClient(log, transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(
+                accepted: true,
+                playerId: 77,
+                snapshotHz: 8,
+                protocolVersion: NetClient.ProtocolVersion + 1));
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.False(net.HandshakeComplete);
+            Assert.Contains(log.Warnings, message => message.Contains("protocol"));
+            Assert.DoesNotContain(log.Warnings, message => message.Contains(Options.Token));
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
         }
 
         [Fact]
@@ -250,6 +278,120 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
+        public void AcceptedHello_BoatPoseOutbound_ThenRemoteSnapshotInbound_RoundTripsExactly()
+        {
+            long now = 4321;
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 77, snapshotHz: 4));
+            transport.Sent.Clear();
+
+            var pose = new BoatPose(
+                new Vector3(12.5f, -3.25f, 99.75f),
+                new Quaternion(0.1f, 0.2f, 0.3f, 0.9f),
+                new Vector3(-4.5f, 0.25f, 6.75f));
+            net.SendClientState(pose);
+
+            Assert.Single(transport.Sent);
+            byte[] expected = new Codec().EncodeClientState(
+                2,
+                pose.Position.X, pose.Position.Y, pose.Position.Z,
+                pose.Rotation.X, pose.Rotation.Y, pose.Rotation.Z, pose.Rotation.W,
+                pose.Velocity.X, pose.Velocity.Y, pose.Velocity.Z,
+                0,
+                (uint)now);
+            Assert.Equal(expected, transport.Sent[0]);
+            ClientState outbound = Decode(transport.Sent[0]).PayloadAsClientState();
+            Assert.Equal(pose.Position.X, outbound.Pos.Value.X);
+            Assert.Equal(pose.Position.Y, outbound.Pos.Value.Y);
+            Assert.Equal(pose.Position.Z, outbound.Pos.Value.Z);
+            Assert.Equal(pose.Rotation.X, outbound.Rot.Value.X);
+            Assert.Equal(pose.Rotation.Y, outbound.Rot.Value.Y);
+            Assert.Equal(pose.Rotation.Z, outbound.Rot.Value.Z);
+            Assert.Equal(pose.Rotation.W, outbound.Rot.Value.W);
+            Assert.Equal(pose.Velocity.X, outbound.Vel.Value.X);
+            Assert.Equal(pose.Velocity.Y, outbound.Vel.Value.Y);
+            Assert.Equal(pose.Velocity.Z, outbound.Vel.Value.Z);
+            Assert.Equal((uint)now, outbound.TMs);
+
+            transport.RaiseNetworkReceive(SnapshotDeltaEnvelope(
+                serverTick: 91,
+                playerId: 88,
+                x: -10.5f,
+                y: 2.25f,
+                z: 45.75f,
+                rx: 0.4f,
+                ry: 0.3f,
+                rz: 0.2f,
+                rw: 0.8f,
+                aboardBoat: 123,
+                tMs: 5678));
+
+            Assert.Equal(91u, net.Cache.LastServerTick);
+            Assert.True(net.Cache.TryGetPlayer(88, out var remote));
+            Assert.NotNull(remote);
+            Assert.Equal(-10.5f, remote.Latest.Pos.X);
+            Assert.Equal(2.25f, remote.Latest.Pos.Y);
+            Assert.Equal(45.75f, remote.Latest.Pos.Z);
+            Assert.Equal(0.4f, remote.Latest.Rot.X);
+            Assert.Equal(0.3f, remote.Latest.Rot.Y);
+            Assert.Equal(0.2f, remote.Latest.Rot.Z);
+            Assert.Equal(0.8f, remote.Latest.Rot.W);
+            Assert.Equal(123ul, remote.Latest.Link);
+            Assert.Equal(5678u, remote.Latest.TMs);
+            Assert.Equal(now, remote.Latest.ReceivedMs);
+        }
+
+        [Fact]
+        public void PositionObservability_LogsEachDirectionOncePerSession_AndResetsOnReconnect()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            long now = 100;
+            var net = new NetClient(log, transport, () => now);
+            var pose = new BoatPose(new Vector3(1f, 2f, 3f), Quaternion.Identity, Vector3.Zero);
+            byte[] snapshot = SnapshotDeltaEnvelope(1, 8, 4f, 5f, 6f, 0f, 0f, 0f, 1f, 123, 10);
+
+            net.Connect(Options);
+            net.SendClientState(pose);
+            Assert.DoesNotContain(log.Infos, message => message.Contains("First outbound position"));
+
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(true, 7, 4));
+            net.SendClientState(pose);
+            net.SendClientState(pose);
+            transport.RaiseNetworkReceive(snapshot);
+            transport.RaiseNetworkReceive(snapshot);
+
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+            Assert.True(Envelope.VerifyEnvelope(new ByteBuffer(snapshot)));
+            Assert.Equal(8ul, Decode(snapshot).PayloadAsSnapshotDelta().Players(0).Value.PlayerId);
+            string outboundLog = Assert.Single(log.Infos.FindAll(message => message.Contains("First outbound position")));
+            Assert.Contains("player_id=7", outboundLog);
+            Assert.Contains("pos=(1, 2, 3)", outboundLog);
+            Assert.Contains("t_ms=100", outboundLog);
+            Assert.True(net.Cache.TryGetPlayer(8, out _));
+            string inboundLog = Assert.Single(log.Infos.FindAll(message => message.Contains("First inbound position")));
+            Assert.Contains("remote_player_id=8", inboundLog);
+            Assert.Contains("pos=(4, 5, 6)", inboundLog);
+            Assert.Contains("t_ms=10", inboundLog);
+            Assert.DoesNotContain(log.Infos, message => message.Contains(Options.Token));
+
+            transport.RaisePeerDisconnected();
+            now += NetClient.DefaultReconnectMs;
+            net.Poll();
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(true, 7, 4));
+            net.SendClientState(pose);
+            transport.RaiseNetworkReceive(snapshot);
+
+            Assert.Equal(2, log.Infos.FindAll(message => message.Contains("First outbound position")).Count);
+            Assert.Equal(2, log.Infos.FindAll(message => message.Contains("First inbound position")).Count);
+        }
+
+        [Fact]
         public void Receive_WorldClock_DispatchesThroughCodecIntoState()
         {
             var transport = new MockTransport();
@@ -314,13 +456,17 @@ namespace Sailwind.Online.Net.Tests
             return Envelope.GetRootAsEnvelope(new ByteBuffer(bytes));
         }
 
-        private static byte[] ServerHelloEnvelope(bool accepted, ulong playerId, byte snapshotHz)
+        private static byte[] ServerHelloEnvelope(
+            bool accepted,
+            ulong playerId,
+            byte snapshotHz,
+            ushort protocolVersion = NetClient.ProtocolVersion)
         {
             var b = new FlatBufferBuilder(128);
             StringOffset reason = b.CreateString(string.Empty);
             StringOffset serverName = b.CreateString("test-server");
             Offset<CapabilityManifest> caps = CapabilityManifest.CreateCapabilityManifest(
-                b, protocol_version: NetClient.ProtocolVersion, snapshot_hz: snapshotHz);
+                b, protocol_version: protocolVersion, snapshot_hz: snapshotHz);
             Offset<ServerHello> hello = ServerHello.CreateServerHello(
                 b,
                 accepted: accepted,
@@ -330,6 +476,35 @@ namespace Sailwind.Online.Net.Tests
                 balance_gold: 0,
                 capabilitiesOffset: caps);
             return Wrap(b, 1, Payload.ServerHello, hello.Value);
+        }
+
+        private static byte[] SnapshotDeltaEnvelope(
+            uint serverTick,
+            ulong playerId,
+            float x,
+            float y,
+            float z,
+            float rx,
+            float ry,
+            float rz,
+            float rw,
+            ulong aboardBoat,
+            uint tMs)
+        {
+            var b = new FlatBufferBuilder(256);
+            PlayerState.StartPlayerState(b);
+            PlayerState.AddPlayerId(b, playerId);
+            PlayerState.AddPos(b, Vec3.CreateVec3(b, x, y, z));
+            PlayerState.AddRot(b, QuatC.CreateQuatC(b, rx, ry, rz, rw));
+            PlayerState.AddAboardBoat(b, aboardBoat);
+            PlayerState.AddTMs(b, tMs);
+            Offset<PlayerState> player = PlayerState.EndPlayerState(b);
+            VectorOffset players = SnapshotDelta.CreatePlayersVector(b, new[] { player });
+            Offset<SnapshotDelta> delta = SnapshotDelta.CreateSnapshotDelta(
+                b,
+                server_tick: serverTick,
+                playersOffset: players);
+            return Wrap(b, 3, Payload.SnapshotDelta, delta.Value);
         }
 
         private static byte[] WorldClockEnvelope(uint day, float timeOfDay)
@@ -363,10 +538,11 @@ namespace Sailwind.Online.Net.Tests
         private sealed class RecordingLog : INetLog
         {
             public readonly List<string> Errors = new List<string>();
+            public readonly List<string> Infos = new List<string>();
             public readonly List<string> Warnings = new List<string>();
 
             public void LogDebug(string message) { }
-            public void LogInfo(string message) { }
+            public void LogInfo(string message) { Infos.Add(message); }
             public void LogWarning(string message) { Warnings.Add(message); }
             public void LogError(string message) { Errors.Add(message); }
         }
