@@ -21,10 +21,10 @@ pub mod sw_proto {
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_PAYLOAD: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_PAYLOAD: u8 = 13;
+pub const ENUM_MAX_PAYLOAD: u8 = 15;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_PAYLOAD: [Payload; 14] = [
+pub const ENUM_VALUES_PAYLOAD: [Payload; 16] = [
   Payload::NONE,
   Payload::ClientHello,
   Payload::ServerHello,
@@ -39,6 +39,8 @@ pub const ENUM_VALUES_PAYLOAD: [Payload; 14] = [
   Payload::ChatSend,
   Payload::ChatBroadcast,
   Payload::WorldClock,
+  Payload::MarketTradeRequest,
+  Payload::MarketStateAck,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -60,9 +62,11 @@ impl Payload {
   pub const ChatSend: Self = Self(11);
   pub const ChatBroadcast: Self = Self(12);
   pub const WorldClock: Self = Self(13);
+  pub const MarketTradeRequest: Self = Self(14);
+  pub const MarketStateAck: Self = Self(15);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 13;
+  pub const ENUM_MAX: u8 = 15;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::ClientHello,
@@ -78,6 +82,8 @@ impl Payload {
     Self::ChatSend,
     Self::ChatBroadcast,
     Self::WorldClock,
+    Self::MarketTradeRequest,
+    Self::MarketStateAck,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -96,6 +102,8 @@ impl Payload {
       Self::ChatSend => Some("ChatSend"),
       Self::ChatBroadcast => Some("ChatBroadcast"),
       Self::WorldClock => Some("WorldClock"),
+      Self::MarketTradeRequest => Some("MarketTradeRequest"),
+      Self::MarketStateAck => Some("MarketStateAck"),
       _ => None,
     }
   }
@@ -3120,6 +3128,370 @@ impl core::fmt::Debug for LedgerAck<'_> {
       ds.finish()
   }
 }
+pub enum MarketTradeRequestOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct MarketTradeRequest<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for MarketTradeRequest<'a> {
+  type Inner = MarketTradeRequest<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> MarketTradeRequest<'a> {
+  pub const VT_TXN_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_PORT_ID: flatbuffers::VOffsetT = 6;
+  pub const VT_ITEM_ID: flatbuffers::VOffsetT = 8;
+  pub const VT_QTY: flatbuffers::VOffsetT = 10;
+  pub const VT_UNIT_PRICE: flatbuffers::VOffsetT = 12;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    MarketTradeRequest { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args MarketTradeRequestArgs
+  ) -> flatbuffers::WIPOffset<MarketTradeRequest<'bldr>> {
+    let mut builder = MarketTradeRequestBuilder::new(_fbb);
+    builder.add_unit_price(args.unit_price);
+    builder.add_qty(args.qty);
+    builder.add_txn_id(args.txn_id);
+    builder.add_item_id(args.item_id);
+    builder.add_port_id(args.port_id);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn txn_id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(MarketTradeRequest::VT_TXN_ID, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn port_id(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(MarketTradeRequest::VT_PORT_ID, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn item_id(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(MarketTradeRequest::VT_ITEM_ID, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn qty(&self) -> i64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<i64>(MarketTradeRequest::VT_QTY, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn unit_price(&self) -> i64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<i64>(MarketTradeRequest::VT_UNIT_PRICE, Some(0)).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for MarketTradeRequest<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u64>("txn_id", Self::VT_TXN_ID, false)?
+     .visit_field::<u32>("port_id", Self::VT_PORT_ID, false)?
+     .visit_field::<u32>("item_id", Self::VT_ITEM_ID, false)?
+     .visit_field::<i64>("qty", Self::VT_QTY, false)?
+     .visit_field::<i64>("unit_price", Self::VT_UNIT_PRICE, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct MarketTradeRequestArgs {
+    pub txn_id: u64,
+    pub port_id: u32,
+    pub item_id: u32,
+    pub qty: i64,
+    pub unit_price: i64,
+}
+impl<'a> Default for MarketTradeRequestArgs {
+  #[inline]
+  fn default() -> Self {
+    MarketTradeRequestArgs {
+      txn_id: 0,
+      port_id: 0,
+      item_id: 0,
+      qty: 0,
+      unit_price: 0,
+    }
+  }
+}
+
+pub struct MarketTradeRequestBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> MarketTradeRequestBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_txn_id(&mut self, txn_id: u64) {
+    self.fbb_.push_slot::<u64>(MarketTradeRequest::VT_TXN_ID, txn_id, 0);
+  }
+  #[inline]
+  pub fn add_port_id(&mut self, port_id: u32) {
+    self.fbb_.push_slot::<u32>(MarketTradeRequest::VT_PORT_ID, port_id, 0);
+  }
+  #[inline]
+  pub fn add_item_id(&mut self, item_id: u32) {
+    self.fbb_.push_slot::<u32>(MarketTradeRequest::VT_ITEM_ID, item_id, 0);
+  }
+  #[inline]
+  pub fn add_qty(&mut self, qty: i64) {
+    self.fbb_.push_slot::<i64>(MarketTradeRequest::VT_QTY, qty, 0);
+  }
+  #[inline]
+  pub fn add_unit_price(&mut self, unit_price: i64) {
+    self.fbb_.push_slot::<i64>(MarketTradeRequest::VT_UNIT_PRICE, unit_price, 0);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> MarketTradeRequestBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    MarketTradeRequestBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<MarketTradeRequest<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for MarketTradeRequest<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("MarketTradeRequest");
+      ds.field("txn_id", &self.txn_id());
+      ds.field("port_id", &self.port_id());
+      ds.field("item_id", &self.item_id());
+      ds.field("qty", &self.qty());
+      ds.field("unit_price", &self.unit_price());
+      ds.finish()
+  }
+}
+pub enum MarketStateAckOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct MarketStateAck<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for MarketStateAck<'a> {
+  type Inner = MarketStateAck<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> MarketStateAck<'a> {
+  pub const VT_TXN_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_ACCEPTED: flatbuffers::VOffsetT = 6;
+  pub const VT_PORT_ID: flatbuffers::VOffsetT = 8;
+  pub const VT_ITEM_ID: flatbuffers::VOffsetT = 10;
+  pub const VT_STOCK: flatbuffers::VOffsetT = 12;
+  pub const VT_PRICE: flatbuffers::VOffsetT = 14;
+  pub const VT_REASON: flatbuffers::VOffsetT = 16;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    MarketStateAck { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args MarketStateAckArgs<'args>
+  ) -> flatbuffers::WIPOffset<MarketStateAck<'bldr>> {
+    let mut builder = MarketStateAckBuilder::new(_fbb);
+    builder.add_price(args.price);
+    builder.add_stock(args.stock);
+    builder.add_txn_id(args.txn_id);
+    if let Some(x) = args.reason { builder.add_reason(x); }
+    builder.add_item_id(args.item_id);
+    builder.add_port_id(args.port_id);
+    builder.add_accepted(args.accepted);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn txn_id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(MarketStateAck::VT_TXN_ID, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn accepted(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(MarketStateAck::VT_ACCEPTED, Some(false)).unwrap()}
+  }
+  #[inline]
+  pub fn port_id(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(MarketStateAck::VT_PORT_ID, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn item_id(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(MarketStateAck::VT_ITEM_ID, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn stock(&self) -> i64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<i64>(MarketStateAck::VT_STOCK, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn price(&self) -> i64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<i64>(MarketStateAck::VT_PRICE, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn reason(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(MarketStateAck::VT_REASON, None)}
+  }
+}
+
+impl flatbuffers::Verifiable for MarketStateAck<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<u64>("txn_id", Self::VT_TXN_ID, false)?
+     .visit_field::<bool>("accepted", Self::VT_ACCEPTED, false)?
+     .visit_field::<u32>("port_id", Self::VT_PORT_ID, false)?
+     .visit_field::<u32>("item_id", Self::VT_ITEM_ID, false)?
+     .visit_field::<i64>("stock", Self::VT_STOCK, false)?
+     .visit_field::<i64>("price", Self::VT_PRICE, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("reason", Self::VT_REASON, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct MarketStateAckArgs<'a> {
+    pub txn_id: u64,
+    pub accepted: bool,
+    pub port_id: u32,
+    pub item_id: u32,
+    pub stock: i64,
+    pub price: i64,
+    pub reason: Option<flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for MarketStateAckArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    MarketStateAckArgs {
+      txn_id: 0,
+      accepted: false,
+      port_id: 0,
+      item_id: 0,
+      stock: 0,
+      price: 0,
+      reason: None,
+    }
+  }
+}
+
+pub struct MarketStateAckBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> MarketStateAckBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_txn_id(&mut self, txn_id: u64) {
+    self.fbb_.push_slot::<u64>(MarketStateAck::VT_TXN_ID, txn_id, 0);
+  }
+  #[inline]
+  pub fn add_accepted(&mut self, accepted: bool) {
+    self.fbb_.push_slot::<bool>(MarketStateAck::VT_ACCEPTED, accepted, false);
+  }
+  #[inline]
+  pub fn add_port_id(&mut self, port_id: u32) {
+    self.fbb_.push_slot::<u32>(MarketStateAck::VT_PORT_ID, port_id, 0);
+  }
+  #[inline]
+  pub fn add_item_id(&mut self, item_id: u32) {
+    self.fbb_.push_slot::<u32>(MarketStateAck::VT_ITEM_ID, item_id, 0);
+  }
+  #[inline]
+  pub fn add_stock(&mut self, stock: i64) {
+    self.fbb_.push_slot::<i64>(MarketStateAck::VT_STOCK, stock, 0);
+  }
+  #[inline]
+  pub fn add_price(&mut self, price: i64) {
+    self.fbb_.push_slot::<i64>(MarketStateAck::VT_PRICE, price, 0);
+  }
+  #[inline]
+  pub fn add_reason(&mut self, reason: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(MarketStateAck::VT_REASON, reason);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> MarketStateAckBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    MarketStateAckBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<MarketStateAck<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for MarketStateAck<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("MarketStateAck");
+      ds.field("txn_id", &self.txn_id());
+      ds.field("accepted", &self.accepted());
+      ds.field("port_id", &self.port_id());
+      ds.field("item_id", &self.item_id());
+      ds.field("stock", &self.stock());
+      ds.field("price", &self.price());
+      ds.field("reason", &self.reason());
+      ds.finish()
+  }
+}
 pub enum ChatSendOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -3652,6 +4024,36 @@ impl<'a> Envelope<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn payload_as_market_trade_request(&self) -> Option<MarketTradeRequest<'a>> {
+    if self.payload_type() == Payload::MarketTradeRequest {
+      self.payload().map(|t| {
+       // Safety:
+       // Created from a valid Table for this object
+       // Which contains a valid union in this slot
+       unsafe { MarketTradeRequest::init_from_table(t) }
+     })
+    } else {
+      None
+    }
+  }
+
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn payload_as_market_state_ack(&self) -> Option<MarketStateAck<'a>> {
+    if self.payload_type() == Payload::MarketStateAck {
+      self.payload().map(|t| {
+       // Safety:
+       // Created from a valid Table for this object
+       // Which contains a valid union in this slot
+       unsafe { MarketStateAck::init_from_table(t) }
+     })
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for Envelope<'_> {
@@ -3677,6 +4079,8 @@ impl flatbuffers::Verifiable for Envelope<'_> {
           Payload::ChatSend => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ChatSend>>("Payload::ChatSend", pos),
           Payload::ChatBroadcast => v.verify_union_variant::<flatbuffers::ForwardsUOffset<ChatBroadcast>>("Payload::ChatBroadcast", pos),
           Payload::WorldClock => v.verify_union_variant::<flatbuffers::ForwardsUOffset<WorldClock>>("Payload::WorldClock", pos),
+          Payload::MarketTradeRequest => v.verify_union_variant::<flatbuffers::ForwardsUOffset<MarketTradeRequest>>("Payload::MarketTradeRequest", pos),
+          Payload::MarketStateAck => v.verify_union_variant::<flatbuffers::ForwardsUOffset<MarketStateAck>>("Payload::MarketStateAck", pos),
           _ => Ok(()),
         }
      })?
@@ -3824,6 +4228,20 @@ impl core::fmt::Debug for Envelope<'_> {
         },
         Payload::WorldClock => {
           if let Some(x) = self.payload_as_world_clock() {
+            ds.field("payload", &x)
+          } else {
+            ds.field("payload", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        Payload::MarketTradeRequest => {
+          if let Some(x) = self.payload_as_market_trade_request() {
+            ds.field("payload", &x)
+          } else {
+            ds.field("payload", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        Payload::MarketStateAck => {
+          if let Some(x) = self.payload_as_market_state_ack() {
             ds.field("payload", &x)
           } else {
             ds.field("payload", &"InvalidFlatbuffer: Union discriminant does not match value.")

@@ -71,6 +71,22 @@ namespace Sailwind.ProtocolSmoke
             return b.SizedByteArray();
         }
 
+        public static byte[] EncodeMarketTradeRequest(
+            uint seq,
+            ulong txnId,
+            uint portId,
+            uint itemId,
+            long qty,
+            long unitPrice)
+        {
+            var b = new FlatBufferBuilder(128);
+            var trade = MarketTradeRequest.CreateMarketTradeRequest(
+                b, txnId, portId, itemId, qty, unitPrice);
+            var env = Envelope.CreateEnvelope(b, seq, Payload.MarketTradeRequest, trade.Value);
+            Envelope.FinishEnvelopeBuffer(b, env);
+            return b.SizedByteArray();
+        }
+
         public static byte[] EncodeMoorRequest(
             uint seq,
             float px, float py, float pz,

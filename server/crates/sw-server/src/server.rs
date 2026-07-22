@@ -3,7 +3,8 @@
 use crate::clock::{clock_from_epoch, WorldClock};
 use crate::codec::{self, BoatSnap, Caps, MooringSnap, PlayerSnap};
 use crate::config::Config;
-use crate::econ_store::DbLedgerStore;
+use crate::econ_store::{DbLedgerStore, DbMarketStore};
+use crate::ratelimit::RateLimiter;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sw_contracts::decode_envelope;
 use sw_contracts::sw_proto as p;
-use sw_econ::{Ledger, Txn};
+use sw_econ::{Ledger, Market, MarketAck, Trade, Txn};
 use sw_net::{DisconnectReason, Event, Host, PeerId};
 use sw_persist::{Db, MooringRow};
 use sw_world::{AoiUpdate, Cell, Subscription, World};
@@ -20,7 +21,7 @@ use sw_world::{AoiUpdate, Cell, Subscription, World};
 const CONNECT_KEY: &str = "sailwind-online";
 
 /// Feature flags advertised in the capability manifest.
-const FEATURES: &[&str] = &["unreliable", "aoi", "econ", "moorage", "chat"];
+const FEATURES: &[&str] = &["unreliable", "aoi", "econ", "market", "moorage", "chat"];
 
 /// `world` table keys.
 const KEY_CLOCK_EPOCH: &str = "clock_epoch_ms";
@@ -57,6 +58,7 @@ pub struct Server {
     epoch_ms: i64,
     weather_seed: u64,
     weather_epoch_day: u32,
+    trade_limiter: RateLimiter,
     running: Arc<AtomicBool>,
 }
 
@@ -81,6 +83,7 @@ impl Server {
 
         let host = Host::bind(&cfg.bind, CONNECT_KEY)?;
         let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
+        let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
 
         Ok(Server {
             cfg,
@@ -94,6 +97,7 @@ impl Server {
             epoch_ms,
             weather_seed,
             weather_epoch_day,
+            trade_limiter,
             running,
         })
     }
@@ -180,6 +184,11 @@ impl Server {
             p::Payload::EconTxn => {
                 if let Some(t) = env.payload_as_econ_txn() {
                     self.on_econ(peer, t)?;
+                }
+            }
+            p::Payload::MarketTradeRequest => {
+                if let Some(r) = env.payload_as_market_trade_request() {
+                    self.on_trade(peer, r, now_ms())?;
                 }
             }
             p::Payload::MoorRequest => {
@@ -355,6 +364,71 @@ impl Server {
         );
 
         let bytes = codec::ledger_ack(self.next_seq(), &ack);
+        self.send(peer, &bytes);
+        Ok(())
+    }
+
+    /// Handle a shared-market trade: throttle new trades per (player, port),
+    /// apply the trade idempotently against the authoritative per-port
+    /// stock/price, and reply with the resulting state.
+    fn on_trade(
+        &mut self,
+        peer: PeerId,
+        req: p::MarketTradeRequest<'_>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        let Some(player_id) = self.sessions.get(&peer).map(|s| s.player_id) else {
+            return Ok(());
+        };
+        let trade = Trade {
+            txn_id: req.txn_id(),
+            port_id: req.port_id(),
+            item_id: req.item_id(),
+            qty: req.qty(),
+            unit_price: req.unit_price(),
+        };
+
+        // Idempotency-first: a replay of an already-committed trade returns the
+        // recorded state and is never throttled, so an app-level resend after
+        // packet loss stays safe even under the per-port rate limit. Only a
+        // genuinely new trade is charged against the token bucket.
+        let already_applied = self.db.lookup_trade(trade.txn_id)?.is_some();
+        if !already_applied && !self.trade_limiter.allow(player_id, trade.port_id, now_ms) {
+            let (stock, price) = self
+                .db
+                .market_state(trade.port_id, trade.item_id)?
+                .unwrap_or((0, 0));
+            let ack = MarketAck {
+                txn_id: trade.txn_id,
+                accepted: false,
+                port_id: trade.port_id,
+                item_id: trade.item_id,
+                stock,
+                price,
+                reason: "rate limited".to_string(),
+            };
+            tracing::debug!(player_id, port = trade.port_id, "market trade rate limited");
+            let bytes = codec::market_state_ack(self.next_seq(), &ack);
+            self.send(peer, &bytes);
+            return Ok(());
+        }
+
+        let ack = {
+            let mut market = Market::new(DbMarketStore::new(&self.db, now_ms));
+            market.apply(&trade)?
+        };
+        tracing::debug!(
+            player_id,
+            txn_id = trade.txn_id,
+            port = trade.port_id,
+            item = trade.item_id,
+            accepted = ack.accepted,
+            stock = ack.stock,
+            price = ack.price,
+            "market trade"
+        );
+
+        let bytes = codec::market_state_ack(self.next_seq(), &ack);
         self.send(peer, &bytes);
         Ok(())
     }
@@ -675,6 +749,7 @@ mod aoi_harden_tests {
 
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
+        let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         Server {
             host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
             db: Db::open_in_memory().unwrap(),
@@ -686,6 +761,7 @@ mod aoi_harden_tests {
             epoch_ms: 0,
             weather_seed: 0,
             weather_epoch_day: 0,
+            trade_limiter,
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
@@ -841,5 +917,149 @@ mod aoi_harden_tests {
         let caps = server.caps();
         assert_eq!(caps.aoi_radius_cells, 5);
         assert_eq!(caps.cell_size_m, 2048.0);
+    }
+}
+
+/// Shared-market dispatch: these exercise the real `on_trade` handler against an
+/// in-memory server, pinning the three acceptance properties for #21 — a trade
+/// mutates the shared per-port stock, a replay of the same txn_id never
+/// double-applies (and is not throttled), and a genuinely new trade inside the
+/// per-(player, port) window is rejected.
+#[cfg(test)]
+mod market_dispatch_tests {
+    use super::*;
+    use flatbuffers::FlatBufferBuilder;
+    use sw_contracts::{decode_envelope, finish_envelope};
+    use sw_world::Grid;
+
+    fn make_server(cfg: Config) -> Server {
+        let world = World::new(Grid::new(cfg.cell_size_m));
+        let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
+        Server {
+            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            db: Db::open_in_memory().unwrap(),
+            world,
+            sessions: HashMap::new(),
+            seq: 0,
+            snapshot_tick: 0,
+            boot: Instant::now(),
+            epoch_ms: 0,
+            weather_seed: 0,
+            weather_epoch_day: 0,
+            trade_limiter,
+            running: Arc::new(AtomicBool::new(true)),
+            cfg,
+        }
+    }
+
+    fn hello_envelope(token: &str, name: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let token_off = fbb.create_string(token);
+        let name_off = fbb.create_string(name);
+        let hello = p::ClientHello::create(
+            &mut fbb,
+            &p::ClientHelloArgs {
+                protocol_version: sw_contracts::PROTOCOL_VERSION,
+                display_name: Some(name_off),
+                token: Some(token_off),
+                ..Default::default()
+            },
+        );
+        finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value())
+    }
+
+    fn trade_envelope(txn_id: u64, port: u32, item: u32, qty: i64, price: i64) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let req = p::MarketTradeRequest::create(
+            &mut fbb,
+            &p::MarketTradeRequestArgs {
+                txn_id,
+                port_id: port,
+                item_id: item,
+                qty,
+                unit_price: price,
+            },
+        );
+        finish_envelope(
+            &mut fbb,
+            2,
+            p::Payload::MarketTradeRequest,
+            req.as_union_value(),
+        )
+    }
+
+    fn join(server: &mut Server, peer: PeerId, token: &str) {
+        let bytes = hello_envelope(token, "Trader");
+        let env = decode_envelope(&bytes).unwrap();
+        server
+            .on_hello(peer, env.payload_as_client_hello().unwrap())
+            .unwrap();
+    }
+
+    fn apply_trade(
+        server: &mut Server,
+        peer: PeerId,
+        txn_id: u64,
+        port: u32,
+        item: u32,
+        qty: i64,
+        price: i64,
+        now_ms: i64,
+    ) {
+        let bytes = trade_envelope(txn_id, port, item, qty, price);
+        let env = decode_envelope(&bytes).unwrap();
+        server
+            .on_trade(peer, env.payload_as_market_trade_request().unwrap(), now_ms)
+            .unwrap();
+    }
+
+    #[test]
+    fn trade_mutates_shared_port_stock_and_replay_is_idempotent() {
+        let mut server = make_server(Config::default());
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-trade");
+
+        // A first trade sells 40 units into port 10 / item 5 at price 100.
+        apply_trade(&mut server, peer, 1, 10, 5, 40, 100, 1000);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), Some((40, 100)));
+
+        // A replay of the same txn_id (even with a different payload) must not
+        // double-apply and must not be throttled despite being inside the
+        // window: the shared stock stays at 40.
+        apply_trade(&mut server, peer, 1, 10, 5, 999, 999, 1050);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), Some((40, 100)));
+    }
+
+    #[test]
+    fn new_trade_inside_the_window_is_rate_limited() {
+        let mut server = make_server(Config {
+            trade_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-rl");
+
+        // First trade accepted at t=1000.
+        apply_trade(&mut server, peer, 1, 10, 5, 40, 100, 1000);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), Some((40, 100)));
+
+        // A *new* txn_id at t=1050 (50ms later, inside the 250ms window) is
+        // throttled: it must not touch the shared stock.
+        apply_trade(&mut server, peer, 2, 10, 5, 5, 100, 1050);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), Some((40, 100)));
+        assert!(server.db.lookup_trade(2).unwrap().is_none());
+
+        // Once the window elapses (t=1300, 300ms after the accepted trade) the
+        // new trade is admitted and the shared stock advances.
+        apply_trade(&mut server, peer, 2, 10, 5, 5, 100, 1300);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), Some((45, 100)));
+    }
+
+    #[test]
+    fn a_trade_before_hello_is_ignored() {
+        // No session for the peer -> the handler is a safe no-op, never a panic.
+        let mut server = make_server(Config::default());
+        apply_trade(&mut server, 99, 1, 10, 5, 40, 100, 1000);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), None);
     }
 }
