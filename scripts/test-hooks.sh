@@ -55,9 +55,19 @@ for fixture in $(find "$fixtures_dir" -type f -name '*.expect0.json' -o -type f 
     export SW_STATE_DIR="$tmp/state"
     export SW_SESSION_FILE="$tmp/session.json"
     if [ -f "$env_file" ]; then
+      normalized_env_file="$tmp/fixture.env"
+      if ! sed 's/\r$//' "$env_file" >"$normalized_env_file"; then
+        echo "test-hooks: failed to normalize environment fixture $env_file" >&2
+        exit 1
+      fi
+
       set -a
       # shellcheck disable=SC1090
-      . <(tr -d '\r' <"$env_file")
+      if ! . "$normalized_env_file"; then
+        set +a
+        echo "test-hooks: failed to source environment fixture $env_file" >&2
+        exit 1
+      fi
       set +a
     fi
     bash "$hook" <"$fixture" >/dev/null 2>&1
