@@ -15,4 +15,8 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
 
+  <ItemGroup Condition="'$(IsTestProject)' == 'true'">
+    <PackageReference Include="coverlet.collector" Version="6.0.2" />
+  </ItemGroup>
+
 </Project>

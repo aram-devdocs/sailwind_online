@@ -42,6 +42,9 @@ cargo clippy --workspace --all-targets --manifest-path server/Cargo.toml -- -D w
 echo "==> cargo test"
 cargo test --workspace --manifest-path server/Cargo.toml
 
+echo "==> coverage (game-free C# + Rust, with thresholds)"
+bash scripts/coverage.sh
+
 if [ -f lib/Assembly-CSharp.dll ]; then
   echo "==> lib/ present: full solution build (Release)"
   dotnet build SailwindOnline.sln -c Release

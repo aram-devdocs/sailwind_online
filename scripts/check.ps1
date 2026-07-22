@@ -29,6 +29,7 @@ Invoke-Step "game-free dotnet tests (template pack)" { dotnet test tests/Sailwin
 Invoke-Step "cargo fmt (check)" { cargo fmt --all --check --manifest-path server/Cargo.toml }
 Invoke-Step "cargo clippy (-D warnings)" { cargo clippy --workspace --all-targets --manifest-path server/Cargo.toml -- -D warnings }
 Invoke-Step "cargo test" { cargo test --workspace --manifest-path server/Cargo.toml }
+Invoke-Step "coverage (game-free C# + Rust, with thresholds)" { bash scripts/coverage.sh }
 
 if (Test-Path 'lib/Assembly-CSharp.dll') {
     Invoke-Step "lib/ present: full solution build (Release)" { dotnet build SailwindOnline.sln -c Release }
