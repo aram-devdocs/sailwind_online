@@ -13,5 +13,9 @@ tick_hz = 30
 # Snapshot broadcast rate in Hz (advertised to clients in the capability manifest).
 snapshot_hz = 4
 
+# Interval in seconds between standalone world-clock broadcasts (the periodic
+# clock authority tick; the join-time clock rides inside ServerHello).
+clock_broadcast_secs = 10
+
 # Human-readable server name returned in ServerHello.
 server_name = "Sailwind Online (dev)"

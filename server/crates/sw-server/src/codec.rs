@@ -115,6 +115,29 @@ pub fn server_hello(
     )
 }
 
+/// Encode a standalone `WorldClock` broadcast.
+///
+/// The join-time clock rides inside `ServerHello`; this variant is the periodic
+/// authority tick the run loop emits so connected clients stay in sync without
+/// reconnecting.
+pub fn world_clock(seq: u32, clock: WorldClock) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let clock_off = p::WorldClock::create(
+        &mut fbb,
+        &p::WorldClockArgs {
+            day: clock.day,
+            time_of_day: clock.time_of_day,
+            moon_phase: clock.moon_phase,
+        },
+    );
+    finish_envelope(
+        &mut fbb,
+        seq,
+        p::Payload::WorldClock,
+        clock_off.as_union_value(),
+    )
+}
+
 /// Encode a `SnapshotDelta`.
 pub fn snapshot_delta(
     seq: u32,
@@ -360,6 +383,23 @@ mod tests {
         assert_eq!(c.tick_hz(), 30);
         assert_eq!(hello.clock().unwrap().day(), 3);
         assert_eq!(hello.weather().unwrap().seed(), 999);
+    }
+
+    #[test]
+    fn world_clock_roundtrips() {
+        let clock = WorldClock {
+            day: 5,
+            time_of_day: 0.5,
+            moon_phase: 0.25,
+        };
+        let bytes = world_clock(11, clock);
+        let env = decode_envelope(&bytes).unwrap();
+        assert_eq!(env.seq(), 11);
+        assert_eq!(env.payload_type(), p::Payload::WorldClock);
+        let wc = env.payload_as_world_clock().unwrap();
+        assert_eq!(wc.day(), 5);
+        assert_eq!(wc.time_of_day(), 0.5);
+        assert_eq!(wc.moon_phase(), 0.25);
     }
 
     #[test]

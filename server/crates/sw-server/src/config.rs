@@ -15,6 +15,8 @@ pub struct Config {
     pub tick_hz: u32,
     /// Snapshot broadcast rate (Hz), advertised to clients.
     pub snapshot_hz: u32,
+    /// Interval (seconds) between standalone world-clock broadcasts.
+    pub clock_broadcast_secs: u32,
     /// Human-readable server name in ServerHello.
     pub server_name: String,
 }
@@ -26,6 +28,7 @@ impl Default for Config {
             db_path: "sailwind.db".to_string(),
             tick_hz: 30,
             snapshot_hz: 4,
+            clock_broadcast_secs: 10,
             server_name: "Sailwind Online (dev)".to_string(),
         }
     }
@@ -105,6 +108,11 @@ impl Config {
     pub fn ticks_per_snapshot(&self) -> u64 {
         (self.tick_hz / self.snapshot_hz).max(1) as u64
     }
+
+    /// Number of ticks between standalone world-clock broadcasts.
+    pub fn ticks_per_clock_broadcast(&self) -> u64 {
+        (self.tick_hz * self.clock_broadcast_secs).max(1) as u64
+    }
 }
 
 fn expect_value(args: &[String], i: &mut usize, flag: &str) -> anyhow::Result<String> {
@@ -124,6 +132,20 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:38455");
         assert_eq!(cfg.ticks_per_snapshot(), 30 / 4);
+    }
+
+    #[test]
+    fn clock_broadcast_cadence() {
+        let cfg = Config::default();
+        assert_eq!(cfg.clock_broadcast_secs, 10);
+        assert_eq!(cfg.ticks_per_clock_broadcast(), 30 * 10);
+
+        let fast = Config {
+            tick_hz: 20,
+            clock_broadcast_secs: 3,
+            ..Config::default()
+        };
+        assert_eq!(fast.ticks_per_clock_broadcast(), 60);
     }
 
     #[test]
