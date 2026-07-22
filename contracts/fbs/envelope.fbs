@@ -24,7 +24,9 @@ union Payload {
   LedgerAck,
   ChatSend,
   ChatBroadcast,
-  WorldClock
+  WorldClock,
+  MarketTradeRequest,
+  MarketStateAck
 }
 
 table Envelope { seq:uint; payload:Payload; }

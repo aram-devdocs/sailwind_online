@@ -11,6 +11,7 @@ mod clock;
 mod codec;
 mod config;
 mod econ_store;
+mod ratelimit;
 mod server;
 
 use std::sync::atomic::{AtomicBool, Ordering};

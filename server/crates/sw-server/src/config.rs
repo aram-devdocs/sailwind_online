@@ -14,6 +14,12 @@ pub const MAX_AOI_RADIUS_CELLS: u32 = 16;
 /// only needs `> 0`, but an absurd value is a misconfiguration.
 const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 
+/// Upper bound on the aggregate per-player market trade min-interval, in
+/// milliseconds. Bounds the rate-limit knob so a misconfiguration cannot wedge
+/// trading behind an absurd cooldown, and so the saturating accessor has a
+/// finite ceiling. One hour is already far beyond any sane throttle.
+pub const MAX_TRADE_MIN_INTERVAL_MS: u32 = 3_600_000;
+
 /// Runtime configuration for the server (see `config.example.toml`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -33,6 +39,12 @@ pub struct Config {
     pub aoi_radius_cells: u32,
     /// Grid cell size, in metres (advertised to clients).
     pub cell_size_m: f32,
+    /// Minimum interval, in milliseconds, between two accepted market trades by
+    /// the same player (an aggregate per-player throttle, independent of which
+    /// port the request names). A new trade inside this window is rejected; an
+    /// idempotent replay of an already-applied trade is not throttled. Bounded
+    /// by [`MAX_TRADE_MIN_INTERVAL_MS`].
+    pub trade_min_interval_ms: u32,
     /// Human-readable server name in ServerHello.
     pub server_name: String,
 }
@@ -47,6 +59,7 @@ impl Default for Config {
             clock_broadcast_secs: 10,
             aoi_radius_cells: sw_world::AOI_RADIUS_CELLS as u32,
             cell_size_m: sw_world::Grid::DEFAULT_CELL_SIZE_M,
+            trade_min_interval_ms: 250,
             server_name: "Sailwind Online (dev)".to_string(),
         }
     }
@@ -132,6 +145,11 @@ impl Config {
                 "cell_size_m must be a finite value in (0, {MAX_CELL_SIZE_M}]"
             ));
         }
+        if self.trade_min_interval_ms > MAX_TRADE_MIN_INTERVAL_MS {
+            return Err(anyhow::anyhow!(
+                "trade_min_interval_ms must be in 0..={MAX_TRADE_MIN_INTERVAL_MS}"
+            ));
+        }
         Ok(())
     }
 
@@ -140,6 +158,14 @@ impl Config {
     /// can never overflow even if a caller bypasses [`Config::validate`].
     pub fn aoi_radius_i32(&self) -> i32 {
         self.aoi_radius_cells.min(MAX_AOI_RADIUS_CELLS) as i32
+    }
+
+    /// Market trade min-interval as a bounded `i64` of milliseconds for the
+    /// rate limiter. Saturates at [`MAX_TRADE_MIN_INTERVAL_MS`], so the
+    /// limiter's interval math stays finite even if a caller bypasses
+    /// [`Config::validate`].
+    pub fn trade_min_interval_ms_i64(&self) -> i64 {
+        self.trade_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
     }
 
     /// Number of ticks between snapshot broadcasts.
@@ -262,6 +288,56 @@ mod tests {
         assert_eq!(cfg.cell_size_m, 512.0);
         cfg.validate().unwrap();
         assert_eq!(cfg.aoi_radius_i32(), 4);
+    }
+
+    #[test]
+    fn trade_rate_limit_default_is_valid_and_bounded() {
+        let cfg = Config::default();
+        cfg.validate().unwrap();
+        assert!(cfg.trade_min_interval_ms > 0);
+        assert!(cfg.trade_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        // The bounded accessor mirrors the config value for a sane default.
+        assert_eq!(
+            cfg.trade_min_interval_ms_i64(),
+            cfg.trade_min_interval_ms as i64
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_trade_interval() {
+        let huge = Config {
+            trade_min_interval_ms: MAX_TRADE_MIN_INTERVAL_MS + 1,
+            ..Config::default()
+        };
+        assert!(
+            huge.validate().is_err(),
+            "an interval past the bound is rejected"
+        );
+    }
+
+    #[test]
+    fn trade_interval_accessor_saturates_at_the_bound() {
+        // Even a pathological value is clamped by the saturating accessor, so
+        // the rate-limiter's min-interval math can never be handed a value the
+        // validator would have rejected.
+        let cfg = Config {
+            trade_min_interval_ms: u32::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.trade_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
+    }
+
+    #[test]
+    fn parses_trade_interval_key() {
+        let toml_text = r#"
+            trade_min_interval_ms = 500
+        "#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.trade_min_interval_ms, 500);
+        cfg.validate().unwrap();
     }
 
     #[test]

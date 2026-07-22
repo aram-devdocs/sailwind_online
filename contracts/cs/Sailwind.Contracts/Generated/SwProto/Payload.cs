@@ -21,6 +21,8 @@ public enum Payload : byte
   ChatSend = 11,
   ChatBroadcast = 12,
   WorldClock = 13,
+  MarketTradeRequest = 14,
+  MarketStateAck = 15,
 };
 
 
@@ -70,6 +72,12 @@ static public class PayloadVerify
         break;
       case Payload.WorldClock:
         result = SwProto.WorldClockVerify.Verify(verifier, tablePos);
+        break;
+      case Payload.MarketTradeRequest:
+        result = SwProto.MarketTradeRequestVerify.Verify(verifier, tablePos);
+        break;
+      case Payload.MarketStateAck:
+        result = SwProto.MarketStateAckVerify.Verify(verifier, tablePos);
         break;
       default: result = true;
         break;

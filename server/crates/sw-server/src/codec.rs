@@ -242,6 +242,31 @@ pub fn ledger_ack(seq: u32, ack: &sw_econ::LedgerAck) -> Vec<u8> {
     finish_envelope(&mut fbb, seq, p::Payload::LedgerAck, la.as_union_value())
 }
 
+/// Encode a `MarketStateAck` — the reply to a `MarketTradeRequest` carrying the
+/// resulting shared per-port stock/price (or a rejection reason).
+pub fn market_state_ack(seq: u32, ack: &sw_econ::MarketAck) -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+    let reason_off = fbb.create_string(&ack.reason);
+    let msa = p::MarketStateAck::create(
+        &mut fbb,
+        &p::MarketStateAckArgs {
+            txn_id: ack.txn_id,
+            accepted: ack.accepted,
+            port_id: ack.port_id,
+            item_id: ack.item_id,
+            stock: ack.stock,
+            price: ack.price,
+            reason: Some(reason_off),
+        },
+    );
+    finish_envelope(
+        &mut fbb,
+        seq,
+        p::Payload::MarketStateAck,
+        msa.as_union_value(),
+    )
+}
+
 /// Encode a `ChatBroadcast`.
 pub fn chat_broadcast(
     seq: u32,
@@ -454,6 +479,31 @@ mod tests {
         let ack = env.payload_as_moor_ack().unwrap();
         assert!(ack.accepted());
         assert_eq!(ack.record().unwrap().boat_id(), 1);
+    }
+
+    #[test]
+    fn market_state_ack_roundtrips() {
+        let ack = sw_econ::MarketAck {
+            txn_id: 9,
+            accepted: true,
+            port_id: 10,
+            item_id: 5,
+            stock: 40,
+            price: 100,
+            reason: "ok".into(),
+        };
+        let bytes = market_state_ack(3, &ack);
+        let env = decode_envelope(&bytes).unwrap();
+        assert_eq!(env.seq(), 3);
+        assert_eq!(env.payload_type(), p::Payload::MarketStateAck);
+        let msa = env.payload_as_market_state_ack().unwrap();
+        assert_eq!(msa.txn_id(), 9);
+        assert!(msa.accepted());
+        assert_eq!(msa.port_id(), 10);
+        assert_eq!(msa.item_id(), 5);
+        assert_eq!(msa.stock(), 40);
+        assert_eq!(msa.price(), 100);
+        assert_eq!(msa.reason(), Some("ok"));
     }
 
     #[test]

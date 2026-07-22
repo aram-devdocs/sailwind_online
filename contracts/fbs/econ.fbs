@@ -5,3 +5,12 @@ namespace SwProto;
 
 table EconTxn { txn_id:ulong; amount_gold:long; kind:ubyte; note:string; }
 table LedgerAck { txn_id:ulong; accepted:bool; new_balance:long; reason:string; }
+
+// Shared port market (v0): a rate-limited, idempotent trade against a port's
+// authoritative per-item stock/price state — not a dynamic-price simulation.
+// qty is a signed stock delta: positive sells into the port (stock rises),
+// negative buys out of it (stock falls, never below zero). unit_price is the
+// price recorded for the (port, item) as state the client reads back. Idempotent
+// by txn_id, exactly like EconTxn, so an app-level resend never double-applies.
+table MarketTradeRequest { txn_id:ulong; port_id:uint; item_id:uint; qty:long; unit_price:long; }
+table MarketStateAck { txn_id:ulong; accepted:bool; port_id:uint; item_id:uint; stock:long; price:long; reason:string; }

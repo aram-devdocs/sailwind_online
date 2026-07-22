@@ -1,4 +1,4 @@
-// The seven numbered conformance checks. Each prints exactly one PASS/FAIL
+// The eight numbered conformance checks. Each prints exactly one PASS/FAIL
 // line and the run exits 0 only when every check passes. The harness is the
 // deliverable: it exercises a real LiteNetLib client against a real Rust
 // server over real FlatBuffers envelopes and a real SQLite database that
@@ -94,6 +94,7 @@ namespace Sailwind.ProtocolSmoke
 
                 results.Add(RunPresence(server, ep, a, playerIdA));
                 results.Add(RunEcon(a));
+                results.Add(RunMarket(a));
                 results.Add(RunMoorage(a));
 
                 // Capture liveness after the spray and scenarios 1-5, before the
@@ -228,6 +229,52 @@ namespace Sailwind.ProtocolSmoke
             catch (Exception ex)
             {
                 return new Result(4, "econ-idempotency", false, $"exception: {ex.Message}");
+            }
+        }
+
+        // Check 8: shared port market. A MarketTradeRequest sells 40 units into
+        // port 10 / item 5; the MarketStateAck reports the shared stock. A replay
+        // of the same txn_id leaves the shared stock unchanged (idempotent), the
+        // market twin of the econ-idempotency check but against per-port state.
+        private Result RunMarket(SmokeClient a)
+        {
+            try
+            {
+                if (!a.Connected)
+                {
+                    return new Result(8, "market-trade", false, "skipped: A has no connection");
+                }
+
+                var trade = Codec.EncodeMarketTradeRequest(_seq++, 1, 10, 5, 40, 100);
+                var ack1 = SendAndWait(a, trade, e => e.PayloadType == Payload.MarketStateAck, 3000, 250);
+                if (!ack1.HasValue)
+                {
+                    return new Result(8, "market-trade", false, "no MarketStateAck for trade 1");
+                }
+
+                var ms1 = ack1.Value.PayloadAsMarketStateAck();
+                if (!ms1.Accepted || ms1.Stock != 40)
+                {
+                    return new Result(8, "market-trade", false,
+                        $"first trade accepted={ms1.Accepted}, stock={ms1.Stock} (expected accepted, 40)");
+                }
+
+                var replay = Codec.EncodeMarketTradeRequest(_seq++, 1, 10, 5, 40, 100);
+                var ack2 = SendAndWait(a, replay, e => e.PayloadType == Payload.MarketStateAck, 3000, 250);
+                if (!ack2.HasValue)
+                {
+                    return new Result(8, "market-trade", false, "no MarketStateAck on replay of trade 1");
+                }
+
+                var ms2 = ack2.Value.PayloadAsMarketStateAck();
+                bool ok = ms2.Stock == 40;
+                return new Result(8, "market-trade", ok,
+                    ok ? "shared port stock 40 after trade and unchanged on replay"
+                       : $"idempotency broken: replay produced stock {ms2.Stock}");
+            }
+            catch (Exception ex)
+            {
+                return new Result(8, "market-trade", false, $"exception: {ex.Message}");
             }
         }
 

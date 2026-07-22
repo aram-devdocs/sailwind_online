@@ -2,8 +2,10 @@
 //!
 //! A thin [`Db`] wrapper over `rusqlite` (bundled SQLite): WAL journal mode,
 //! `user_version`-numbered migrations applied at boot from embedded SQL, and
-//! typed accessors for the four schema-v1 tables (`players`, `moorings`,
-//! `ledger`, `world`). Synchronous by design — it is driven directly from the
+//! typed accessors for the schema tables (`players`, `moorings`, `ledger`,
+//! `world` in v1; the shared `market` + `market_trades` in v2). Migrations are
+//! forward-only and additive — a later version never drops or rewrites an
+//! earlier table. Synchronous by design — it is driven directly from the
 //! server's single-threaded tick loop.
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -11,7 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 pub use rusqlite::{Error, Result};
 
 /// The latest schema version this build knows how to produce.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Embedded schema for `user_version = 1`. Applied once, in a transaction.
 const MIGRATION_V1: &str = r#"
@@ -54,6 +56,32 @@ CREATE INDEX idx_ledger_player ON ledger (player_id);
 CREATE TABLE world (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+"#;
+
+/// Embedded schema for `user_version = 2`. Additive over v1: the shared,
+/// authoritative per-port market. `market` holds the current `(stock, price)`
+/// keyed by `(port_id, item_id)`; `market_trades` is the txn_id dedup log that
+/// makes a replayed trade idempotent, exactly as `ledger` does for balances.
+/// Modelled on the game `SaveContainer`'s port-demand / market-supply concepts
+/// (see `docs/04-reference/game-facts.md`), by concept only — never by reading
+/// the game's bytes.
+const MIGRATION_V2: &str = r#"
+CREATE TABLE market (
+    port_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    stock   INTEGER NOT NULL DEFAULT 0,
+    price   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (port_id, item_id)
+);
+
+CREATE TABLE market_trades (
+    txn_id     INTEGER PRIMARY KEY,
+    port_id    INTEGER NOT NULL,
+    item_id    INTEGER NOT NULL,
+    stock      INTEGER NOT NULL,
+    price      INTEGER NOT NULL,
+    applied_at INTEGER NOT NULL
 );
 "#;
 
@@ -117,6 +145,12 @@ impl Db {
                 "BEGIN; {MIGRATION_V1} PRAGMA user_version = 1; COMMIT;"
             ))?;
             version = 1;
+        }
+        if version < 2 {
+            self.conn.execute_batch(&format!(
+                "BEGIN; {MIGRATION_V2} PRAGMA user_version = 2; COMMIT;"
+            ))?;
+            version = 2;
         }
         debug_assert_eq!(version, SCHEMA_VERSION);
         Ok(())
@@ -222,6 +256,59 @@ impl Db {
         tx.execute(
             "UPDATE players SET gold = ?2 WHERE id = ?1",
             params![player_id, new_balance],
+        )?;
+        tx.commit()
+    }
+
+    // ----- market --------------------------------------------------------
+
+    /// Current shared `(stock, price)` for a `(port, item)`, or `None` if no
+    /// trade has ever touched it.
+    pub fn market_state(&self, port_id: u32, item_id: u32) -> Result<Option<(i64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT stock, price FROM market WHERE port_id = ?1 AND item_id = ?2",
+                params![port_id, item_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Look up a committed trade by its idempotency key:
+    /// `(port_id, item_id, resulting_stock, resulting_price)`.
+    pub fn lookup_trade(&self, txn_id: u64) -> Result<Option<(u32, u32, i64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT port_id, item_id, stock, price FROM market_trades WHERE txn_id = ?1",
+                params![txn_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+    }
+
+    /// Atomically record a trade in the dedup log and upsert the shared
+    /// `(port, item)` stock/price to its post-trade values.
+    pub fn commit_trade(
+        &self,
+        txn_id: u64,
+        port_id: u32,
+        item_id: u32,
+        new_stock: i64,
+        new_price: i64,
+        applied_at: i64,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO market_trades (txn_id, port_id, item_id, stock, price, applied_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![txn_id, port_id, item_id, new_stock, new_price, applied_at],
+        )?;
+        tx.execute(
+            "INSERT INTO market (port_id, item_id, stock, price)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(port_id, item_id) DO UPDATE SET
+                stock = excluded.stock, price = excluded.price",
+            params![port_id, item_id, new_stock, new_price],
         )?;
         tx.commit()
     }
@@ -349,9 +436,79 @@ mod tests {
     }
 
     #[test]
-    fn opens_and_migrates_to_v1() {
+    fn opens_and_migrates_to_latest() {
         let db = Db::open_in_memory().unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn market_state_defaults_and_roundtrips() {
+        let db = Db::open_in_memory().unwrap();
+        // Untouched (port, item) reads as (0, 0) — no row yet.
+        assert_eq!(db.market_state(10, 5).unwrap(), None);
+        // A committed trade upserts the shared state and records the dedup key.
+        assert_eq!(db.lookup_trade(1).unwrap(), None);
+        db.commit_trade(1, 10, 5, 30, 100, 1000).unwrap();
+        assert_eq!(db.market_state(10, 5).unwrap(), Some((30, 100)));
+        assert_eq!(db.lookup_trade(1).unwrap(), Some((10, 5, 30, 100)));
+
+        // A second trade to the same (port, item) replaces stock/price in place.
+        db.commit_trade(2, 10, 5, 20, 110, 1001).unwrap();
+        assert_eq!(db.market_state(10, 5).unwrap(), Some((20, 110)));
+        // Distinct (port, item) is independent.
+        db.commit_trade(3, 11, 5, 50, 300, 1002).unwrap();
+        assert_eq!(db.market_state(11, 5).unwrap(), Some((50, 300)));
+        assert_eq!(db.market_state(10, 5).unwrap(), Some((20, 110)));
+    }
+
+    #[test]
+    fn migration_v1_to_v2_preserves_v1_tables_and_data() {
+        // A fresh v1 database, opened by a v2 build, must forward-migrate to v2
+        // (adding the market tables) while preserving every v1 row.
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "sw-persist-migrate-{}-{:?}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        let path_str = path.to_str().unwrap().to_string();
+
+        // Stamp a genuine v1 database: only the v1 schema, user_version = 1.
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN; {MIGRATION_V1} PRAGMA user_version = 1; COMMIT;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO players (name, token_hash, gold, created_at, last_seen)
+                 VALUES ('Skipper', 'v1hash', 250, 1, 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Reopen with the current build: it migrates v1 -> v2.
+        {
+            let db = Db::open(&path_str).unwrap();
+            assert_eq!(db.schema_version().unwrap(), 2);
+            // v1 data survived the migration.
+            let p = db.upsert_player_by_token("v1hash", "Skipper", 3).unwrap();
+            assert_eq!(p.gold, 250);
+            // The v2 market table exists and starts empty.
+            assert_eq!(db.market_state(1, 1).unwrap(), None);
+            db.commit_trade(1, 1, 1, 5, 7, 4).unwrap();
+            assert_eq!(db.market_state(1, 1).unwrap(), Some((5, 7)));
+        }
+
+        let _ = std::fs::remove_file(&path_str);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 
     #[test]

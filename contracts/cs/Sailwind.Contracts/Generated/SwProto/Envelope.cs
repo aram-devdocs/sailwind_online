@@ -37,6 +37,8 @@ public struct Envelope : IFlatbufferObject
   public SwProto.ChatSend PayloadAsChatSend() { return Payload<SwProto.ChatSend>().Value; }
   public SwProto.ChatBroadcast PayloadAsChatBroadcast() { return Payload<SwProto.ChatBroadcast>().Value; }
   public SwProto.WorldClock PayloadAsWorldClock() { return Payload<SwProto.WorldClock>().Value; }
+  public SwProto.MarketTradeRequest PayloadAsMarketTradeRequest() { return Payload<SwProto.MarketTradeRequest>().Value; }
+  public SwProto.MarketStateAck PayloadAsMarketStateAck() { return Payload<SwProto.MarketStateAck>().Value; }
 
   public static Offset<SwProto.Envelope> CreateEnvelope(FlatBufferBuilder builder,
       uint seq = 0,
