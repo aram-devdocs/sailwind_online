@@ -90,7 +90,8 @@ namespace Sailwind.Online.Net.Tests
         public void Handshake_ServerHelloRejected_ReturnsToDisconnected()
         {
             var transport = new MockTransport();
-            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
             net.Connect(Options);
             transport.RaisePeerConnected();
 
@@ -98,6 +99,22 @@ namespace Sailwind.Online.Net.Tests
 
             Assert.Equal(ConnectionStatus.Disconnected, net.Status);
             Assert.False(net.HandshakeComplete);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.False(transport.IsPeerConnected);
+
+            now = NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(1, transport.ConnectCalls);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(2, transport.FreshPeerConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            transport.RaisePeerConnected();
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            Assert.Equal(2, transport.Sent.Count);
         }
 
         [Fact]
@@ -118,13 +135,19 @@ namespace Sailwind.Online.Net.Tests
 
             Assert.Equal(ConnectionStatus.Disconnected, net.Status);
             Assert.False(net.HandshakeComplete);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.False(transport.IsPeerConnected);
             Assert.Contains(log.Warnings, message => message.Contains("protocol"));
             Assert.DoesNotContain(log.Warnings, message => message.Contains(Options.Token));
 
             now = NetClient.DefaultReconnectMs;
             net.Poll();
             Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(2, transport.FreshPeerConnectCalls);
             Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            transport.RaisePeerConnected();
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
         }
 
         [Fact]
@@ -145,6 +168,8 @@ namespace Sailwind.Online.Net.Tests
 
             Assert.Equal(ConnectionStatus.Disconnected, net.Status);
             Assert.False(net.HandshakeComplete);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.False(transport.IsPeerConnected);
             Assert.Equal(
                 "[Sailwind.Online] ServerHello missing capabilities; will retry.",
                 Assert.Single(log.Warnings));
@@ -152,7 +177,11 @@ namespace Sailwind.Online.Net.Tests
             now = NetClient.DefaultReconnectMs;
             net.Poll();
             Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(2, transport.FreshPeerConnectCalls);
             Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            transport.RaisePeerConnected();
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
         }
 
         [Fact]
@@ -200,6 +229,7 @@ namespace Sailwind.Online.Net.Tests
             now = 0;
             transport.RaisePeerDisconnected();
             Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.Equal(0, transport.DropPeerCalls);
 
             now = NetClient.DefaultReconnectMs - 1;
             net.Poll();
@@ -306,7 +336,7 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
-        public void AcceptedHello_BoatPoseOutbound_ThenRemoteSnapshotInbound_RoundTripsExactly()
+        public void ReadySession_EncodesOutboundPoseExactly_ThenIndependentlyIngestsRemoteSnapshot()
         {
             long now = 4321;
             var transport = new MockTransport();

@@ -21,6 +21,8 @@ namespace Sailwind.Online.Net.Tests
         public int StartCalls;
         public int StopCalls;
         public int ConnectCalls;
+        public int FreshPeerConnectCalls;
+        public int DropPeerCalls;
         public int PollCalls;
 
         public string LastHost;
@@ -58,9 +60,21 @@ namespace Sailwind.Online.Net.Tests
         public void Connect(string host, int port, string key)
         {
             ConnectCalls++;
+            if (!_peerConnected)
+            {
+                FreshPeerConnectCalls++;
+            }
+
             LastHost = host;
             LastPort = port;
             LastKey = key;
+        }
+
+        public void DropPeer()
+        {
+            DropPeerCalls++;
+            _peerConnected = false;
+            Ping = -1;
         }
 
         public void Send(byte[] data, DeliveryMethod deliveryMethod)

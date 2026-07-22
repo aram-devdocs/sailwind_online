@@ -35,6 +35,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 struct Session {
     peer: PeerId,
     player_id: u64,
+    identity_hash: String,
     display_name: String,
     aboard_boat: u64,
     pos: [f32; 3],
@@ -255,10 +256,24 @@ impl Server {
             return Ok(());
         }
 
+        let identity_hash = token_hash(token);
+        if let Some((player_id, identity_matches)) = self
+            .sessions
+            .get(&peer)
+            .map(|session| (session.player_id, session.identity_hash == identity_hash))
+        {
+            if !identity_matches {
+                self.reject_hello(peer, "identity change requires a new connection");
+                return Ok(());
+            }
+
+            let balance = self.db.player_balance(player_id as i64)?;
+            self.send_accepted_hello(peer, player_id, balance);
+            return Ok(());
+        }
+
         let now = now_ms();
-        let player = self
-            .db
-            .upsert_player_by_token(&token_hash(token), &name, now)?;
+        let player = self.db.upsert_player_by_token(&identity_hash, &name, now)?;
         let player_id = player.id as u64;
 
         // Drop any prior session for this identity (reconnect from a new peer).
@@ -282,6 +297,7 @@ impl Server {
             Session {
                 peer,
                 player_id,
+                identity_hash,
                 display_name: name,
                 aboard_boat: 0,
                 pos: [0.0, 0.0, 0.0],
@@ -296,25 +312,29 @@ impl Server {
 
         tracing::info!(peer, player_id, name = %self.sessions[&peer].display_name, "hello accepted");
 
-        let bytes = codec::server_hello(
-            self.next_seq(),
-            true,
-            "",
-            player_id,
-            &self.cfg.server_name,
-            player.gold,
-            &self.caps(),
-            self.clock_now(),
-            self.weather_seed,
-            self.weather_epoch_day,
-        );
-        self.send(peer, &bytes);
+        self.send_accepted_hello(peer, player_id, player.gold);
 
         // Emit the join-time interest set so a freshly connected player learns
         // its surrounding cells (and their contents, e.g. persisted moorings)
         // without having to first cross a cell boundary.
         self.emit_aoi(peer, &aoi);
         Ok(())
+    }
+
+    fn send_accepted_hello(&mut self, peer: PeerId, player_id: u64, balance_gold: i64) {
+        let bytes = codec::server_hello(
+            self.next_seq(),
+            true,
+            "",
+            player_id,
+            &self.cfg.server_name,
+            balance_gold,
+            &self.caps(),
+            self.clock_now(),
+            self.weather_seed,
+            self.weather_epoch_day,
+        );
+        self.send(peer, &bytes);
     }
 
     fn reject_hello(&mut self, peer: PeerId, reason: &str) {
@@ -907,9 +927,13 @@ mod handshake_tests {
         }
     }
 
-    fn hello_envelope(protocol_version: u16, api_surface_hash: Option<&str>) -> Vec<u8> {
+    fn hello_envelope(
+        token: &str,
+        protocol_version: u16,
+        api_surface_hash: Option<&str>,
+    ) -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::new();
-        let token = fbb.create_string("handshake-token");
+        let token = fbb.create_string(token);
         let name = fbb.create_string("Sailor");
         let api_hash = api_surface_hash.map(|value| fbb.create_string(value));
         let hello = p::ClientHello::create(
@@ -923,6 +947,24 @@ mod handshake_tests {
             },
         );
         finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value())
+    }
+
+    fn state_envelope() -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let pos = p::Vec3::new(175.0, 4.0, -125.0);
+        let rot = p::QuatC::new(0.1, 0.2, 0.3, 0.9);
+        let vel = p::Vec3::new(2.0, 3.0, 4.0);
+        let state = p::ClientState::create(
+            &mut fbb,
+            &p::ClientStateArgs {
+                pos: Some(&pos),
+                rot: Some(&rot),
+                vel: Some(&vel),
+                aboard_boat: 99,
+                t_ms: 4321,
+            },
+        );
+        finish_envelope(&mut fbb, 2, p::Payload::ClientState, state.as_union_value())
     }
 
     fn deliver_hello(server: &mut Server, peer: PeerId, bytes: &[u8]) {
@@ -952,22 +994,29 @@ mod handshake_tests {
     }
 
     fn receive_server_hello(client: &UdpSocket) -> (bool, String) {
-        let mut packet = [0u8; protocol::MTU];
-        let received = client.recv(&mut packet).unwrap();
-        assert_eq!(
-            protocol::Header::from_byte(packet[0]).property,
-            protocol::property::UNRELIABLE
-        );
-        let env = decode_envelope(&packet[protocol::HEADER_SIZE..received]).unwrap();
-        let hello = env.payload_as_server_hello().unwrap();
-        (hello.accepted(), hello.reason().unwrap_or("").to_string())
+        loop {
+            let mut packet = [0u8; protocol::MTU];
+            let received = client.recv(&mut packet).unwrap();
+            assert_eq!(
+                protocol::Header::from_byte(packet[0]).property,
+                protocol::property::UNRELIABLE
+            );
+            let env = decode_envelope(&packet[protocol::HEADER_SIZE..received]).unwrap();
+            if let Some(hello) = env.payload_as_server_hello() {
+                return (hello.accepted(), hello.reason().unwrap_or("").to_string());
+            }
+        }
     }
 
     #[test]
     fn protocol_mismatch_is_rejected_before_session_creation() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
-        let bytes = hello_envelope(sw_contracts::PROTOCOL_VERSION + 1, Some("surface-hash"));
+        let bytes = hello_envelope(
+            "handshake-token",
+            sw_contracts::PROTOCOL_VERSION + 1,
+            Some("surface-hash"),
+        );
 
         deliver_hello(&mut server, peer, &bytes);
 
@@ -1001,7 +1050,7 @@ mod handshake_tests {
         for (hash, expected_reason) in cases {
             let mut server = make_server();
             let (client, peer) = connect_peer(&mut server);
-            let bytes = hello_envelope(sw_contracts::PROTOCOL_VERSION, hash);
+            let bytes = hello_envelope("handshake-token", sw_contracts::PROTOCOL_VERSION, hash);
             deliver_hello(&mut server, peer, &bytes);
             assert!(
                 !server.sessions.contains_key(&peer),
@@ -1014,11 +1063,101 @@ mod handshake_tests {
     #[test]
     fn valid_protocol_and_api_surface_hash_create_session() {
         let mut server = make_server();
-        let bytes = hello_envelope(sw_contracts::PROTOCOL_VERSION, Some("surface-hash"));
+        let bytes = hello_envelope(
+            "handshake-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
 
         deliver_hello(&mut server, 1, &bytes);
 
         assert!(server.sessions.contains_key(&1));
+    }
+
+    #[test]
+    fn repeated_valid_hello_preserves_established_session_and_only_resends_server_hello() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let hello = hello_envelope(
+            "handshake-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello(&mut server, peer, &hello);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+
+        let state = state_envelope();
+        let env = decode_envelope(&state).unwrap();
+        server.on_client_state(peer, env.payload_as_client_state().unwrap(), 1_000);
+
+        let established = &server.sessions[&peer];
+        let player_id = established.player_id;
+        let display_name = established.display_name.clone();
+        let aboard_boat = established.aboard_boat;
+        let pos = established.pos;
+        let rot = established.rot;
+        let vel = established.vel;
+        let t_ms = established.t_ms;
+        let cell = established.cell;
+        let subscribed_cells = established.sub.cells().clone();
+        let world_cell = server.world.cell_of_entity(player_id);
+        let seq_before_retry = server.seq;
+
+        deliver_hello(&mut server, peer, &hello);
+
+        let retried = &server.sessions[&peer];
+        assert_eq!(retried.player_id, player_id);
+        assert_eq!(retried.display_name, display_name);
+        assert_eq!(retried.aboard_boat, aboard_boat);
+        assert_eq!(retried.pos, pos);
+        assert_eq!(retried.rot, rot);
+        assert_eq!(retried.vel, vel);
+        assert_eq!(retried.t_ms, t_ms);
+        assert_eq!(retried.cell, cell);
+        assert_eq!(retried.sub.cells(), &subscribed_cells);
+        assert_eq!(server.world.cell_of_entity(player_id), world_cell);
+        assert_eq!(server.seq, seq_before_retry.wrapping_add(1));
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+    }
+
+    #[test]
+    fn same_peer_cannot_replace_an_established_session_with_a_different_identity() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let first = hello_envelope(
+            "first-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello(&mut server, peer, &first);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+
+        let player_id = server.sessions[&peer].player_id;
+        let subscribed_cells = server.sessions[&peer].sub.cells().clone();
+        let world_len = server.world.len();
+        let world_cell = server.world.cell_of_entity(player_id);
+        let seq_before_replacement = server.seq;
+        let replacement = hello_envelope(
+            "different-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+
+        deliver_hello(&mut server, peer, &replacement);
+
+        assert_eq!(server.sessions.len(), 1);
+        assert_eq!(server.sessions[&peer].player_id, player_id);
+        assert_eq!(server.sessions[&peer].sub.cells(), &subscribed_cells);
+        assert_eq!(server.world.len(), world_len);
+        assert_eq!(server.world.cell_of_entity(player_id), world_cell);
+        assert_eq!(server.seq, seq_before_replacement.wrapping_add(1));
+        assert_eq!(
+            receive_server_hello(&client),
+            (
+                false,
+                "identity change requires a new connection".to_string()
+            )
+        );
     }
 }
 

@@ -331,29 +331,20 @@ namespace Sailwind.Online.Client.Net
         {
             if (!hello.Accepted)
             {
-                _status = ConnectionStatus.Disconnected;
-                ResetPositionObservability();
-                ScheduleReconnect();
-                _log.LogWarning("[Sailwind.Online] ServerHello rejected: " + (hello.Reason ?? "no reason"));
+                RejectHandshake("[Sailwind.Online] ServerHello rejected: " + (hello.Reason ?? "no reason"));
                 return;
             }
 
             CapabilityManifest? caps = hello.Capabilities;
             if (!caps.HasValue)
             {
-                _status = ConnectionStatus.Disconnected;
-                ResetPositionObservability();
-                ScheduleReconnect();
-                _log.LogWarning("[Sailwind.Online] ServerHello missing capabilities; will retry.");
+                RejectHandshake("[Sailwind.Online] ServerHello missing capabilities; will retry.");
                 return;
             }
 
             if (caps.Value.ProtocolVersion != ProtocolVersion)
             {
-                _status = ConnectionStatus.Disconnected;
-                ResetPositionObservability();
-                ScheduleReconnect();
-                _log.LogWarning(
+                RejectHandshake(
                     "[Sailwind.Online] ServerHello protocol mismatch: client " + ProtocolVersion +
                     ", server " + caps.Value.ProtocolVersion + "; will retry.");
                 return;
@@ -523,6 +514,15 @@ namespace Sailwind.Online.Client.Net
         {
             _loggedFirstOutboundPosition = false;
             _loggedFirstInboundPosition = false;
+        }
+
+        private void RejectHandshake(string warning)
+        {
+            _transport.DropPeer();
+            _status = ConnectionStatus.Disconnected;
+            ResetPositionObservability();
+            ScheduleReconnect();
+            _log.LogWarning(warning);
         }
 
         public static string FormatTimeOfDay(float fractionOfDay)

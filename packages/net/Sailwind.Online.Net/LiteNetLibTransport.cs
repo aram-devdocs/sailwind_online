@@ -17,6 +17,7 @@ namespace Sailwind.Online.Client.Net
         private readonly EventBasedNetListener _listener = new EventBasedNetListener();
         private readonly NetManager _manager;
         private NetPeer? _peer;
+        private NetPeer? _locallyDroppedPeer;
 
         public LiteNetLibTransport()
         {
@@ -63,6 +64,19 @@ namespace Sailwind.Online.Client.Net
             _peer = _manager.Connect(host, port, key);
         }
 
+        public void DropPeer()
+        {
+            NetPeer? peer = _peer;
+            if (peer == null)
+            {
+                return;
+            }
+
+            _locallyDroppedPeer = peer;
+            _peer = null;
+            _manager.DisconnectPeerForce(peer);
+        }
+
         public void Send(byte[] data, DeliveryMethod deliveryMethod)
         {
             _peer?.Send(data, deliveryMethod);
@@ -91,7 +105,17 @@ namespace Sailwind.Online.Client.Net
 
         private void OnPeerDisconnected(NetPeer peer, DisconnectInfo info)
         {
-            _peer = null;
+            if (ReferenceEquals(_locallyDroppedPeer, peer))
+            {
+                _locallyDroppedPeer = null;
+                return;
+            }
+
+            if (ReferenceEquals(_peer, peer))
+            {
+                _peer = null;
+            }
+
             PeerDisconnected?.Invoke(info.Reason.ToString());
         }
 

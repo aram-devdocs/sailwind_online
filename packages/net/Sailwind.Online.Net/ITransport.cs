@@ -29,6 +29,9 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Open (or re-open) the single peer to <paramref name="host"/>:<paramref name="port"/> with the connect key.</summary>
         void Connect(string host, int port, string key);
 
+        /// <summary>Immediately drop the current peer without reporting a network-originated disconnect.</summary>
+        void DropPeer();
+
         /// <summary>Send one datagram to the current peer with the given delivery method.</summary>
         void Send(byte[] data, DeliveryMethod deliveryMethod);
 
