@@ -339,7 +339,16 @@ namespace Sailwind.Online.Client.Net
             }
 
             CapabilityManifest? caps = hello.Capabilities;
-            if (caps.HasValue && caps.Value.ProtocolVersion != ProtocolVersion)
+            if (!caps.HasValue)
+            {
+                _status = ConnectionStatus.Disconnected;
+                ResetPositionObservability();
+                ScheduleReconnect();
+                _log.LogWarning("[Sailwind.Online] ServerHello missing capabilities; will retry.");
+                return;
+            }
+
+            if (caps.Value.ProtocolVersion != ProtocolVersion)
             {
                 _status = ConnectionStatus.Disconnected;
                 ResetPositionObservability();
@@ -354,7 +363,7 @@ namespace Sailwind.Online.Client.Net
             _playerId = hello.PlayerId;
             _reconnectBackoffMs = DefaultReconnectMs;
 
-            if (caps.HasValue && caps.Value.SnapshotHz > 0)
+            if (caps.Value.SnapshotHz > 0)
             {
                 _snapshotHz = caps.Value.SnapshotHz;
             }

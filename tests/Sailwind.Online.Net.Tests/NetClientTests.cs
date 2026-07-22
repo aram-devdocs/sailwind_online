@@ -128,6 +128,34 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
+        public void Handshake_AcceptedServerHelloWithoutCapabilities_ReturnsToDisconnected()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            long now = 0;
+            var net = new NetClient(log, transport, () => now);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(
+                accepted: true,
+                playerId: 77,
+                snapshotHz: 8,
+                includeCapabilities: false));
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.False(net.HandshakeComplete);
+            Assert.Equal(
+                "[Sailwind.Online] ServerHello missing capabilities; will retry.",
+                Assert.Single(log.Warnings));
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+        }
+
+        [Fact]
         public void ClientHello_ResendsEveryIntervalUntilServerHello()
         {
             var transport = new MockTransport();
@@ -460,13 +488,19 @@ namespace Sailwind.Online.Net.Tests
             bool accepted,
             ulong playerId,
             byte snapshotHz,
-            ushort protocolVersion = NetClient.ProtocolVersion)
+            ushort protocolVersion = NetClient.ProtocolVersion,
+            bool includeCapabilities = true)
         {
             var b = new FlatBufferBuilder(128);
             StringOffset reason = b.CreateString(string.Empty);
             StringOffset serverName = b.CreateString("test-server");
-            Offset<CapabilityManifest> caps = CapabilityManifest.CreateCapabilityManifest(
-                b, protocol_version: protocolVersion, snapshot_hz: snapshotHz);
+            Offset<CapabilityManifest> caps = default(Offset<CapabilityManifest>);
+            if (includeCapabilities)
+            {
+                caps = CapabilityManifest.CreateCapabilityManifest(
+                    b, protocol_version: protocolVersion, snapshot_hz: snapshotHz);
+            }
+
             Offset<ServerHello> hello = ServerHello.CreateServerHello(
                 b,
                 accepted: accepted,
