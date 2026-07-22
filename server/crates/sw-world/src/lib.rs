@@ -305,6 +305,32 @@ mod tests {
     }
 
     #[test]
+    fn recenter_removes_the_vacated_cell() {
+        // Unsubscribe path: a cross-cell jump beyond the AoI diameter fully
+        // vacates the old block, so every previously-subscribed cell — the old
+        // centre included — must appear in `removed` and none may linger in the
+        // subscription. The server relies on this to stop streaming a cell a
+        // player (or a departing peer's tracked entity) has left behind.
+        let mut sub = Subscription::new(AOI_RADIUS_CELLS);
+        let old_center = Cell::new(0, 0);
+        let before: HashSet<Cell> = sub.recenter(old_center).added.into_iter().collect();
+        assert!(before.contains(&old_center));
+
+        // Jump strictly past the old block so the two blocks are disjoint.
+        let jump = 2 * AOI_RADIUS_CELLS + 1;
+        let update = sub.recenter(Cell::new(jump, 0));
+        let removed: HashSet<Cell> = update.removed.iter().copied().collect();
+
+        // The entire old block is unsubscribed, the vacated centre included...
+        assert_eq!(removed, before);
+        assert!(removed.contains(&old_center));
+        // ...and the subscription no longer contains any of it.
+        for cell in &before {
+            assert!(!sub.contains(*cell), "vacated cell {cell:?} still in view");
+        }
+    }
+
+    #[test]
     fn index_moves_entity_between_cells() {
         let mut w = World::new(Grid::default());
         assert!(w.place(1, 10.0, 10.0)); // new -> crossed

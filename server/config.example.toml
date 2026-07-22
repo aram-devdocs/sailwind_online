@@ -17,5 +17,16 @@ snapshot_hz = 4
 # clock authority tick; the join-time clock rides inside ServerHello).
 clock_broadcast_secs = 10
 
+# Area-of-interest radius in grid cells (advertised to clients). A radius r is a
+# (2r+1)x(2r+1) block of cells; per-recipient snapshot bandwidth tracks the
+# entity density inside that block, not the global population. Must be in
+# 1..=16 (the ceiling keeps the (2r+1)^2 block allocation bounded).
+aoi_radius_cells = 2
+
+# Grid cell size in metres (advertised to clients). Must be finite and in
+# (0, 1000000]. Larger cells mean coarser interest management (fewer, bigger
+# cells); smaller cells mean tighter culling at more boundary crossings.
+cell_size_m = 1024.0
+
 # Human-readable server name returned in ServerHello.
 server_name = "Sailwind Online (dev)"
