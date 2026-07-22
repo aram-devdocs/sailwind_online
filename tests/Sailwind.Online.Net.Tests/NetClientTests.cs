@@ -335,7 +335,13 @@ namespace Sailwind.Online.Net.Tests
         private static byte[] WorldClockEnvelope(uint day, float timeOfDay)
         {
             var b = new FlatBufferBuilder(64);
-            Offset<WorldClock> clock = WorldClock.CreateWorldClock(b, day: day, time_of_day: timeOfDay, moon_phase: 0f);
+
+            // Populate every WorldClock field, including moon_phase, so the union payload table is
+            // fully written. The pinned FlatBuffers 25.2.10 verifier that Codec.TryDispatch runs
+            // rejects a partially-populated union payload table, so a clock that left moon_phase at
+            // its 0 default would be dropped before dispatch and never reach NetClient. This mirrors
+            // the fully-populated clock in CodecTests; day and time_of_day are the values asserted.
+            Offset<WorldClock> clock = WorldClock.CreateWorldClock(b, day: day, time_of_day: timeOfDay, moon_phase: 0.25f);
             return Wrap(b, 2, Payload.WorldClock, clock.Value);
         }
 
