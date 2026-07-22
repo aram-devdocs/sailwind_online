@@ -14,7 +14,7 @@ use sw_contracts::sw_proto as p;
 use sw_econ::{Ledger, Txn};
 use sw_net::{DisconnectReason, Event, Host, PeerId};
 use sw_persist::{Db, MooringRow};
-use sw_world::{AoiUpdate, Cell, Subscription, World, AOI_RADIUS_CELLS};
+use sw_world::{AoiUpdate, Cell, Subscription, World};
 
 /// LiteNetLib connect key clients must present.
 const CONNECT_KEY: &str = "sailwind-online";
@@ -80,7 +80,7 @@ impl Server {
         let weather_epoch_day = clock_from_epoch(epoch_ms, epoch_ms).day;
 
         let host = Host::bind(&cfg.bind, CONNECT_KEY)?;
-        let world = World::new(sw_world::Grid::default());
+        let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
 
         Ok(Server {
             cfg,
@@ -236,7 +236,7 @@ impl Server {
             self.sessions.remove(&pp);
         }
 
-        let mut sub = Subscription::new(AOI_RADIUS_CELLS);
+        let mut sub = Subscription::new(self.cfg.aoi_radius_i32());
         let origin = self.world.grid().cell_of(0.0, 0.0);
         let aoi = sub.recenter(origin);
         self.world.place_in_cell(player_id, origin);
@@ -460,10 +460,7 @@ impl Server {
         for (peer, self_pid, cell) in recipients {
             let mut players = Vec::new();
             let mut boats = Vec::new();
-            for eid in self.world.entities_in_radius(cell, AOI_RADIUS_CELLS) {
-                if eid == self_pid {
-                    continue; // don't echo a player to itself
-                }
+            for eid in self.players_in_view(cell, self_pid) {
                 if let Some(s) = self.session_by_player(eid) {
                     players.push(player_snap(s));
                     if s.aboard_boat != 0 {
@@ -477,6 +474,17 @@ impl Server {
             let bytes = codec::snapshot_delta(self.next_seq(), server_tick, &players, &boats);
             self.send(peer, &bytes);
         }
+    }
+
+    /// Entity ids visible to a viewer centred on `cell`: everything within the
+    /// configured AoI radius, minus the viewer itself. This bounds a
+    /// recipient's snapshot to AoI density, never the global population.
+    fn players_in_view(&self, cell: Cell, self_pid: u64) -> Vec<u64> {
+        self.world
+            .entities_in_radius(cell, self.cfg.aoi_radius_i32())
+            .into_iter()
+            .filter(|&eid| eid != self_pid)
+            .collect()
     }
 
     /// Broadcast the current world clock to every connected session. The clock
@@ -548,7 +556,7 @@ impl Server {
         Caps {
             tick_hz: self.cfg.tick_hz.min(u8::MAX as u32) as u8,
             snapshot_hz: self.cfg.snapshot_hz.min(u8::MAX as u32) as u8,
-            aoi_radius_cells: AOI_RADIUS_CELLS as u8,
+            aoi_radius_cells: self.cfg.aoi_radius_cells.min(u8::MAX as u32) as u8,
             cell_size_m: self.world.grid().cell_size_m,
             features: FEATURES,
         }
@@ -650,5 +658,188 @@ mod tests {
     fn vec_and_quat_defaults() {
         assert_eq!(vec3_of(None), [0.0, 0.0, 0.0]);
         assert_eq!(quat_of(None), [0.0, 0.0, 0.0, 1.0]);
+    }
+}
+
+/// Interest-management hardening: these exercise the real message handlers and
+/// the per-recipient visibility decision against an in-memory server, pinning
+/// the quantitative AoI acceptance (initial interest set on join, added/removed
+/// on a cross-cell move, and a snapshot bounded to AoI density not population).
+#[cfg(test)]
+mod aoi_harden_tests {
+    use super::*;
+    use flatbuffers::FlatBufferBuilder;
+    use std::collections::HashSet;
+    use sw_contracts::{decode_envelope, finish_envelope};
+    use sw_world::{cells_in_radius, EntityId, Grid};
+
+    fn make_server(cfg: Config) -> Server {
+        let world = World::new(Grid::new(cfg.cell_size_m));
+        Server {
+            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            db: Db::open_in_memory().unwrap(),
+            world,
+            sessions: HashMap::new(),
+            seq: 0,
+            snapshot_tick: 0,
+            boot: Instant::now(),
+            epoch_ms: 0,
+            weather_seed: 0,
+            weather_epoch_day: 0,
+            running: Arc::new(AtomicBool::new(true)),
+            cfg,
+        }
+    }
+
+    fn hello_envelope(token: &str, name: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let token_off = fbb.create_string(token);
+        let name_off = fbb.create_string(name);
+        let hello = p::ClientHello::create(
+            &mut fbb,
+            &p::ClientHelloArgs {
+                protocol_version: sw_contracts::PROTOCOL_VERSION,
+                display_name: Some(name_off),
+                token: Some(token_off),
+                ..Default::default()
+            },
+        );
+        finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value())
+    }
+
+    fn state_envelope(x: f32, z: f32) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let pos = p::Vec3::new(x, 0.0, z);
+        let rot = p::QuatC::new(0.0, 0.0, 0.0, 1.0);
+        let vel = p::Vec3::new(0.0, 0.0, 0.0);
+        let cs = p::ClientState::create(
+            &mut fbb,
+            &p::ClientStateArgs {
+                pos: Some(&pos),
+                rot: Some(&rot),
+                vel: Some(&vel),
+                aboard_boat: 0,
+                t_ms: 0,
+            },
+        );
+        finish_envelope(&mut fbb, 2, p::Payload::ClientState, cs.as_union_value())
+    }
+
+    #[test]
+    fn join_emits_configured_initial_interest_set() {
+        // A joining player's subscription must be the full block for the
+        // *configured* radius, not the hardcoded default — the join-time AoI is
+        // sized by config.
+        let mut server = make_server(Config {
+            aoi_radius_cells: 3,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        let bytes = hello_envelope("tok-join", "Joiner");
+        let env = decode_envelope(&bytes).unwrap();
+        server
+            .on_hello(peer, env.payload_as_client_hello().unwrap())
+            .unwrap();
+
+        let origin = server.world.grid().cell_of(0.0, 0.0);
+        let expected: HashSet<Cell> = cells_in_radius(origin, 3).into_iter().collect();
+        let sub = &server.sessions[&peer].sub;
+        assert_eq!(sub.cells(), &expected);
+        assert_eq!(sub.cells().len(), 49); // (2*3+1)^2
+    }
+
+    #[test]
+    fn cross_cell_move_adds_new_block_and_removes_vacated_cells() {
+        let mut server = make_server(Config::default()); // radius 2, cell 1024 m
+        let peer: PeerId = 7;
+        let hello_bytes = hello_envelope("tok-move", "Mover");
+        let hello = decode_envelope(&hello_bytes).unwrap();
+        server
+            .on_hello(peer, hello.payload_as_client_hello().unwrap())
+            .unwrap();
+
+        let origin = server.world.grid().cell_of(0.0, 0.0);
+        let before: HashSet<Cell> = server.sessions[&peer].sub.cells().clone();
+        assert!(before.contains(&origin));
+
+        // Jump far in +X so the old block is fully vacated.
+        let far_x = 10.0 * server.world.grid().cell_size_m;
+        let state_bytes = state_envelope(far_x, 0.0);
+        let cs = decode_envelope(&state_bytes).unwrap();
+        server.on_client_state(peer, cs.payload_as_client_state().unwrap());
+
+        let after = server.sessions[&peer].sub.cells();
+        let new_center = server.world.grid().cell_of(far_x, 0.0);
+        assert!(after.contains(&new_center), "new block added");
+        assert!(!after.contains(&origin), "vacated origin removed");
+        for cell in &before {
+            assert!(!after.contains(cell), "vacated cell {cell:?} still in view");
+        }
+        // The world index tracks the move: the mover left the origin cell.
+        assert!(server.world.entities_in(origin).is_empty());
+    }
+
+    #[test]
+    fn snapshot_visibility_tracks_aoi_density_not_population() {
+        // Bandwidth guarantee: a recipient only sees entities inside its AoI
+        // block, so per-recipient cost scales with local density, never with the
+        // global entity population.
+        let mut server = make_server(Config::default()); // radius 2
+        let viewer: EntityId = 1;
+        let center = Cell::new(0, 0);
+        server.world.place_in_cell(viewer, center);
+
+        let near_cells = [
+            Cell::new(0, 0),
+            Cell::new(1, 0),
+            Cell::new(-2, 2),
+            Cell::new(2, -1),
+        ];
+        let mut near_ids = Vec::new();
+        let mut id: EntityId = 100;
+        for &cell in &near_cells {
+            server.world.place_in_cell(id, cell);
+            near_ids.push(id);
+            id += 1;
+        }
+
+        // A large far-flung population well outside the radius-2 block.
+        let mut far_ids = Vec::new();
+        for k in 0..500 {
+            server.world.place_in_cell(id, Cell::new(100 + k, 100));
+            far_ids.push(id);
+            id += 1;
+        }
+
+        let visible: HashSet<EntityId> =
+            server.players_in_view(center, viewer).into_iter().collect();
+
+        for nid in &near_ids {
+            assert!(
+                visible.contains(nid),
+                "in-range entity {nid} must be visible"
+            );
+        }
+        assert!(
+            !visible.contains(&viewer),
+            "viewer is never echoed to itself"
+        );
+        for fid in &far_ids {
+            assert!(!visible.contains(fid), "far entity {fid} must not leak in");
+        }
+        // The bound is AoI density, orders of magnitude below the population.
+        assert!(visible.len() < far_ids.len());
+    }
+
+    #[test]
+    fn caps_advertise_configured_aoi() {
+        let server = make_server(Config {
+            aoi_radius_cells: 5,
+            cell_size_m: 2048.0,
+            ..Config::default()
+        });
+        let caps = server.caps();
+        assert_eq!(caps.aoi_radius_cells, 5);
+        assert_eq!(caps.cell_size_m, 2048.0);
     }
 }
