@@ -23,8 +23,8 @@ const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 /// numerator, so the divisor needs its own floor here.
 const MIN_CELL_SIZE_M: f32 = 1.0;
 
-/// Upper bound on any aggregate per-player message-class min-interval, in
-/// milliseconds (market trade, client-state, chat, econ, moor). Bounds the
+/// Upper bound on any aggregate peer/player message-class min-interval, in
+/// milliseconds (hello, market trade, client-state, chat, econ, moor). Bounds the
 /// rate-limit knobs so a misconfiguration cannot wedge a message class behind an
 /// absurd cooldown, and so the saturating accessors have a finite ceiling. One
 /// hour is already far beyond any sane throttle.
@@ -56,6 +56,12 @@ pub struct Config {
     pub aoi_radius_cells: u32,
     /// Grid cell size, in metres (advertised to clients).
     pub cell_size_m: f32,
+    /// Minimum interval, in milliseconds, between two processed `ClientHello`
+    /// messages from the same peer. A flood beyond this rate is dropped before
+    /// validation, persistence, or response generation. The 250 ms default
+    /// matches the client's handshake retry cadence. Bounded by
+    /// [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    pub hello_min_interval_ms: u32,
     /// Minimum interval, in milliseconds, between two accepted market trades by
     /// the same player (an aggregate per-player throttle, independent of which
     /// port the request names). A new trade inside this window is rejected; an
@@ -100,6 +106,7 @@ impl Default for Config {
             clock_broadcast_secs: 10,
             aoi_radius_cells: sw_world::AOI_RADIUS_CELLS as u32,
             cell_size_m: sw_world::Grid::DEFAULT_CELL_SIZE_M,
+            hello_min_interval_ms: 250,
             trade_min_interval_ms: 250,
             client_state_min_interval_ms: 20,
             chat_min_interval_ms: 500,
@@ -192,6 +199,7 @@ impl Config {
             ));
         }
         for (name, value) in [
+            ("hello_min_interval_ms", self.hello_min_interval_ms),
             ("trade_min_interval_ms", self.trade_min_interval_ms),
             (
                 "client_state_min_interval_ms",
@@ -228,6 +236,13 @@ impl Config {
     /// [`Config::validate`].
     pub fn trade_min_interval_ms_i64(&self) -> i64 {
         self.trade_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Client-hello throttle min-interval as a bounded `i64` of milliseconds.
+    /// Saturates at [`MAX_TRADE_MIN_INTERVAL_MS`] so the limiter math stays
+    /// finite even if a caller bypasses [`Config::validate`].
+    pub fn hello_min_interval_ms_i64(&self) -> i64 {
+        self.hello_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
     }
 
     /// Client-state throttle min-interval as a bounded `i64` of milliseconds.
@@ -481,10 +496,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_hello_interval_key() {
+        let toml_text = r#"
+            hello_min_interval_ms = 500
+        "#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.hello_min_interval_ms, 500);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
     fn message_rate_limit_defaults_are_valid_and_bounded() {
         let cfg = Config::default();
         cfg.validate().unwrap();
         // A permissive-but-finite default for each per-class throttle.
+        assert_eq!(cfg.hello_min_interval_ms, 250);
+        assert!(cfg.hello_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.client_state_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.chat_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.econ_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
@@ -494,6 +521,10 @@ mod tests {
         let snapshot_period_ms = 1000 / cfg.snapshot_hz;
         assert!(cfg.client_state_min_interval_ms < snapshot_period_ms);
         // The bounded accessors mirror the config values for sane defaults.
+        assert_eq!(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.hello_min_interval_ms as i64
+        );
         assert_eq!(
             cfg.client_state_min_interval_ms_i64(),
             cfg.client_state_min_interval_ms as i64
@@ -515,6 +546,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_message_intervals() {
         for mutate in [
+            |c: &mut Config| c.hello_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.client_state_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.chat_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.econ_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
@@ -532,12 +564,17 @@ mod tests {
     #[test]
     fn message_interval_accessors_saturate_at_the_bound() {
         let cfg = Config {
+            hello_min_interval_ms: u32::MAX,
             client_state_min_interval_ms: u32::MAX,
             chat_min_interval_ms: u32::MAX,
             econ_min_interval_ms: u32::MAX,
             moor_min_interval_ms: u32::MAX,
             ..Config::default()
         };
+        assert_eq!(
+            cfg.hello_min_interval_ms_i64(),
+            MAX_TRADE_MIN_INTERVAL_MS as i64
+        );
         assert_eq!(
             cfg.client_state_min_interval_ms_i64(),
             MAX_TRADE_MIN_INTERVAL_MS as i64

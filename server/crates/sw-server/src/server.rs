@@ -60,6 +60,7 @@ pub struct Server {
     epoch_ms: i64,
     weather_seed: u64,
     weather_epoch_day: u32,
+    hello_limiter: RateLimiter,
     trade_limiter: RateLimiter,
     client_state_limiter: RateLimiter,
     chat_limiter: RateLimiter,
@@ -89,6 +90,7 @@ impl Server {
 
         let host = Host::bind(&cfg.bind, CONNECT_KEY)?;
         let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
+        let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -107,6 +109,7 @@ impl Server {
             epoch_ms,
             weather_seed,
             weather_epoch_day,
+            hello_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -221,6 +224,19 @@ impl Server {
     }
 
     fn on_hello(&mut self, peer: PeerId, hello: p::ClientHello<'_>) -> anyhow::Result<()> {
+        self.on_hello_at(peer, hello, now_ms())
+    }
+
+    fn on_hello_at(
+        &mut self,
+        peer: PeerId,
+        hello: p::ClientHello<'_>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        if !self.hello_limiter.allow(u64::from(peer), now_ms) {
+            return Ok(());
+        }
+
         if hello.protocol_version() != sw_contracts::PROTOCOL_VERSION {
             let reason = format!(
                 "protocol version mismatch: client {}, server {}",
@@ -272,8 +288,9 @@ impl Server {
             return Ok(());
         }
 
-        let now = now_ms();
-        let player = self.db.upsert_player_by_token(&identity_hash, &name, now)?;
+        let player = self
+            .db
+            .upsert_player_by_token(&identity_hash, &name, now_ms)?;
         let player_id = player.id as u64;
 
         // Drop any prior session for this identity (reconnect from a new peer).
@@ -663,6 +680,7 @@ impl Server {
     }
 
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
+        self.hello_limiter.clear(u64::from(peer));
         if let Some(s) = self.sessions.remove(&peer) {
             self.world.remove(s.player_id);
             // Drop the player's throttle state across every message class: a
@@ -917,6 +935,7 @@ mod handshake_tests {
             epoch_ms: 0,
             weather_seed: 0,
             weather_epoch_day: 0,
+            hello_limiter: RateLimiter::new(cfg.hello_min_interval_ms_i64()),
             trade_limiter: RateLimiter::new(cfg.trade_min_interval_ms_i64()),
             client_state_limiter: RateLimiter::new(cfg.client_state_min_interval_ms_i64()),
             chat_limiter: RateLimiter::new(cfg.chat_min_interval_ms_i64()),
@@ -974,6 +993,13 @@ mod handshake_tests {
             .unwrap();
     }
 
+    fn deliver_hello_at(server: &mut Server, peer: PeerId, bytes: &[u8], now_ms: i64) {
+        let env = decode_envelope(bytes).unwrap();
+        server
+            .on_hello_at(peer, env.payload_as_client_hello().unwrap(), now_ms)
+            .unwrap();
+    }
+
     fn connect_peer(server: &mut Server) -> (UdpSocket, PeerId) {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.connect(server.host.local_addr().unwrap()).unwrap();
@@ -1006,6 +1032,21 @@ mod handshake_tests {
                 return (hello.accepted(), hello.reason().unwrap_or("").to_string());
             }
         }
+    }
+
+    fn assert_no_outbound_datagram(client: &UdpSocket) {
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut packet = [0u8; protocol::MTU];
+        let error = client.recv(&mut packet).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected no outbound datagram, got {error}"
+        );
     }
 
     #[test]
@@ -1078,12 +1119,13 @@ mod handshake_tests {
     fn repeated_valid_hello_preserves_established_session_and_only_resends_server_hello() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
+        let hello_interval_ms = server.cfg.hello_min_interval_ms_i64();
         let hello = hello_envelope(
             "handshake-token",
             sw_contracts::PROTOCOL_VERSION,
             Some("surface-hash"),
         );
-        deliver_hello(&mut server, peer, &hello);
+        deliver_hello_at(&mut server, peer, &hello, 1_000);
         assert_eq!(receive_server_hello(&client), (true, String::new()));
 
         let state = state_envelope();
@@ -1103,7 +1145,7 @@ mod handshake_tests {
         let world_cell = server.world.cell_of_entity(player_id);
         let seq_before_retry = server.seq;
 
-        deliver_hello(&mut server, peer, &hello);
+        deliver_hello_at(&mut server, peer, &hello, 1_000 + hello_interval_ms);
 
         let retried = &server.sessions[&peer];
         assert_eq!(retried.player_id, player_id);
@@ -1121,15 +1163,133 @@ mod handshake_tests {
     }
 
     #[test]
-    fn same_peer_cannot_replace_an_established_session_with_a_different_identity() {
+    fn duplicate_hello_burst_is_dropped_before_response_or_session_work() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
+        let hello_interval_ms = server.cfg.hello_min_interval_ms_i64();
+        let hello = hello_envelope(
+            "handshake-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, peer, &hello, 1_000);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+
+        let state = state_envelope();
+        let env = decode_envelope(&state).unwrap();
+        server.on_client_state(peer, env.payload_as_client_state().unwrap(), 1_000);
+
+        deliver_hello_at(&mut server, peer, &hello, 1_000 + hello_interval_ms);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+
+        let established = &server.sessions[&peer];
+        let player_id = established.player_id;
+        let identity_hash = established.identity_hash.clone();
+        let display_name = established.display_name.clone();
+        let aboard_boat = established.aboard_boat;
+        let pos = established.pos;
+        let rot = established.rot;
+        let vel = established.vel;
+        let t_ms = established.t_ms;
+        let cell = established.cell;
+        let subscribed_cells = established.sub.cells().clone();
+        let world_len = server.world.len();
+        let world_cell = server.world.cell_of_entity(player_id);
+        let seq_after_allowed_retry = server.seq;
+
+        for _ in 0..1_000 {
+            deliver_hello_at(&mut server, peer, &hello, 1_000 + hello_interval_ms + 1);
+        }
+
+        let after_flood = &server.sessions[&peer];
+        assert_eq!(after_flood.player_id, player_id);
+        assert_eq!(after_flood.identity_hash, identity_hash);
+        assert_eq!(after_flood.display_name, display_name);
+        assert_eq!(after_flood.aboard_boat, aboard_boat);
+        assert_eq!(after_flood.pos, pos);
+        assert_eq!(after_flood.rot, rot);
+        assert_eq!(after_flood.vel, vel);
+        assert_eq!(after_flood.t_ms, t_ms);
+        assert_eq!(after_flood.cell, cell);
+        assert_eq!(after_flood.sub.cells(), &subscribed_cells);
+        assert_eq!(server.sessions.len(), 1);
+        assert_eq!(server.world.len(), world_len);
+        assert_eq!(server.world.cell_of_entity(player_id), world_cell);
+        assert_eq!(server.seq, seq_after_allowed_retry);
+        assert_eq!(server.hello_limiter.tracked_count(), 1);
+        assert_no_outbound_datagram(&client);
+    }
+
+    #[test]
+    fn hello_limit_is_independent_per_peer() {
+        let mut server = make_server();
         let first = hello_envelope(
             "first-token",
             sw_contracts::PROTOCOL_VERSION,
             Some("surface-hash"),
         );
-        deliver_hello(&mut server, peer, &first);
+        let second = hello_envelope(
+            "second-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+
+        deliver_hello_at(&mut server, 1, &first, 1_000);
+        let seq_after_first = server.seq;
+        deliver_hello_at(&mut server, 1, &first, 1_001);
+        assert_eq!(server.seq, seq_after_first);
+
+        deliver_hello_at(&mut server, 2, &second, 1_001);
+        assert_ne!(server.seq, seq_after_first);
+        assert!(server.sessions.contains_key(&1));
+        assert!(server.sessions.contains_key(&2));
+        assert_eq!(server.hello_limiter.tracked_count(), 2);
+    }
+
+    #[test]
+    fn disconnect_clears_hello_limit_for_immediate_peer_id_reuse() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let first = hello_envelope(
+            "first-token",
+            sw_contracts::PROTOCOL_VERSION + 1,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, peer, &first, 1_000);
+        assert!(!receive_server_hello(&client).0);
+        assert!(!server.sessions.contains_key(&peer));
+        assert_eq!(server.hello_limiter.tracked_count(), 1);
+
+        server
+            .on_disconnect(peer, DisconnectReason::Remote)
+            .unwrap();
+        assert_eq!(server.hello_limiter.tracked_count(), 0);
+        let seq_before_reuse = server.seq;
+
+        let reused = hello_envelope(
+            "reused-peer-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, peer, &reused, 1_001);
+
+        assert!(server.sessions.contains_key(&peer));
+        assert_ne!(server.seq, seq_before_reuse);
+        assert_eq!(server.hello_limiter.tracked_count(), 1);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+    }
+
+    #[test]
+    fn same_peer_cannot_replace_an_established_session_with_a_different_identity() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let hello_interval_ms = server.cfg.hello_min_interval_ms_i64();
+        let first = hello_envelope(
+            "first-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, peer, &first, 1_000);
         assert_eq!(receive_server_hello(&client), (true, String::new()));
 
         let player_id = server.sessions[&peer].player_id;
@@ -1143,7 +1303,7 @@ mod handshake_tests {
             Some("surface-hash"),
         );
 
-        deliver_hello(&mut server, peer, &replacement);
+        deliver_hello_at(&mut server, peer, &replacement, 1_000 + hello_interval_ms);
 
         assert_eq!(server.sessions.len(), 1);
         assert_eq!(server.sessions[&peer].player_id, player_id);
@@ -1175,6 +1335,7 @@ mod aoi_harden_tests {
 
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
+        let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -1191,6 +1352,7 @@ mod aoi_harden_tests {
             epoch_ms: 0,
             weather_seed: 0,
             weather_epoch_day: 0,
+            hello_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -1371,6 +1533,7 @@ mod market_dispatch_tests {
 
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
+        let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -1387,6 +1550,7 @@ mod market_dispatch_tests {
             epoch_ms: 0,
             weather_seed: 0,
             weather_epoch_day: 0,
+            hello_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -1595,6 +1759,7 @@ mod input_hardening_tests {
 
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
+        let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -1611,6 +1776,7 @@ mod input_hardening_tests {
             epoch_ms: 0,
             weather_seed: 0,
             weather_epoch_day: 0,
+            hello_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -2004,6 +2170,7 @@ mod input_hardening_tests {
     #[test]
     fn disconnect_clears_every_message_class_limiter() {
         let mut server = make_server(Config {
+            hello_min_interval_ms: 250,
             client_state_min_interval_ms: 250,
             chat_min_interval_ms: 250,
             econ_min_interval_ms: 250,
@@ -2027,6 +2194,7 @@ mod input_hardening_tests {
         // covered in the market dispatch suite); the point here is that
         // on_disconnect clears every class.
         server.trade_limiter.allow(pid, 1_000);
+        assert_eq!(server.hello_limiter.tracked_count(), 1);
         assert_eq!(server.client_state_limiter.tracked_count(), 1);
         assert_eq!(server.econ_limiter.tracked_count(), 1);
         assert_eq!(server.chat_limiter.tracked_count(), 1);
@@ -2037,6 +2205,7 @@ mod input_hardening_tests {
             .on_disconnect(peer, DisconnectReason::Remote)
             .unwrap();
 
+        assert_eq!(server.hello_limiter.tracked_count(), 0);
         assert_eq!(server.client_state_limiter.tracked_count(), 0);
         assert_eq!(server.econ_limiter.tracked_count(), 0);
         assert_eq!(server.chat_limiter.tracked_count(), 0);
