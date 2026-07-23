@@ -6,12 +6,11 @@ using Sailwind.Api.Runtime;
 namespace Sailwind.Api.Adapters
 {
     /// <summary>
-    /// Raises <see cref="WorldLoaded"/> / <see cref="SaveCompleted"/> from Harmony
-    /// postfixes on the verified <c>SaveLoadManager.LoadGame</c> / <c>SaveGame</c>
-    /// methods (names from <see cref="GameRef"/>, confirmed against the assembly by
-    /// codegen — not a guessed candidate list, so the surface hash now covers them).
-    /// If a method does not resolve, no patch is applied and the events simply never
-    /// fire — degraded, never crashing.
+    /// Reads the common world-ready marker and raises <see cref="WorldLoaded"/> /
+    /// <see cref="SaveCompleted"/> from Harmony postfixes on the verified
+    /// <c>SaveLoadManager.LoadGame</c> / <c>SaveGame</c> methods. All member names
+    /// come from <see cref="GameRef"/> and are covered by the generated surface.
+    /// Missing members and failed reads degrade safely without crashing the game.
     /// </summary>
     public sealed class SaveEventsAdapter : ISaveEvents
     {
@@ -19,13 +18,43 @@ namespace Sailwind.Api.Adapters
         public event Action SaveCompleted;
 
         private static SaveEventsAdapter _active;
+        private readonly Func<object, object> _worldReady;
 
         public bool Patched { get; }
+
+        public bool IsWorldReady
+        {
+            get
+            {
+                try
+                {
+                    return _worldReady?.Invoke(null) is bool ready && ready;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
 
         public SaveEventsAdapter(Harmony harmony)
         {
             _active = this;
+            _worldReady = TryBindWorldReady();
             Patched = TryPatch(harmony);
+        }
+
+        private static Func<object, object> TryBindWorldReady()
+        {
+            try
+            {
+                var type = GameBind.Resolve(GameRef.SaveLoadManager);
+                return GameBind.Getter(type, GameRef.SaveLoadManager_readyToSave);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static bool TryPatch(Harmony harmony)

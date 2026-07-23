@@ -54,6 +54,9 @@ namespace Sailwind.Api.SurfaceTests
         public void SaveLoadManager_SaveGame_method() => SurfaceProbe.RequireMember("SaveLoadManager", "SaveGame", "method", false);
 
         [Fact]
+        public void SaveLoadManager_readyToSave_field() => SurfaceProbe.RequireMember("SaveLoadManager", "readyToSave", "field", true);
+
+        [Fact]
         public void SaveSlots_type() => SurfaceProbe.RequireType("SaveSlots");
 
         [Fact]

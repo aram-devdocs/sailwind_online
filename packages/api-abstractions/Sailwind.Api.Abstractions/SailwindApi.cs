@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.ExceptionServices;
 
 namespace Sailwind.Api
 {
@@ -58,7 +59,30 @@ namespace Sailwind.Api
                 _isReady = true;
                 handlers = _ready;
             }
-            handlers?.Invoke();
+
+            Exception? firstFailure = null;
+            if (handlers != null)
+            {
+                foreach (Action handler in handlers.GetInvocationList())
+                {
+                    try
+                    {
+                        handler();
+                    }
+                    catch (Exception exception)
+                    {
+                        if (firstFailure == null)
+                        {
+                            firstFailure = exception;
+                        }
+                    }
+                }
+            }
+
+            if (firstFailure != null)
+            {
+                ExceptionDispatchInfo.Capture(firstFailure).Throw();
+            }
         }
     }
 }

@@ -1,13 +1,14 @@
 ---
 name: work
-version: 2.0.0
+version: 2.1.0
 description: |
   The top-level self-driving loop. Orients against repo and run state, resumes
   an active run or selects the highest-priority unblocked GitHub issue, routes
   large issues through /gh-runbook and the rest straight to /gh-issue, drives
   the issue to a green PR against dev through gated subagent phases, mirrors the
-  review locally with /gh-review, records lessons, reports, and stops. One
-  issue per invocation; does not merge its own PR.
+  review locally with /gh-review, records lessons, and squash-merges only after
+  rechecking the completed run and current GitHub state. One issue per
+  invocation.
 user-invocable: true
 ---
 
@@ -15,11 +16,11 @@ user-invocable: true
 
 ## Purpose
 
-Drive one GitHub issue from open to a green pull request against `dev` without
+Drive one GitHub issue from open through a gated squash merge into `dev` without
 human steering, as a durable, resumable, subagent-driven run. The issue list is
 the backlog; this skill is the executor. The heavy lifting lives in
-`/gh-issue`; this loop selects the work, resumes crashed runs, and enforces the
-one-issue-per-invocation discipline.
+`/gh-issue`; this loop selects the work, resumes crashed runs, performs the
+post-CI merge, and enforces the one-issue-per-invocation discipline.
 
 Reference: `/gh-runbook` (decomposing a large issue), `/gh-issue` (the
 per-issue lifecycle), `/gh-review` (the local review mirror), and
@@ -31,8 +32,13 @@ guidance (the orchestrator delegates, never implements).
 Stop and report instead of proceeding when any of these fail:
 
 - `gh auth status` shows the aram-devdocs account.
+- `.agents/repository.json` is exactly
+  `{"repository":"aram-devdocs/sailwind_online"}` after JSON parsing.
 - `AGENTS.md` and the applicable `.agents/rules/` have been read this session.
 - The orient step below has reconciled any prior run.
+
+Every GitHub command MUST pass `--repo aram-devdocs/sailwind_online`, because
+checkout remotes are not trusted repository identity.
 
 ## Process
 
@@ -57,8 +63,14 @@ present and clean or dirty, branch exists, PR state, outstanding gates) and
 prints an action list. Hand the active run back to `/gh-issue`, which resumes
 from the earliest phase whose reality is incomplete. A complete-but-uncommitted
 worktree is the classic dead-run trap: inspect the diff, then finish or discard
-deliberately, never blind-reset. When the resumed run reaches `done`, report
-and stop; do not also pick a new issue this invocation.
+deliberately, never blind-reset. When the resumed run reaches `done`, continue
+to the gated merge in step 8, report, and stop; do not also pick a new issue
+this invocation.
+
+If the active run is already at `done`, go directly to step 8. Cleanup retains
+the active marker for this handoff, so a crash cannot make an unmerged PR
+disappear from issue selection. The gated merge clears the marker only after it
+confirms both the PR merge and issue closure.
 
 If no run is active and the tree is clean:
 
@@ -68,7 +80,12 @@ If no run is active and the tree is clean:
 
 Only when no run is active.
 
-    gh issue list --state open --limit 100 --json number,title,labels,milestone,assignees
+    gh issue list --repo aram-devdocs/sailwind_online --state open --limit 100 --json number,url,title,labels,milestone,assignees
+
+Treat the returned `url` as the selected issue identity. It MUST equal
+`https://github.com/aram-devdocs/sailwind_online/issues/<N>`, because
+`init-run` records that canonical URL before later operations can derive the
+same repository and issue.
 
 Selection order, applied in sequence:
 
@@ -80,7 +97,7 @@ Skip an issue when any of these hold:
 
 - It carries the `blocked` label.
 - Its body says `Blocked by #N` and issue N is still open
-  (`gh issue view N --json state`).
+  (`gh issue view N --repo aram-devdocs/sailwind_online --json state`).
 - It is assigned and shows activity newer than 24 hours (claimed).
 - An open PR already references it.
 
@@ -88,8 +105,8 @@ If nothing is selectable, report that and stop.
 
 ### 3. Claim
 
-    gh issue edit <N> --add-assignee @me
-    gh issue comment <N> --body "Picking this up. Branch: feat/<N>-<slug>"
+    gh issue edit <N> --repo aram-devdocs/sailwind_online --add-assignee @me
+    gh issue comment <N> --repo aram-devdocs/sailwind_online --body "Picking this up. Branch: feat/<N>-<slug>"
 
 `<slug>` is 2-4 kebab-case words from the issue title.
 
@@ -105,13 +122,18 @@ Read the issue body fully first, then choose the path:
 
 ### 5. Drive /gh-issue to a green PR
 
-    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue <N> --slug <slug>
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue <N> --issue-url <selected issue url> --slug <slug>
 
 Then run the `/gh-issue` lifecycle: investigate -> plan -> implement -> verify
 -> review -> pr -> wait-ci -> cleanup -> done. Every transition goes through
 `gh_issue_run.py`; the `implement` phase dispatches `01-implementer` (the
 orchestrator never edits files); the `review` phase runs `02` -> `03` -> `04`
 -> `05` in the fixed order with each verdict recorded through the state machine.
+Immediately before `02`, run `gh_issue_run.py record-reviewed-head`; it binds
+the clean worktree commit and clears every old verdict. Any later commit,
+including a CI fix, MUST return to `review`, record the new head, and rerun all
+four reviewers, because verdicts for an earlier commit cannot authorize the
+merge.
 `make validate` is the canonical gate and MUST pass locally before the PR.
 Attempt cap: three fix cycles on the same failure, then Escalate.
 
@@ -129,7 +151,67 @@ tool needs a flag, a Windows trap), append one dated line to
 `.agents/lessons-learned.md` inside the same PR. Skip when there is nothing new;
 an empty entry is noise.
 
-### 8. Report and stop
+### 8. Gated squash merge
+
+`/gh-issue` ends at a green PR and keeps its state schema unchanged. After its
+run reaches `done`, `/work` owns the merge:
+
+    python .agents/skills/work/scripts/gated_merge.py --run-id <run_id>
+
+The script MUST be the only merge path in this loop, because it binds the
+operation to the completed run rather than trusting conversational memory. It
+requires `phase=done`, `plan_open=0`, all four recorded verdicts equal to
+`APPROVE`, a state-machine-owned `reviewed-head`, and a canonical durable
+`issue-url` companion marker, issue, branch, and PR that exactly match the run.
+Owner/repository identity comes only from that marker; the script never asks
+the checkout or a local remote which repository it is in. Every GitHub command
+or GraphQL query uses that explicit expected repository. It then rechecks
+through `gh` that the PR is open, not a draft, targets `dev`, comes from the
+recorded branch, links the recorded issue for closure, reports
+`mergeStateStatus=CLEAN`, and has no pending or failed required checks. The PR
+head MUST equal `reviewed-head`, because every review verdict must cover the
+exact commit merged. The required `gate` check proves that same PR head passed
+the CI mirror of `make validate`.
+
+Before its first state or companion-marker read, the script acquires the state
+machine's global lock and the completed run's advisory lock in that order. It
+holds both through every precondition recheck, the merge, confirmation, remote
+branch cleanup, and the active-marker compare-delete. State updates and
+reviewed-head recording use the same run lock, so they cannot invalidate the
+snapshot during the merge. Lock acquisition is bounded, and process exit
+releases ownership for a safe retry.
+
+Immediately before merging, the script reads the PR again and refuses a changed
+head, rechecks issue linkage, and reads required checks again. It passes that
+exact head to `gh pr merge --match-head-commit` only when the final check read
+still passes and uses squash merge without GitHub's unguarded branch-delete
+flag. It then
+confirms the PR is `MERGED` and polls the linked issue for bounded closure
+confirmation. Every external command has a fixed timeout and fails closed with
+the command purpose. It then independently queries the recorded remote feature
+ref. An absent ref succeeds. A ref still at the reviewed head is deleted with a
+SHA-bound `--force-with-lease` pushed directly to the HTTPS URL derived from the
+durable `issue-url` marker, then queried again. Local `origin`
+configuration cannot redirect this mutation. A move between lookup and deletion
+makes the atomic operation fail. A ref at any other commit is never deleted.
+
+The merge command is retry-safe. If GitHub accepted the squash merge but a
+confirmation call failed or issue closure was delayed, rerun the same command.
+It accepts only the exact recorded PR, branch, issue link, reviewed head, and
+required checks; when that PR is already `MERGED`, it skips the merge call,
+finishes bounded confirmation, repairs or confirms remote branch deletion, and
+asks the run state machine to clear the active handoff under its lock only if
+the marker still names this run. Any branch lookup, deletion, verification, or
+marker compare failure keeps the handoff active for another safe retry. A
+replacement active marker is preserved.
+
+If the command prints `STOP`, report its exact precondition failure and stop
+without merging or selecting another issue. If it prints `ERROR`, report the
+exact merge or confirmation failure and stop without claiming success. Use
+`--dry-run` only for diagnostics, because it checks every precondition but does
+not merge.
+
+### 9. Report and stop
 
 End with exactly this summary, then stop. One issue per invocation.
 
@@ -137,7 +219,8 @@ End with exactly this summary, then stop. One issue per invocation.
     - Issue: #<N> <title>
     - Run: <N>-<slug> (phase: <final phase>)
     - Branch: feat/<N>-<slug>
-    - PR: <url> (CI: green | red)
+    - PR: <url> (MERGED | not merged: <exact failure>)
+    - Issue state: CLOSED | <actual state>
     - Gates: spec <v>; quality <v>; architecture <v>; security <v>
     - make validate: <pass | fail>
     - Lessons recorded: <yes: one line | no>
@@ -165,4 +248,6 @@ After three failed attempts on the same gate or CI failure:
 - Implementing in the orchestrator instead of dispatching `01-implementer`.
 - Hand-editing `state.json` instead of going through `gh_issue_run.py`.
 - Silent scope creep, silent test weakening, silent hook edits.
-- Merging your own PR.
+- Calling `gh pr merge` directly instead of the gated merge script.
+- Clearing a completed run's active marker before merge confirmation.
+- Starting the next issue after either a successful or failed merge attempt.

@@ -25,8 +25,11 @@ own.
   contracts, infra, docs, release.
 - `make validate` MUST pass locally before you push, because it mirrors CI
   exactly and a red push wastes a round trip.
-- You do not merge your own PR. Merging is a separate review step, so nothing
-  lands on `dev` by the same hand that wrote it.
+- `/work` MAY merge the PR it created only through its gated merge script,
+  because that script rechecks the completed run, all independent review
+  verdicts, the current PR head, and required CI checks before merging.
+- A failed merge precondition MUST stop without merging, because an unchecked
+  self-merge would bypass the review boundary.
 - Merges are squash-only, so `dev` history reads as one Conventional Commit per
   change.
 
@@ -48,9 +51,9 @@ tooling reads to produce the changelog and version.
 
 ## The self-driving loop: `/work`
 
-The `/work` skill drives one issue from open to a green PR against `dev` without
-human steering, and it is resumable: it reads its state from disk, not memory,
-so a run that died mid-task recovers cleanly. The full loop is in
+The `/work` skill drives one issue from open through a gated squash merge into
+`dev` without human steering, and it is resumable: it reads its state from disk,
+not memory, so a run that died mid-task recovers cleanly. The full loop is in
 `.agents/skills/work/SKILL.md`. One issue per invocation.
 
 1. Orient and resume. It fetches, inspects the working tree, and reads the
@@ -66,8 +69,26 @@ so a run that died mid-task recovers cleanly. The full loop is in
    dispatches the subagents below and drives the per-issue lifecycle in
    `.agents/skills/gh-issue`.
 4. Review, verify, open the PR. It runs the fixed review gates in order, makes
-   `make validate` pass, opens the PR, and keeps it green. It never merges its
-   own PR.
+   `make validate` pass, opens the PR, and keeps it green. Before the four
+   reviewers run, the state machine records the clean commit in
+   `reviewed-head` and clears old verdicts. Any later commit requires all four
+   reviews again.
+5. Recheck and merge. After `/gh-issue` reaches `done`, `/work` reads that
+   completed run and requires `plan_open=0` plus four `APPROVE` verdicts. Its
+   deterministic merge script derives owner/repository only from the immutable
+   canonical `issue-url` companion marker recorded at run creation and checks
+   it against the strictly parsed `.agents/repository.json` bootstrap identity.
+   It never discovers identity from checkout remotes. Using that explicit
+   repository, it verifies the recorded PR is open, not a draft, targets `dev`,
+   comes from the recorded branch, links the recorded issue, reports a clean
+   merge state, and has no pending or failed required checks.
+   It rereads the head before a squash merge guarded by that exact commit,
+   rechecks linkage and required checks at the final mutation boundary,
+   omits GitHub's unguarded branch-delete flag, then confirms `MERGED`, `CLOSED`,
+   and independent absence of the exact recorded remote feature ref. Branch
+   cleanup uses a SHA-bound lease, so a concurrent move cannot be deleted.
+   Cleanup retains the active-run marker until those confirmations succeed, so
+   a restart resumes this handoff before selecting another issue.
 
 Supporting skills, all under `.agents/skills/`: `gh-runbook` (decompose a large
 issue), `gh-issue` (the per-issue lifecycle state machine), `gh-review` (the
@@ -111,7 +132,60 @@ unfenced.
 
 ## How merging works in practice
 
-A person (or, later, a review workflow) reviews the green PR and merges it. A
-single-maintainer account cannot approve its own PR, so the gate that protects
-`dev` is the CI status check, not a required approval, and the no-self-merge
-rule keeps the review boundary intact.
+The `/gh-issue` state machine remains responsible for producing a green PR and
+does not merge. It atomically records the selected canonical GitHub issue URL
+in an immutable `issue-url` companion marker without changing the flat
+`state.json` schema. Legacy runs missing the marker use the locked
+`migrate-issue-url` command with an independently recorded URL and otherwise
+fail closed. That command also removes a legacy `issue_url` state key through
+the state machine. Active non-`done` migration additionally requires the exact
+clean recorded worktree and branch. `/work` owns the post-CI merge and
+MUST call `.agents/skills/work/scripts/gated_merge.py`, because a single
+deterministic path prevents a conversational shortcut around the gates.
+
+The script accepts only a completed run with no open plan items and four
+`APPROVE` review verdicts. It also requires the current PR head to equal the
+state-machine-owned `reviewed-head`, so a CI-fix commit cannot inherit verdicts
+for an older diff. The required CI `gate` is tied to that same PR head and
+mirrors `make validate`; the script reads the head again immediately before
+merging and gives it to GitHub as the expected head commit. GitHub refuses the
+merge if the branch changed in that interval. A successful run squash-merges,
+deletes the remote feature branch, confirms the PR is `MERGED`, and confirms
+the linked issue is `CLOSED`.
+
+The confirmation path uses bounded issue-closure polling and fixed timeouts for
+every external command. If confirmation fails after GitHub accepted the merge,
+the active run remains discoverable. A retry verifies the exact already-merged
+PR, reviewed head, required checks, and closing issue link, skips a second merge
+call, and finishes confirmation before clearing the active marker. If the
+recorded remote branch remains at the reviewed head, the retry deletes it with
+an atomic `--force-with-lease` bound to that commit and rechecks it. The push
+targets the HTTPS URL derived from the durable `issue-url` companion marker,
+not a configurable local remote or an implicit `gh repo view`. A move before
+or during deletion fails the lease and is never deleted.
+
+The final active-marker clear goes through the run state machine under its
+global lock and deletes only a marker still naming the completed run. A marker
+replaced by another run is preserved.
+
+Worktree cleanup reads the full Git worktree registry entry even when the
+recorded directory is missing. The path, branch, and head must match the run's
+recorded branch and reviewed commit. An existing worktree must still be clean,
+including untracked files, immediately before normal removal. Force is limited
+to removing the exact matched registry entry after its path is verified absent.
+A dirty path or replacement registration fails without mutation. The state
+machine holds an ownership-safe advisory lifecycle lock through the final
+registry/path absence check and `done` write, while `init-run` holds the same
+lock for creation. Process exit releases a crashed owner's lock; file age never
+steals a live lock. A removal, identity, or verification error keeps the prior
+phase and active marker so cleanup can be retried.
+
+Before a run exists, `/work` reads the one-field tracked
+`.agents/repository.json` file and passes its
+`aram-devdocs/sailwind_online` value to issue selection, blocker lookup,
+assignment, and comment commands with `--repo`. The selected explicit result
+supplies the canonical URL to `init-run`. Missing, malformed, extra-field, or
+mismatched configuration stops the run before GitHub mutation.
+
+Any mismatch prints the exact failure and stops. `/work` does not merge a
+different PR, repair state by hand, or select another issue in that invocation.
