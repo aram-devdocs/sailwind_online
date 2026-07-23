@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
 use crate::ratelimit::{GlobalRateLimiter, RateLimiter};
 use crate::validate;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,6 +54,9 @@ pub struct Server {
     db: Db,
     world: World,
     sessions: HashMap<PeerId, Session>,
+    // Logical sessions replaced on another connection stay barred until their
+    // still-live transport peer disconnects. This set is bounded by live peers.
+    superseded_peers: HashSet<PeerId>,
     seq: u32,
     snapshot_tick: u32,
     boot: Instant,
@@ -105,6 +108,7 @@ impl Server {
             db,
             world,
             sessions: HashMap::new(),
+            superseded_peers: HashSet::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -252,6 +256,11 @@ impl Server {
             return Ok(());
         }
 
+        if self.superseded_peers.contains(&peer) {
+            self.reject_hello(peer, "session replaced by a newer connection");
+            return Ok(());
+        }
+
         if hello.protocol_version() != sw_contracts::PROTOCOL_VERSION {
             let reason = format!(
                 "protocol version mismatch: client {}, server {}",
@@ -351,6 +360,7 @@ impl Server {
             .collect();
         for pp in stale {
             self.sessions.remove(&pp);
+            self.superseded_peers.insert(pp);
         }
 
         let mut sub = Subscription::new(self.cfg.aoi_radius_i32());
@@ -741,6 +751,7 @@ impl Server {
 
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
         self.hello_limiter.clear(u64::from(peer));
+        self.superseded_peers.remove(&peer);
         if let Some(s) = self.sessions.remove(&peer) {
             self.world.remove(s.player_id);
             // Drop the player's throttle state across every message class: a
@@ -1008,6 +1019,7 @@ mod handshake_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            superseded_peers: HashSet::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -1697,6 +1709,61 @@ mod handshake_tests {
     }
 
     #[test]
+    fn superseded_peer_retry_cannot_reclaim_identity_from_accepted_replacement() {
+        let mut server = make_server();
+        let (first_client, first_peer) = connect_peer(&mut server);
+        let hello = hello_envelope(
+            "shared-identity-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let first_admission_ms = 1_000;
+
+        deliver_hello_at(&mut server, first_peer, &hello, first_admission_ms);
+        assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+
+        let (replacement_client, replacement_peer) = connect_peer(&mut server);
+        let replacement_admission_ms =
+            first_admission_ms + server.cfg.new_session_min_interval_ms_i64();
+        deliver_hello_at(
+            &mut server,
+            replacement_peer,
+            &hello,
+            replacement_admission_ms,
+        );
+        assert_eq!(
+            receive_server_hello(&replacement_client),
+            (true, String::new())
+        );
+        let player_id = server.sessions[&replacement_peer].player_id;
+        let world_cell = server.world.cell_of_entity(player_id);
+        assert!(!server.sessions.contains_key(&first_peer));
+
+        let stale_retry_ms = replacement_admission_ms
+            + server
+                .cfg
+                .hello_min_interval_ms_i64()
+                .max(server.cfg.new_session_min_interval_ms_i64());
+        deliver_hello_at(&mut server, first_peer, &hello, stale_retry_ms);
+
+        assert_eq!(server.sessions.len(), 1);
+        assert!(!server.sessions.contains_key(&first_peer));
+        assert_eq!(server.sessions[&replacement_peer].player_id, player_id);
+        assert_eq!(server.world.len(), 1);
+        assert_eq!(server.world.cell_of_entity(player_id), world_cell);
+        assert_eq!(
+            receive_server_hello(&first_client),
+            (false, "session replaced by a newer connection".to_string())
+        );
+
+        server
+            .on_disconnect(first_peer, DisconnectReason::Remote)
+            .unwrap();
+        assert!(!server.superseded_peers.contains(&first_peer));
+        assert_eq!(server.sessions[&replacement_peer].player_id, player_id);
+    }
+
+    #[test]
     fn duplicate_hello_burst_is_dropped_before_response_or_session_work() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
@@ -2005,6 +2072,7 @@ mod aoi_harden_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            superseded_peers: HashSet::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -2205,6 +2273,7 @@ mod market_dispatch_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            superseded_peers: HashSet::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -2438,6 +2507,7 @@ mod input_hardening_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            superseded_peers: HashSet::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
