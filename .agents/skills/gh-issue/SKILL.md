@@ -55,11 +55,15 @@ condition, recorded through the state machine, before the next begins.
 - **cleanup** `gh_issue_run.py cleanup-worktree` removes the worktree, sets
   `phase=done`, and retains the active marker for `/work`. Exit: worktree gone,
   its Git registry entry gone, phase done, merge handoff remains discoverable.
-  Cleanup checks `git worktree list --porcelain`, prunes stale registration for
-  a missing recorded path, and verifies both filesystem and registry absence
-  before advancing. If any removal, prune, or verification fails, stop with the
-  prior phase and active marker intact, because cleanup must remain retryable
-  rather than becoming a false `done`.
+  Cleanup parses the full `git worktree list --porcelain` entry and requires the
+  exact run path, recorded branch, and `reviewed-head` before force removal. A
+  replacement entry fails without mutation. It prunes identity-matched stale
+  registration for a missing path and holds the lifecycle lock through final
+  filesystem/registry verification and the `done` write. `init-run` holds that
+  same lock while creating a worktree, so compliant commands cannot recreate
+  the path in that interval. If any identity, removal, prune, or verification
+  fails, stop with the prior phase and active marker intact, because cleanup
+  must remain retryable rather than becoming a false `done`.
 - **done** Terminal for `/gh-issue`. The run reports and stops. It does NOT
   merge its own PR or clear the handoff that `/work` must resume.
 

@@ -94,9 +94,12 @@ clears that marker through the state machine only after it confirms the merged
 PR, closed issue, and remote branch deletion. Active-marker writes and the
 expected-run compare-and-delete share the global run lock, so a replacement
 marker is preserved. Cleanup checks the Git worktree registry, reconciles a
-stale entry for a missing recorded path, and verifies registry and filesystem
-absence before `done`. Any cleanup failure leaves the prior phase and active
-marker unchanged so resume retries cleanup.
+stale entry only when its full porcelain record matches the run path, recorded
+branch, and reviewed head. A replacement entry is never removed. Cleanup holds
+the global lifecycle lock through final registry and filesystem verification
+and the `done` state write; `init-run` uses the same lock while creating
+worktrees. Any cleanup failure leaves the prior phase and active marker
+unchanged so resume retries cleanup.
 
 | hook                          | trigger        | reads                          | effect                                                                 |
 | ----------------------------- | -------------- | ------------------------------ | ---------------------------------------------------------------------- |

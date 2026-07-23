@@ -34,6 +34,7 @@ BRANCH_QUERY = (
 )
 RUN_ID_RE = re.compile(r"(?P<issue>[1-9][0-9]*)-[a-z0-9]+(?:-[a-z0-9]+)*")
 HEAD_OID_RE = re.compile(r"[0-9a-fA-F]{40}")
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 GH_TIMEOUT_SECONDS = 30
 CLOSURE_CONFIRMATION_ATTEMPTS = 5
 CLOSURE_POLL_INTERVAL_SECONDS = 2
@@ -192,13 +193,24 @@ def repository_name(runner):
     repo = data.get("nameWithOwner") if isinstance(data, dict) else None
     if (
         not isinstance(repo, str)
-        or repo.count("/") != 1
-        or any(not part for part in repo.split("/"))
+        or not REPOSITORY_RE.fullmatch(repo)
+        or any(part in (".", "..") for part in repo.split("/"))
     ):
         raise MergePreconditionError(
             f"repository lookup returned invalid nameWithOwner: {repo!r}"
         )
     return repo
+
+
+def repository_push_url(repo):
+    """Derive the exact GitHub HTTPS target from a validated owner/name."""
+    if not REPOSITORY_RE.fullmatch(repo) or any(
+        part in (".", "..") for part in repo.split("/")
+    ):
+        raise MergePreconditionError(
+            f"cannot derive push URL from invalid repository {repo!r}"
+        )
+    return f"https://github.com/{repo}.git"
 
 
 def pr_view_command(pr_number, repo):
@@ -515,7 +527,7 @@ def ensure_remote_branch_deleted(runner, repo, branch, expected_head):
         "git",
         "push",
         f"--force-with-lease=refs/heads/{branch}:{expected_head.lower()}",
-        "origin",
+        repository_push_url(repo),
         f":refs/heads/{branch}",
     ]
     result = runner(delete_command)

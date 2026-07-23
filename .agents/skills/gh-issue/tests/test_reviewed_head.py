@@ -186,6 +186,10 @@ class ReviewedHeadTests(unittest.TestCase):
             self.run_id + "\n",
             encoding="utf-8",
         )
+        (self.run_dir / "reviewed-head").write_text(
+            self.head + "\n",
+            encoding="utf-8",
+        )
         worktree = (
             self.runs_dir
             / ".worktrees"
@@ -231,6 +235,10 @@ class ReviewedHeadTests(unittest.TestCase):
     def test_cleanup_prunes_stale_registered_worktree_before_done(self):
         (self.runs_dir / "active").write_text(
             self.run_id + "\n",
+            encoding="utf-8",
+        )
+        (self.run_dir / "reviewed-head").write_text(
+            self.head + "\n",
             encoding="utf-8",
         )
         worktree = self.runs_dir / ".worktrees" / self.run_id
@@ -291,6 +299,10 @@ class ReviewedHeadTests(unittest.TestCase):
             self.run_id + "\n",
             encoding="utf-8",
         )
+        (self.run_dir / "reviewed-head").write_text(
+            self.head + "\n",
+            encoding="utf-8",
+        )
         worktree = self.runs_dir / ".worktrees" / self.run_id
         registered = (
             f"worktree {worktree}\n"
@@ -329,6 +341,101 @@ class ReviewedHeadTests(unittest.TestCase):
             (self.runs_dir / "active").read_text(encoding="utf-8"),
             self.run_id + "\n",
         )
+
+    def test_cleanup_rejects_replacement_worktree_identity(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        (self.run_dir / "reviewed-head").write_text(
+            self.head + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        replacement = (
+            f"worktree {worktree}\n"
+            f"HEAD {'b' * 40}\n"
+            "branch refs/heads/feat/99-replacement\n"
+        )
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            no_git=False,
+        )
+
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                return_value=(0, replacement, ""),
+            ) as run,
+            self.assertRaisesRegex(SystemExit, "worktree identity mismatch"),
+        ):
+            gh_issue_run.cmd_cleanup_worktree(args)
+
+        self.assertEqual(len(run.call_args_list), 1)
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "review")
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            self.run_id + "\n",
+        )
+
+    def test_cleanup_holds_global_lock_through_done_write(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            no_git=False,
+        )
+        original_write_state = gh_issue_run.write_state
+        registry_reads = 0
+
+        def inspect_registry(command, cwd=None):
+            nonlocal registry_reads
+            registry_reads += 1
+            self.assertEqual(
+                command,
+                ["git", "worktree", "list", "--porcelain"],
+            )
+            self.assertTrue((self.runs_dir / ".lock").exists())
+            return 0, "", ""
+
+        def assert_locked_write(path, data):
+            self.assertTrue((self.runs_dir / ".lock").exists())
+            return original_write_state(path, data)
+
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                side_effect=inspect_registry,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "write_state",
+                side_effect=assert_locked_write,
+            ),
+        ):
+            gh_issue_run.cmd_cleanup_worktree(args)
+
+        self.assertEqual(registry_reads, 2)
+        self.assertFalse((self.runs_dir / ".lock").exists())
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "done")
 
     def test_clear_active_preserves_replacement_marker(self):
         replacement = "99-replacement-run"

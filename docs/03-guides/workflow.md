@@ -149,18 +149,23 @@ the active run remains discoverable. A retry verifies the exact already-merged
 PR, reviewed head, required checks, and closing issue link, skips a second merge
 call, and finishes confirmation before clearing the active marker. If the
 recorded remote branch remains at the reviewed head, the retry deletes it with
-an atomic `--force-with-lease` bound to that commit and rechecks it. A move
-before or during deletion fails the lease and is never deleted.
+an atomic `--force-with-lease` bound to that commit and rechecks it. The push
+targets the HTTPS URL derived from the repository identity already validated
+through GitHub, not a configurable local remote. A move before or during
+deletion fails the lease and is never deleted.
 
 The final active-marker clear goes through the run state machine under its
 global lock and deletes only a marker still naming the completed run. A marker
 replaced by another run is preserved.
 
-Worktree cleanup reads Git's worktree registry even when the recorded directory
-is missing. It reconciles stale registration and reaches `done` only after both
-the exact registry entry and directory are absent. A removal, prune, or
-verification error keeps the prior phase and active marker so cleanup can be
-retried.
+Worktree cleanup reads the full Git worktree registry entry even when the
+recorded directory is missing. Before force removal or stale pruning, the path,
+branch, and head must match the run's recorded branch and reviewed commit. A
+replacement registration fails without mutation. The state machine holds its
+global lifecycle lock through the final registry/path absence check and `done`
+write, while `init-run` holds the same lock for creation. A removal, prune,
+identity, or verification error keeps the prior phase and active marker so
+cleanup can be retried.
 
 Any mismatch prints the exact failure and stops. `/work` does not merge a
 different PR, repair state by hand, or select another issue in that invocation.

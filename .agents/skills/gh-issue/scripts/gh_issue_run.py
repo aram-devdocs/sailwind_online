@@ -158,16 +158,20 @@ def active_path(args):
     return runs_dir(args) / "active"
 
 
+def write_active_run_locked(args, run_id):
+    """Atomically replace the active marker while the global lock is held."""
+    marker = active_path(args)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(marker.name + ".tmp")
+    tmp.write_text(run_id + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(marker))
+
+
 def write_active_run(args, run_id):
     """Atomically replace the active marker under the global run lock."""
-    root = runs_dir(args)
-    lock = acquire_lock(root)
+    lock = acquire_lock(runs_dir(args))
     try:
-        marker = active_path(args)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        tmp = marker.with_name(marker.name + ".tmp")
-        tmp.write_text(run_id + "\n", encoding="utf-8")
-        os.replace(str(tmp), str(marker))
+        write_active_run_locked(args, run_id)
     finally:
         release_lock(lock)
 
@@ -316,14 +320,15 @@ def cmd_init_run(args):
     rundir = run_dir(args, run_id)
     spath = state_path(args, run_id)
 
-    if spath.exists() and not args.resume:
-        raise SystemExit(
-            f"error: run '{run_id}' already exists at {spath}; pass --resume to "
-            "reattach to it"
-        )
-
-    lock = acquire_lock(rundir)
+    global_lock = acquire_lock(runs_dir(args))
+    lock = None
     try:
+        lock = acquire_lock(rundir)
+        if spath.exists() and not args.resume:
+            raise SystemExit(
+                f"error: run '{run_id}' already exists at {spath}; pass "
+                "--resume to reattach to it"
+            )
         if spath.exists() and args.resume:
             data = read_state(spath)
             data["updated_at"] = now_utc()
@@ -333,32 +338,39 @@ def cmd_init_run(args):
             data = blank_state(run_id, args.issue, args.slug)
             write_state(spath, data)
             print(f"initialized run '{run_id}' (phase=investigate) at {spath}")
+
+        # Mark this run active for the hooks.
+        write_active_run_locked(args, run_id)
+        print(f"active run set to '{run_id}'")
+
+        # Create the isolated worktree while the lifecycle lock excludes cleanup.
+        if data.get("phase") in ("cleanup", "done"):
+            print(
+                f"run '{run_id}' is at phase {data.get('phase')!r}; "
+                "worktree recreation is not valid during or after cleanup"
+            )
+            return
+        if args.no_git:
+            print("no-git: skipped 'git worktree add' (worktree not created)")
+            return
+        root = repo_root()
+        worktree = root / data["worktree"]
+        branch = data["branch"]
+        if worktree.exists():
+            print(f"worktree already present at {worktree}; leaving as-is")
+            return
+        rc, out, err = run_cmd(
+            ["git", "worktree", "add", str(worktree), "-b", branch, "dev"],
+            cwd=str(root),
+        )
+        if rc == 0:
+            print(f"created worktree {worktree} on branch {branch}")
+        else:
+            print(f"warning: 'git worktree add' failed (rc={rc}): {err or out}")
     finally:
-        release_lock(lock)
-
-    # Mark this run active for the hooks.
-    write_active_run(args, run_id)
-    print(f"active run set to '{run_id}'")
-
-    # Create the isolated worktree. The script does this at /work time; --no-git
-    # skips it for tests and for the authoring/dry-exercise path.
-    if args.no_git:
-        print("no-git: skipped 'git worktree add' (worktree not created)")
-        return
-    root = repo_root()
-    worktree = root / data["worktree"]
-    branch = data["branch"]
-    if worktree.exists():
-        print(f"worktree already present at {worktree}; leaving as-is")
-        return
-    rc, out, err = run_cmd(
-        ["git", "worktree", "add", str(worktree), "-b", branch, "dev"],
-        cwd=str(root),
-    )
-    if rc == 0:
-        print(f"created worktree {worktree} on branch {branch}")
-    else:
-        print(f"warning: 'git worktree add' failed (rc={rc}): {err or out}")
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
 
 
 def cmd_update_state(args):
@@ -648,8 +660,8 @@ def normalized_path(path):
     return os.path.normcase(str(Path(path).resolve(strict=False)))
 
 
-def registered_worktree_paths(root):
-    """Read the Git worktree registry and return its exact recorded paths."""
+def registered_worktrees(root):
+    """Parse the stable Git porcelain format into full worktree entries."""
     rc, out, err = run_cmd(
         ["git", "worktree", "list", "--porcelain"],
         cwd=str(root),
@@ -659,89 +671,164 @@ def registered_worktree_paths(root):
             f"error: worktree registry inspection failed (rc={rc}): "
             f"{err or out}"
         )
-    return {
-        normalized_path(line.removeprefix("worktree "))
-        for line in out.splitlines()
-        if line.startswith("worktree ")
-    }
+    entries = {}
+    current = None
+    for line in (*out.splitlines(), ""):
+        if not line:
+            if current is not None:
+                key = normalized_path(current["path"])
+                if key in entries:
+                    raise SystemExit(
+                        f"error: worktree registry contains duplicate path "
+                        f"{current['path']!r}"
+                    )
+                entries[key] = current
+                current = None
+            continue
+        if line.startswith("worktree "):
+            if current is not None:
+                raise SystemExit(
+                    "error: malformed worktree registry: missing entry separator"
+                )
+            current = {
+                "path": line.removeprefix("worktree "),
+                "head": "",
+                "branch": "",
+            }
+            continue
+        if current is None:
+            raise SystemExit(
+                f"error: malformed worktree registry line {line!r}"
+            )
+        if line.startswith("HEAD "):
+            current["head"] = line.removeprefix("HEAD ")
+        elif line.startswith("branch "):
+            current["branch"] = line.removeprefix("branch ")
+        elif line == "detached":
+            current["detached"] = True
+        elif line == "bare":
+            current["bare"] = True
+        elif line == "locked" or line.startswith("locked "):
+            current["locked"] = line.removeprefix("locked").strip()
+        elif line == "prunable" or line.startswith("prunable "):
+            current["prunable"] = line.removeprefix("prunable").strip()
+        else:
+            raise SystemExit(
+                f"error: unrecognized worktree registry line {line!r}"
+            )
+    return entries
+
+
+def validate_cleanup_entry(args, run_id, data, entry):
+    """Bind a destructive worktree removal to branch and reviewed commit."""
+    expected_branch = f"refs/heads/{data.get('branch', '')}"
+    marker = reviewed_head_path(args, run_id)
+    try:
+        expected_head = marker.read_text(encoding="utf-8").strip().lower()
+    except OSError as exc:
+        raise SystemExit(
+            f"error: cannot read reviewed head for cleanup: {exc}"
+        ) from exc
+    actual_head = entry.get("head", "").lower()
+    actual_branch = entry.get("branch", "")
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", expected_head)
+        or actual_head != expected_head
+        or actual_branch != expected_branch
+    ):
+        raise SystemExit(
+            f"error: worktree identity mismatch for {entry.get('path')!r}: "
+            f"expected {expected_branch} at {expected_head!r}, found "
+            f"{actual_branch!r} at {actual_head!r}; refusing removal"
+        )
 
 
 def cmd_cleanup_worktree(args):
     run_id = resolve_run_id(args)
+    rundir = run_dir(args, run_id)
     spath = state_path(args, run_id)
-    data = read_state(spath)
     root = repo_root()
-    recorded_worktree = data.get("worktree", "")
-    expected_worktree = Path(".worktrees") / run_id
-    if (
-        not recorded_worktree
-        or Path(recorded_worktree).is_absolute()
-        or Path(recorded_worktree) != expected_worktree
-    ):
-        raise SystemExit(
-            f"error: recorded worktree {recorded_worktree!r} does not match "
-            f"the exact run path {str(expected_worktree)!r}"
-        )
-    worktree = root / recorded_worktree
-
-    if args.no_git:
-        print("no-git: skipped 'git worktree remove'")
-    else:
-        target = normalized_path(worktree)
-        registered = target in registered_worktree_paths(root)
-        if registered:
-            rc, out, err = run_cmd(
-                ["git", "worktree", "remove", str(worktree), "--force"],
-                cwd=str(root),
+    global_lock = acquire_lock(runs_dir(args))
+    lock = None
+    try:
+        lock = acquire_lock(rundir)
+        data = read_state(spath)
+        recorded_worktree = data.get("worktree", "")
+        expected_worktree = Path(".worktrees") / run_id
+        if (
+            not recorded_worktree
+            or Path(recorded_worktree).is_absolute()
+            or Path(recorded_worktree) != expected_worktree
+            or data.get("branch") != f"feat/{run_id}"
+        ):
+            raise SystemExit(
+                f"error: recorded worktree identity "
+                f"{recorded_worktree!r}/{data.get('branch')!r} does not match "
+                f"the exact run {run_id!r}"
             )
-            if rc == 0:
-                print(f"removed worktree {worktree}")
-            elif worktree.exists():
-                raise SystemExit(
-                    f"error: worktree removal failed (rc={rc}): "
-                    f"{err or out}; run remains active and non-done for "
-                    "cleanup retry"
-                )
-            else:
-                prune_rc, prune_out, prune_err = run_cmd(
-                    ["git", "worktree", "prune", "--expire", "now"],
+        worktree = root / recorded_worktree
+
+        if args.no_git:
+            print("no-git: skipped 'git worktree remove'")
+        else:
+            target = normalized_path(worktree)
+            entries = registered_worktrees(root)
+            entry = entries.get(target)
+            if entry is not None:
+                validate_cleanup_entry(args, run_id, data, entry)
+                rc, out, err = run_cmd(
+                    ["git", "worktree", "remove", str(worktree), "--force"],
                     cwd=str(root),
                 )
-                if prune_rc != 0:
+                if rc == 0:
+                    print(f"removed worktree {worktree}")
+                elif worktree.exists():
                     raise SystemExit(
-                        f"error: stale worktree registry cleanup failed "
-                        f"(rc={prune_rc}): {prune_err or prune_out}; run "
-                        "remains active and non-done for cleanup retry"
+                        f"error: worktree removal failed (rc={rc}): "
+                        f"{err or out}; run remains active and non-done for "
+                        "cleanup retry"
                     )
-                print(f"pruned stale worktree registration for {worktree}")
-        elif worktree.exists():
-            raise SystemExit(
-                f"error: worktree path {worktree} exists but is not registered; "
-                "refusing to remove an unowned directory"
-            )
-        else:
-            print(f"worktree {worktree} already absent")
+                else:
+                    prune_rc, prune_out, prune_err = run_cmd(
+                        ["git", "worktree", "prune", "--expire", "now"],
+                        cwd=str(root),
+                    )
+                    if prune_rc != 0:
+                        raise SystemExit(
+                            f"error: stale worktree registry cleanup failed "
+                            f"(rc={prune_rc}): {prune_err or prune_out}; run "
+                            "remains active and non-done for cleanup retry"
+                        )
+                    print(
+                        f"pruned stale worktree registration for {worktree}"
+                    )
+            elif worktree.exists():
+                raise SystemExit(
+                    f"error: worktree path {worktree} exists but is not "
+                    "registered; refusing to remove an unowned directory"
+                )
+            else:
+                print(f"worktree {worktree} already absent")
 
-        if target in registered_worktree_paths(root):
-            raise SystemExit(
-                f"error: worktree {worktree} remains registered after cleanup; "
-                "run remains active and non-done for cleanup retry"
-            )
-        if worktree.exists():
-            raise SystemExit(
-                f"error: worktree path {worktree} remains after cleanup; run "
-                "remains active and non-done for cleanup retry"
-            )
+            if target in registered_worktrees(root):
+                raise SystemExit(
+                    f"error: worktree {worktree} remains registered after "
+                    "cleanup; run remains active and non-done for cleanup retry"
+                )
+            if worktree.exists():
+                raise SystemExit(
+                    f"error: worktree path {worktree} remains after cleanup; "
+                    "run remains active and non-done for cleanup retry"
+                )
 
-    rundir = run_dir(args, run_id)
-    lock = acquire_lock(rundir)
-    try:
         data = read_state(spath)
         data["phase"] = "done"
         data["updated_at"] = now_utc()
         write_state(spath, data)
     finally:
-        release_lock(lock)
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
     print(f"phase set to 'done' for run '{run_id}'")
     print("active run retained for the /work merge handoff")
 

@@ -170,7 +170,7 @@ class GatedMergeTests(unittest.TestCase):
                 "--force-with-lease=refs/heads/"
                 f"feat/48-gated-self-merge:{self.head}"
             ),
-            "origin",
+            "https://github.com/aram-devdocs/sailwind_online.git",
             ":refs/heads/feat/48-gated-self-merge",
         ]
 
@@ -768,6 +768,42 @@ class GatedMergeTests(unittest.TestCase):
 
         self.assertIn(self.branch_delete_command(), runner.calls)
         self.assertTrue((self.runs_dir / "active").exists())
+        runner.assert_finished()
+
+    def test_atomic_delete_never_targets_misconfigured_origin(self):
+        responses = self.merged_retry_responses("CLOSED")
+        responses[-1] = (
+            self.branch_lookup_command(),
+            0,
+            self.branch_result(self.head),
+            "",
+        )
+        responses.extend(
+            [
+                (self.branch_delete_command(), 0, "", ""),
+                (
+                    self.branch_lookup_command(),
+                    0,
+                    self.branch_result(),
+                    "",
+                ),
+            ]
+        )
+        runner = FakeRunner(responses)
+
+        result = gated_merge.merge_completed_run(
+            self.runs_dir,
+            self.run_id,
+            runner=runner,
+            confirmation_attempts=1,
+            sleeper=lambda _: None,
+        )
+
+        self.assertTrue(result.merged)
+        self.assertIn(self.branch_delete_command(), runner.calls)
+        self.assertFalse(
+            any("origin" in call for call in runner.calls)
+        )
         runner.assert_finished()
 
         retry_responses = self.merged_retry_responses("CLOSED")

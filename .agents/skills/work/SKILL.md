@@ -168,9 +168,10 @@ confirms the PR is `MERGED` and polls the linked issue for bounded closure
 confirmation. Every external command has a fixed timeout and fails closed with
 the command purpose. It then independently queries the recorded remote feature
 ref. An absent ref succeeds. A ref still at the reviewed head is deleted with a
-SHA-bound `--force-with-lease` and queried again, so a move between lookup and
-deletion makes the atomic operation fail. A ref at any other commit is never
-deleted.
+SHA-bound `--force-with-lease` pushed directly to the HTTPS URL derived from the
+validated owner and repository, then queried again. Local `origin`
+configuration cannot redirect this mutation. A move between lookup and deletion
+makes the atomic operation fail. A ref at any other commit is never deleted.
 
 The merge command is retry-safe. If GitHub accepted the squash merge but a
 confirmation call failed or issue closure was delayed, rerun the same command.
