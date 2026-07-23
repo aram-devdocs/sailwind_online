@@ -35,6 +35,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the host sends its own Ping to each peer to measure RTT.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Default hard ceiling on live transport peers.
+pub const DEFAULT_MAX_PEERS: usize = 1_024;
+
+/// Default hard ceiling on live transport peers sharing one source IP.
+pub const DEFAULT_MAX_PEERS_PER_IP: usize = 16;
+
 /// .NET `DateTime` ticks (100 ns units) at the Unix epoch (1970-01-01).
 const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
 
@@ -83,12 +89,36 @@ pub struct Host {
     next_local_peer_id: i32,
     connect_key: String,
     timeout: Duration,
+    max_peers: usize,
+    max_peers_per_ip: usize,
     recv_buf: Box<[u8; RECV_BUFFER]>,
 }
 
 impl Host {
     /// Bind a non-blocking UDP host that accepts peers presenting `connect_key`.
     pub fn bind<A: ToSocketAddrs>(addr: A, connect_key: &str) -> io::Result<Host> {
+        Self::bind_with_limits(
+            addr,
+            connect_key,
+            DEFAULT_MAX_PEERS,
+            DEFAULT_MAX_PEERS_PER_IP,
+        )
+    }
+
+    /// Bind with hard global and per-source-IP live-peer ceilings.
+    pub fn bind_with_limits<A: ToSocketAddrs>(
+        addr: A,
+        connect_key: &str,
+        max_peers: usize,
+        max_peers_per_ip: usize,
+    ) -> io::Result<Host> {
+        if max_peers == 0 || max_peers_per_ip == 0 || max_peers_per_ip > max_peers {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "peer limits must be nonzero and per-IP must not exceed global",
+            ));
+        }
+
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
         Ok(Host {
@@ -99,6 +129,8 @@ impl Host {
             next_local_peer_id: 0,
             connect_key: connect_key.to_string(),
             timeout: DEFAULT_TIMEOUT,
+            max_peers,
+            max_peers_per_ip,
             recv_buf: Box::new([0u8; RECV_BUFFER]),
         })
     }
@@ -106,6 +138,11 @@ impl Host {
     /// The address the socket is actually bound to (useful when binding to port 0).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Return the remote address for a live peer.
+    pub fn peer_addr(&self, peer: PeerId) -> Option<SocketAddr> {
+        self.by_id.get(&peer).copied()
     }
 
     /// Number of currently connected peers.
@@ -224,6 +261,15 @@ impl Host {
             self.peers.remove(&addr);
             self.by_id.remove(&old_id);
             events.push(Event::Disconnected(old_id, DisconnectReason::Remote));
+        } else if self.peers.len() >= self.max_peers
+            || self
+                .peers
+                .keys()
+                .filter(|connected| connected.ip() == addr.ip())
+                .count()
+                >= self.max_peers_per_ip
+        {
+            return;
         }
 
         let id = self.next_id;
@@ -385,6 +431,60 @@ mod tests {
     fn connect_datagram(connect_time: i64, key: &str) -> Vec<u8> {
         let data = protocol::write_litenet_string(key);
         protocol::build_connect_request(0, connect_time, 7, 16, &data)
+    }
+
+    fn client_from(source_ip: &str, server_addr: SocketAddr) -> UdpSocket {
+        let client = UdpSocket::bind((source_ip, 0)).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.connect(server_addr).unwrap();
+        client
+    }
+
+    #[test]
+    fn peer_limits_bound_global_and_per_source_transport_state() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 3, 2).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let first = client_from("127.0.0.1", server_addr);
+        let second = client_from("127.0.0.1", server_addr);
+
+        first.send(&connect_datagram(1, "sailwind-online")).unwrap();
+        assert_eq!(server.poll(Instant::now()), vec![Event::Connected(1)]);
+        second
+            .send(&connect_datagram(2, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(Instant::now()), vec![Event::Connected(2)]);
+        assert_eq!(server.peer_count(), 2);
+
+        let same_source_excess = client_from("127.0.0.1", server_addr);
+        same_source_excess
+            .send(&connect_datagram(3, "sailwind-online"))
+            .unwrap();
+        assert!(server.poll(Instant::now()).is_empty());
+        assert_eq!(server.peer_count(), 2);
+
+        let other_source = client_from("127.0.0.2", server_addr);
+        other_source
+            .send(&connect_datagram(4, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(Instant::now()), vec![Event::Connected(3)]);
+        assert_eq!(server.peer_count(), 3);
+
+        let global_excess = client_from("127.0.0.2", server_addr);
+        global_excess
+            .send(&connect_datagram(5, "sailwind-online"))
+            .unwrap();
+        assert!(server.poll(Instant::now()).is_empty());
+        assert_eq!(server.peer_count(), 3);
+
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        first.recv(&mut accept).unwrap();
+        first.send(&connect_datagram(1, "sailwind-online")).unwrap();
+        assert!(server.poll(Instant::now()).is_empty());
+        assert_eq!(
+            first.recv(&mut accept).unwrap(),
+            protocol::CONNECT_ACCEPT_SIZE
+        );
+        assert_eq!(server.peer_count(), 3);
     }
 
     #[test]

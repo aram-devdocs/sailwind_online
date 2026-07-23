@@ -4,10 +4,11 @@ use crate::clock::{clock_from_epoch, WorldClock};
 use crate::codec::{self, BoatSnap, Caps, MooringSnap, PlayerSnap};
 use crate::config::Config;
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
-use crate::ratelimit::{GlobalRateLimiter, RateLimiter};
+use crate::ratelimit::{BoundedRateLimiter, GlobalRateLimiter, RateLimiter};
 use crate::validate;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,6 +65,8 @@ pub struct Server {
     weather_seed: u64,
     weather_epoch_day: u32,
     hello_limiter: RateLimiter,
+    source_session_limiter: BoundedRateLimiter<IpAddr>,
+    reconnect_limiter: RateLimiter,
     new_session_limiter: GlobalRateLimiter,
     trade_limiter: RateLimiter,
     client_state_limiter: RateLimiter,
@@ -92,9 +95,19 @@ impl Server {
         let weather_seed: u64 = seed_str.parse().unwrap_or(0);
         let weather_epoch_day = clock_from_epoch(epoch_ms, epoch_ms).day;
 
-        let host = Host::bind(&cfg.bind, CONNECT_KEY)?;
+        let host = Host::bind_with_limits(
+            &cfg.bind,
+            CONNECT_KEY,
+            cfg.max_transport_peers_usize(),
+            cfg.max_transport_peers_per_ip_usize(),
+        )?;
         let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let source_session_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_transport_peers_usize(),
+        );
+        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -116,6 +129,8 @@ impl Server {
             weather_seed,
             weather_epoch_day,
             hello_limiter,
+            source_session_limiter,
+            reconnect_limiter,
             new_session_limiter,
             trade_limiter,
             client_state_limiter,
@@ -332,7 +347,30 @@ impl Server {
             return Ok(());
         }
 
-        if !self.new_session_limiter.allow(admission_ms) {
+        let source_ip = match self.host.peer_addr(peer) {
+            Some(addr) => addr.ip(),
+            #[cfg(test)]
+            None => test_peer_ip(peer),
+            #[cfg(not(test))]
+            None => return Ok(()),
+        };
+        if !self.source_session_limiter.allow(source_ip, admission_ms) {
+            self.reject_hello(peer, "server busy; retry");
+            return Ok(());
+        }
+
+        let active_player_id = self
+            .sessions
+            .values()
+            .find(|session| session.identity_hash == identity_hash)
+            .map(|session| session.player_id);
+        if active_player_id
+            .is_some_and(|player_id| !self.reconnect_limiter.allow(player_id, admission_ms))
+        {
+            self.reject_hello(peer, "server busy; retry");
+            return Ok(());
+        }
+        if active_player_id.is_none() && !self.new_session_limiter.allow(admission_ms) {
             self.reject_hello(peer, "server busy; retry");
             return Ok(());
         }
@@ -350,6 +388,9 @@ impl Server {
             }
         };
         let player_id = player.id as u64;
+        if active_player_id.is_none() {
+            let _ = self.reconnect_limiter.allow(player_id, admission_ms);
+        }
 
         // Drop any prior session for this identity (reconnect from a new peer).
         let stale: Vec<PeerId> = self
@@ -758,6 +799,7 @@ impl Server {
             // departed player's entries are useless and leaving them behind would
             // let connection churn accrete stale entries in the limiter maps.
             self.trade_limiter.clear(s.player_id);
+            self.reconnect_limiter.clear(s.player_id);
             self.client_state_limiter.clear(s.player_id);
             self.chat_limiter.clear(s.player_id);
             self.econ_limiter.clear(s.player_id);
@@ -968,6 +1010,11 @@ fn token_hash(token: &str) -> String {
     format!("{h:016x}")
 }
 
+#[cfg(test)]
+fn test_peer_ip(peer: PeerId) -> IpAddr {
+    IpAddr::V6(std::net::Ipv6Addr::from(u128::from(peer) + 1))
+}
+
 fn validate_hello_string<'a>(
     value: Option<&'a str>,
     field: &str,
@@ -1015,7 +1062,13 @@ mod handshake_tests {
         let cfg = Config::default();
         let world = World::new(Grid::new(cfg.cell_size_m));
         Server {
-            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            host: Host::bind_with_limits(
+                "127.0.0.1:0",
+                CONNECT_KEY,
+                cfg.max_transport_peers_usize(),
+                cfg.max_transport_peers_per_ip_usize(),
+            )
+            .unwrap(),
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
@@ -1027,6 +1080,11 @@ mod handshake_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter: RateLimiter::new(cfg.hello_min_interval_ms_i64()),
+            source_session_limiter: BoundedRateLimiter::new(
+                cfg.hello_min_interval_ms_i64(),
+                cfg.max_transport_peers_usize(),
+            ),
+            reconnect_limiter: RateLimiter::new(cfg.hello_min_interval_ms_i64()),
             new_session_limiter: GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64()),
             trade_limiter: RateLimiter::new(cfg.trade_min_interval_ms_i64()),
             client_state_limiter: RateLimiter::new(cfg.client_state_min_interval_ms_i64()),
@@ -1200,7 +1258,11 @@ mod handshake_tests {
     }
 
     fn connect_peer(server: &mut Server) -> (UdpSocket, PeerId) {
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        connect_peer_from(server, "127.0.0.1")
+    }
+
+    fn connect_peer_from(server: &mut Server, source_ip: &str) -> (UdpSocket, PeerId) {
+        let client = UdpSocket::bind((source_ip, 0)).unwrap();
         client.connect(server.host.local_addr().unwrap()).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1534,7 +1596,11 @@ mod handshake_tests {
             Some("surface-hash"),
             sw_contracts::PROTOCOL_VERSION,
         );
-        let observer_admission_ms = 1_000 + server.cfg.new_session_min_interval_ms_i64();
+        let observer_admission_ms = 1_000
+            + server
+                .cfg
+                .hello_min_interval_ms_i64()
+                .max(server.cfg.new_session_min_interval_ms_i64());
         deliver_hello_at(
             &mut server,
             observer_peer,
@@ -1618,7 +1684,11 @@ mod handshake_tests {
             Some("surface-hash"),
             sw_contracts::PROTOCOL_VERSION,
         );
-        let observer_admission_ms = 1_000 + server.cfg.new_session_min_interval_ms_i64();
+        let observer_admission_ms = 1_000
+            + server
+                .cfg
+                .hello_min_interval_ms_i64()
+                .max(server.cfg.new_session_min_interval_ms_i64());
         deliver_hello_at(
             &mut server,
             observer_peer,
@@ -1723,8 +1793,11 @@ mod handshake_tests {
         assert_eq!(receive_server_hello(&first_client), (true, String::new()));
 
         let (replacement_client, replacement_peer) = connect_peer(&mut server);
-        let replacement_admission_ms =
-            first_admission_ms + server.cfg.new_session_min_interval_ms_i64();
+        let replacement_admission_ms = first_admission_ms
+            + server
+                .cfg
+                .hello_min_interval_ms_i64()
+                .max(server.cfg.new_session_min_interval_ms_i64());
         deliver_hello_at(
             &mut server,
             replacement_peer,
@@ -1761,6 +1834,89 @@ mod handshake_tests {
             .unwrap();
         assert!(!server.superseded_peers.contains(&first_peer));
         assert_eq!(server.sessions[&replacement_peer].player_id, player_id);
+    }
+
+    #[test]
+    fn same_identity_port_rotation_does_not_starve_another_source() {
+        let mut server = make_server();
+        let (first_client, first_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let returning = hello_envelope(
+            "returning-identity-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let first_admission_ms = 1_000;
+        deliver_hello_at(&mut server, first_peer, &returning, first_admission_ms);
+        assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+
+        let (replacement_client, replacement_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let (other_client, other_peer) = connect_peer_from(&mut server, "127.0.0.2");
+        let next_admission_ms = first_admission_ms
+            + server
+                .cfg
+                .hello_min_interval_ms_i64()
+                .max(server.cfg.new_session_min_interval_ms_i64());
+
+        deliver_hello_at(&mut server, replacement_peer, &returning, next_admission_ms);
+        assert_eq!(
+            receive_server_hello(&replacement_client),
+            (true, String::new())
+        );
+
+        let other = hello_envelope(
+            "other-source-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, other_peer, &other, next_admission_ms);
+
+        assert_eq!(receive_server_hello(&other_client), (true, String::new()));
+        assert_eq!(server.sessions.len(), 2);
+        assert!(!server.sessions.contains_key(&first_peer));
+        assert!(server.sessions.contains_key(&replacement_peer));
+        assert!(server.sessions.contains_key(&other_peer));
+    }
+
+    #[test]
+    fn one_source_cannot_monopolize_new_identity_admission() {
+        let mut server = make_server();
+        let (first_client, first_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let first = hello_envelope(
+            "first-source-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let first_admission_ms = 1_000;
+        deliver_hello_at(&mut server, first_peer, &first, first_admission_ms);
+        assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+
+        let (rotated_client, rotated_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let rotated = hello_envelope(
+            "rotated-source-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let (other_client, other_peer) = connect_peer_from(&mut server, "127.0.0.2");
+        let next_global_ms = first_admission_ms + server.cfg.new_session_min_interval_ms_i64();
+
+        deliver_hello_at(&mut server, rotated_peer, &rotated, next_global_ms);
+        assert_eq!(
+            receive_server_hello(&rotated_client),
+            (false, "server busy; retry".to_string())
+        );
+
+        let other = hello_envelope(
+            "other-source-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, other_peer, &other, next_global_ms);
+
+        assert_eq!(receive_server_hello(&other_client), (true, String::new()));
+        assert_eq!(server.sessions.len(), 2);
+        assert!(server.sessions.contains_key(&first_peer));
+        assert!(!server.sessions.contains_key(&rotated_peer));
+        assert!(server.sessions.contains_key(&other_peer));
     }
 
     #[test]
@@ -1869,7 +2025,10 @@ mod handshake_tests {
     fn player_capacity_refuses_new_identity_without_state_and_allows_reconnect() {
         let mut server = make_server();
         server.cfg.max_player_rows = 1;
-        let interval = server.cfg.new_session_min_interval_ms_i64();
+        let interval = server
+            .cfg
+            .hello_min_interval_ms_i64()
+            .max(server.cfg.new_session_min_interval_ms_i64());
 
         let (first_client, first_peer) = connect_peer(&mut server);
         let first = hello_envelope(
@@ -2061,6 +2220,11 @@ mod aoi_harden_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let source_session_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_transport_peers_usize(),
+        );
+        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -2068,7 +2232,13 @@ mod aoi_harden_tests {
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
         let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
-            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            host: Host::bind_with_limits(
+                "127.0.0.1:0",
+                CONNECT_KEY,
+                cfg.max_transport_peers_usize(),
+                cfg.max_transport_peers_per_ip_usize(),
+            )
+            .unwrap(),
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
@@ -2080,6 +2250,8 @@ mod aoi_harden_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter,
+            source_session_limiter,
+            reconnect_limiter,
             new_session_limiter,
             trade_limiter,
             client_state_limiter,
@@ -2262,6 +2434,11 @@ mod market_dispatch_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let source_session_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_transport_peers_usize(),
+        );
+        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -2269,7 +2446,13 @@ mod market_dispatch_tests {
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
         let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
-            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            host: Host::bind_with_limits(
+                "127.0.0.1:0",
+                CONNECT_KEY,
+                cfg.max_transport_peers_usize(),
+                cfg.max_transport_peers_per_ip_usize(),
+            )
+            .unwrap(),
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
@@ -2281,6 +2464,8 @@ mod market_dispatch_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter,
+            source_session_limiter,
+            reconnect_limiter,
             new_session_limiter,
             trade_limiter,
             client_state_limiter,
@@ -2496,6 +2681,11 @@ mod input_hardening_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let source_session_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_transport_peers_usize(),
+        );
+        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -2503,7 +2693,13 @@ mod input_hardening_tests {
         let econ_limiter = RateLimiter::new(cfg.econ_min_interval_ms_i64());
         let moor_limiter = RateLimiter::new(cfg.moor_min_interval_ms_i64());
         Server {
-            host: Host::bind("127.0.0.1:0", CONNECT_KEY).unwrap(),
+            host: Host::bind_with_limits(
+                "127.0.0.1:0",
+                CONNECT_KEY,
+                cfg.max_transport_peers_usize(),
+                cfg.max_transport_peers_per_ip_usize(),
+            )
+            .unwrap(),
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
@@ -2515,6 +2711,8 @@ mod input_hardening_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter,
+            source_session_limiter,
+            reconnect_limiter,
             new_session_limiter,
             trade_limiter,
             client_state_limiter,

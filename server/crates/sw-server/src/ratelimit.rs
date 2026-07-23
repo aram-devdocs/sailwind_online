@@ -14,7 +14,8 @@
 //! [`crate::config::Config::trade_min_interval_ms_i64`]), so the window math
 //! never overflows.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
+use std::hash::Hash;
 
 /// One process-wide minimum-interval gate with constant memory.
 #[derive(Debug)]
@@ -113,6 +114,67 @@ impl RateLimiter {
     #[cfg(test)]
     pub fn last_accepted_ms(&self, key: u64) -> Option<i64> {
         self.last.get(&key).copied()
+    }
+}
+
+/// A minimum-interval throttle with a hard ceiling on tracked keys.
+///
+/// When the key budget is full, a new key may replace only the oldest entry
+/// whose cooldown has elapsed. This retains disconnect churn protection
+/// without allowing the limiter itself to grow beyond `max_keys`.
+#[derive(Debug)]
+pub struct BoundedRateLimiter<K> {
+    min_interval_ms: i64,
+    max_keys: usize,
+    last: HashMap<K, i64>,
+    oldest: BTreeSet<(i64, K)>,
+}
+
+impl<K> BoundedRateLimiter<K>
+where
+    K: Clone + Eq + Hash + Ord,
+{
+    /// Build a bounded per-key limiter.
+    pub fn new(min_interval_ms: i64, max_keys: usize) -> BoundedRateLimiter<K> {
+        BoundedRateLimiter {
+            min_interval_ms,
+            max_keys,
+            last: HashMap::new(),
+            oldest: BTreeSet::new(),
+        }
+    }
+
+    /// Admit a key after its cooldown while retaining at most `max_keys`.
+    pub fn allow(&mut self, key: K, now_ms: i64) -> bool {
+        if self.min_interval_ms <= 0 {
+            return true;
+        }
+
+        if let Some(&last_ms) = self.last.get(&key) {
+            if now_ms.saturating_sub(last_ms) < self.min_interval_ms {
+                return false;
+            }
+            self.oldest.remove(&(last_ms, key.clone()));
+        } else if self.last.len() >= self.max_keys {
+            let Some((oldest_ms, oldest_key)) = self.oldest.first().cloned() else {
+                return false;
+            };
+            if now_ms.saturating_sub(oldest_ms) < self.min_interval_ms {
+                return false;
+            }
+            self.oldest.remove(&(oldest_ms, oldest_key.clone()));
+            self.last.remove(&oldest_key);
+        }
+
+        self.last.insert(key.clone(), now_ms);
+        self.oldest.insert((now_ms, key));
+        true
+    }
+
+    /// Number of retained keys.
+    #[cfg(test)]
+    pub fn tracked_count(&self) -> usize {
+        self.last.len()
     }
 }
 
@@ -220,5 +282,28 @@ mod tests {
         assert!(!limiter.allow(900));
         assert!(!limiter.allow(1_249));
         assert!(limiter.allow(1_250));
+    }
+
+    #[test]
+    fn bounded_limiter_rejects_new_keys_until_an_entry_expires() {
+        let mut limiter = BoundedRateLimiter::new(250, 2);
+        assert!(limiter.allow(1, 1_000));
+        assert!(limiter.allow(2, 1_001));
+        assert!(!limiter.allow(3, 1_249));
+        assert_eq!(limiter.tracked_count(), 2);
+
+        assert!(limiter.allow(3, 1_250));
+        assert_eq!(limiter.tracked_count(), 2);
+        assert!(!limiter.allow(3, 1_251));
+    }
+
+    #[test]
+    fn bounded_limiter_never_exceeds_its_key_budget_under_churn() {
+        let mut limiter = BoundedRateLimiter::new(1, 4);
+        for key in 0..10_000 {
+            assert!(limiter.allow(key, key as i64));
+            assert!(limiter.tracked_count() <= 4);
+        }
+        assert_eq!(limiter.tracked_count(), 4);
     }
 }

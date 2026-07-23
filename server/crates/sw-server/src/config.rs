@@ -45,6 +45,9 @@ const MIN_HELLO_MIN_INTERVAL_MS: u32 = 1;
 /// the next scheduled hello.
 pub const MAX_NEW_SESSION_MIN_INTERVAL_MS: u32 = 250;
 
+/// Highest configurable live transport-peer ceiling.
+pub const MAX_TRANSPORT_PEERS: u32 = 65_535;
+
 /// Highest configurable persistent player-row ceiling. The server still uses
 /// the operator's lower configured value; this only prevents an accidental
 /// effectively-unbounded cap.
@@ -79,14 +82,22 @@ pub struct Config {
     /// Minimum interval, in milliseconds, between two processed `ClientHello`
     /// messages from the same peer. A flood beyond this rate is dropped before
     /// validation, persistence, or response generation. The 250 ms default
-    /// matches the client's handshake retry cadence. Bounded to
+    /// matches the client's handshake retry cadence. The same interval bounds
+    /// session admissions from one source IP. Bounded to
     /// `1..=`[`MAX_HELLO_MIN_INTERVAL_MS`].
     pub hello_min_interval_ms: u32,
     /// Process-wide minimum interval, in milliseconds, between database
-    /// admissions for sessions not already established on their peer. This
-    /// constant-memory gate bounds connection/token rotation across peer IDs.
-    /// Bounded to `1..=`[`MAX_NEW_SESSION_MIN_INTERVAL_MS`].
+    /// admissions for identities without an active session. Active-identity
+    /// reconnects use a separate per-player gate, so they cannot consume every
+    /// new-identity window. Bounded to
+    /// `1..=`[`MAX_NEW_SESSION_MIN_INTERVAL_MS`].
     pub new_session_min_interval_ms: u32,
+    /// Hard ceiling on all live transport peers, including pre-authentication
+    /// peers. Bounded to `1..=`[`MAX_TRANSPORT_PEERS`].
+    pub max_transport_peers: u32,
+    /// Hard ceiling on live transport peers sharing a source IP. Must not
+    /// exceed [`Config::max_transport_peers`].
+    pub max_transport_peers_per_ip: u32,
     /// Hard ceiling on persistent rows in the `players` table. Existing
     /// identities may reconnect at capacity; new identities are refused.
     /// Bounded to `1..=`[`MAX_PLAYER_ROWS`].
@@ -137,6 +148,8 @@ impl Default for Config {
             cell_size_m: sw_world::Grid::DEFAULT_CELL_SIZE_M,
             hello_min_interval_ms: 250,
             new_session_min_interval_ms: 30,
+            max_transport_peers: sw_net::DEFAULT_MAX_PEERS as u32,
+            max_transport_peers_per_ip: sw_net::DEFAULT_MAX_PEERS_PER_IP as u32,
             max_player_rows: 10_000,
             trade_min_interval_ms: 250,
             client_state_min_interval_ms: 20,
@@ -243,6 +256,18 @@ impl Config {
                 "new_session_min_interval_ms must be in {MIN_HELLO_MIN_INTERVAL_MS}..={MAX_NEW_SESSION_MIN_INTERVAL_MS}"
             ));
         }
+        if self.max_transport_peers == 0 || self.max_transport_peers > MAX_TRANSPORT_PEERS {
+            return Err(anyhow::anyhow!(
+                "max_transport_peers must be in 1..={MAX_TRANSPORT_PEERS}"
+            ));
+        }
+        if self.max_transport_peers_per_ip == 0
+            || self.max_transport_peers_per_ip > self.max_transport_peers
+        {
+            return Err(anyhow::anyhow!(
+                "max_transport_peers_per_ip must be in 1..=max_transport_peers"
+            ));
+        }
         if self.max_player_rows == 0 || self.max_player_rows > MAX_PLAYER_ROWS {
             return Err(anyhow::anyhow!(
                 "max_player_rows must be in 1..={MAX_PLAYER_ROWS}"
@@ -299,6 +324,17 @@ impl Config {
     pub fn new_session_min_interval_ms_i64(&self) -> i64 {
         self.new_session_min_interval_ms
             .clamp(MIN_HELLO_MIN_INTERVAL_MS, MAX_NEW_SESSION_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Global live-peer ceiling with a defense-in-depth clamp.
+    pub fn max_transport_peers_usize(&self) -> usize {
+        self.max_transport_peers.clamp(1, MAX_TRANSPORT_PEERS) as usize
+    }
+
+    /// Per-source-IP live-peer ceiling with a defense-in-depth clamp.
+    pub fn max_transport_peers_per_ip_usize(&self) -> usize {
+        self.max_transport_peers_per_ip
+            .clamp(1, self.max_transport_peers.clamp(1, MAX_TRANSPORT_PEERS)) as usize
     }
 
     /// Persistent player-row ceiling with a defense-in-depth clamp.
@@ -724,6 +760,8 @@ mod tests {
     fn parses_new_hardening_keys() {
         let toml_text = r#"
             new_session_min_interval_ms = 125
+            max_transport_peers = 2048
+            max_transport_peers_per_ip = 24
             max_player_rows = 5000
             client_state_min_interval_ms = 33
             chat_min_interval_ms = 750
@@ -733,6 +771,8 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(cfg.new_session_min_interval_ms, 125);
+        assert_eq!(cfg.max_transport_peers, 2048);
+        assert_eq!(cfg.max_transport_peers_per_ip, 24);
         assert_eq!(cfg.max_player_rows, 5000);
         assert_eq!(cfg.client_state_min_interval_ms, 33);
         assert_eq!(cfg.chat_min_interval_ms, 750);
@@ -747,6 +787,11 @@ mod tests {
         let cfg = Config::default();
         cfg.validate().unwrap();
         assert_eq!(cfg.new_session_min_interval_ms, 30);
+        assert_eq!(cfg.max_transport_peers, sw_net::DEFAULT_MAX_PEERS as u32);
+        assert_eq!(
+            cfg.max_transport_peers_per_ip,
+            sw_net::DEFAULT_MAX_PEERS_PER_IP as u32
+        );
         assert_eq!(cfg.max_player_rows, 10_000);
         assert_eq!(
             cfg.new_session_min_interval_ms_i64(),
@@ -774,12 +819,34 @@ mod tests {
                 "player-row capacity {value} must be rejected"
             );
         }
+        for value in [0, MAX_TRANSPORT_PEERS + 1, u32::MAX] {
+            let invalid = Config {
+                max_transport_peers: value,
+                ..Config::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "transport-peer capacity {value} must be rejected"
+            );
+        }
+        for value in [0, Config::default().max_transport_peers + 1, u32::MAX] {
+            let invalid = Config {
+                max_transport_peers_per_ip: value,
+                ..Config::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "per-IP transport-peer capacity {value} must be rejected"
+            );
+        }
     }
 
     #[test]
     fn new_session_budget_accessors_clamp_bypassed_validation() {
         let invalid = Config {
             new_session_min_interval_ms: u32::MAX,
+            max_transport_peers: u32::MAX,
+            max_transport_peers_per_ip: u32::MAX,
             max_player_rows: u32::MAX,
             ..Config::default()
         };
@@ -788,6 +855,14 @@ mod tests {
             i64::from(MAX_NEW_SESSION_MIN_INTERVAL_MS)
         );
         assert_eq!(invalid.max_player_rows_u32(), MAX_PLAYER_ROWS);
+        assert_eq!(
+            invalid.max_transport_peers_usize(),
+            MAX_TRANSPORT_PEERS as usize
+        );
+        assert_eq!(
+            invalid.max_transport_peers_per_ip_usize(),
+            MAX_TRANSPORT_PEERS as usize
+        );
     }
 
     #[test]
