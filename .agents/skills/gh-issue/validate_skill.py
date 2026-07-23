@@ -29,6 +29,7 @@ REQUIRED_SUBCOMMANDS = (
     "get-state",
     "set-active",
     "clear-active",
+    "record-reviewed-head",
     "validate-resume",
     "poll-pr",
     "cleanup-worktree",

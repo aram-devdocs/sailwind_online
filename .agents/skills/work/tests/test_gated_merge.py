@@ -42,6 +42,7 @@ class GatedMergeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.runs_dir = Path(self.temp.name)
         self.write_state()
+        self.write_reviewed_head()
 
     def tearDown(self):
         self.temp.cleanup()
@@ -66,6 +67,14 @@ class GatedMergeTests(unittest.TestCase):
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "state.json").write_text(
             json.dumps(state), encoding="utf-8"
+        )
+
+    def write_reviewed_head(self, head=None):
+        run_dir = self.runs_dir / self.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "reviewed-head").write_text(
+            (head or self.head) + "\n",
+            encoding="utf-8",
         )
 
     def pr_view_command(self):
@@ -289,6 +298,50 @@ class GatedMergeTests(unittest.TestCase):
                         self.runs_dir, self.run_id, runner=runner
                     )
                 self.assertEqual(runner.calls, [])
+
+    def test_rejects_missing_or_malformed_reviewed_head_before_gh(self):
+        marker = self.runs_dir / self.run_id / "reviewed-head"
+        for label, value in {
+            "missing": None,
+            "malformed": "not-a-commit\n",
+        }.items():
+            with self.subTest(label=label):
+                if value is None:
+                    marker.unlink(missing_ok=True)
+                else:
+                    marker.write_text(value, encoding="utf-8")
+                runner = FakeRunner([])
+                with self.assertRaises(gated_merge.MergePreconditionError):
+                    gated_merge.merge_completed_run(
+                        self.runs_dir,
+                        self.run_id,
+                        runner=runner,
+                    )
+                self.assertEqual(runner.calls, [])
+
+    def test_rejects_pr_head_that_differs_from_reviewed_head(self):
+        responses = self.success_responses()
+        responses[1] = (
+            self.pr_view_command(),
+            0,
+            self.open_pr(headRefOid="b" * 40),
+            "",
+        )
+        runner = FakeRunner(responses)
+
+        with self.assertRaisesRegex(
+            gated_merge.MergePreconditionError,
+            "reviewed head",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=runner,
+            )
+
+        self.assertFalse(
+            any(call[:3] == ["gh", "pr", "merge"] for call in runner.calls)
+        )
 
     def test_rejects_each_remote_pr_mismatch_without_merging(self):
         cases = {

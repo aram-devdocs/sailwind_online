@@ -69,7 +69,10 @@ not memory, so a run that died mid-task recovers cleanly. The full loop is in
    dispatches the subagents below and drives the per-issue lifecycle in
    `.agents/skills/gh-issue`.
 4. Review, verify, open the PR. It runs the fixed review gates in order, makes
-   `make validate` pass, opens the PR, and keeps it green.
+   `make validate` pass, opens the PR, and keeps it green. Before the four
+   reviewers run, the state machine records the clean commit in
+   `reviewed-head` and clears old verdicts. Any later commit requires all four
+   reviews again.
 5. Recheck and merge. After `/gh-issue` reaches `done`, `/work` reads that
    completed run and requires `plan_open=0` plus four `APPROVE` verdicts. Its
    deterministic merge script verifies the recorded PR is open, not a draft,
@@ -126,12 +129,14 @@ MUST call `.agents/skills/work/scripts/gated_merge.py`, because a single
 deterministic path prevents a conversational shortcut around the gates.
 
 The script accepts only a completed run with no open plan items and four
-`APPROVE` review verdicts. The required CI `gate` is tied to the current PR head
-and mirrors `make validate`; the script reads the head again immediately before
+`APPROVE` review verdicts. It also requires the current PR head to equal the
+state-machine-owned `reviewed-head`, so a CI-fix commit cannot inherit verdicts
+for an older diff. The required CI `gate` is tied to that same PR head and
+mirrors `make validate`; the script reads the head again immediately before
 merging and gives it to GitHub as the expected head commit. GitHub refuses the
 merge if the branch changed in that interval. A successful run squash-merges,
-deletes the remote feature branch, confirms the PR is `MERGED`, and confirms the
-linked issue is `CLOSED`.
+deletes the remote feature branch, confirms the PR is `MERGED`, and confirms
+the linked issue is `CLOSED`.
 
 Any mismatch prints the exact failure and stops. `/work` does not merge a
 different PR, repair state by hand, or select another issue in that invocation.

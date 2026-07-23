@@ -43,6 +43,7 @@ Subcommands
     set-active RUN_ID
     clear-active
     validate-resume
+    record-reviewed-head [--run-id RUN_ID]
     poll-pr
     cleanup-worktree [--no-git]
 
@@ -56,6 +57,7 @@ Stdlib only: json, argparse, os, subprocess, time, pathlib.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -143,6 +145,10 @@ def run_dir(args, run_id):
 
 def state_path(args, run_id):
     return run_dir(args, run_id) / "state.json"
+
+
+def reviewed_head_path(args, run_id):
+    return run_dir(args, run_id) / "reviewed-head"
 
 
 def active_path(args):
@@ -364,6 +370,89 @@ def cmd_get_state(args):
         print(data[args.key])
     else:
         print(json.dumps(data, indent=2))
+
+
+def cmd_record_reviewed_head(args):
+    """Bind a clean worktree head to a fresh set of review verdicts."""
+    if args.head and not args.no_git:
+        raise SystemExit("error: --head requires --no-git (test seam only)")
+
+    run_id = resolve_run_id(args)
+    spath = state_path(args, run_id)
+    data = read_state(spath)
+    if data.get("phase") != "review":
+        raise SystemExit(
+            f"error: reviewed head can only be recorded in phase 'review'; "
+            f"run '{run_id}' is at {data.get('phase')!r}"
+        )
+
+    if args.no_git:
+        head = args.head or ""
+    else:
+        root = repo_root()
+        worktree = root / data.get("worktree", "")
+        rc, dirty, err = run_cmd(
+            ["git", "status", "--porcelain"],
+            cwd=str(worktree),
+        )
+        if rc != 0:
+            raise SystemExit(
+                f"error: cannot inspect review worktree {worktree}: "
+                f"{err or dirty}"
+            )
+        if dirty:
+            raise SystemExit(
+                f"error: review worktree {worktree} is dirty; commit the exact "
+                "reviewed content first"
+            )
+        rc, branch, err = run_cmd(
+            ["git", "branch", "--show-current"],
+            cwd=str(worktree),
+        )
+        if rc != 0 or branch != data.get("branch"):
+            raise SystemExit(
+                f"error: review worktree branch must be "
+                f"{data.get('branch')!r}, found {branch!r}: {err}"
+            )
+        rc, head, err = run_cmd(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=str(worktree),
+        )
+        if rc != 0:
+            raise SystemExit(
+                f"error: cannot resolve review head in {worktree}: {err}"
+            )
+
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+        raise SystemExit(
+            "error: reviewed head must be a 40-character hexadecimal commit"
+        )
+    head = head.lower()
+
+    rundir = run_dir(args, run_id)
+    lock = acquire_lock(rundir)
+    try:
+        data = read_state(spath)
+        if data.get("phase") != "review":
+            raise SystemExit(
+                f"error: run '{run_id}' left review phase before the head "
+                "could be recorded"
+            )
+        for gate in GATE_ORDER:
+            data[f"gate_{gate}"] = ""
+        data["updated_at"] = now_utc()
+        write_state(spath, data)
+
+        marker = reviewed_head_path(args, run_id)
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(head + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(marker))
+    finally:
+        release_lock(lock)
+    print(
+        f"recorded reviewed head {head} for run '{run_id}'; "
+        "cleared all review verdicts"
+    )
 
 
 def cmd_set_active(args):
@@ -598,6 +687,22 @@ def build_parser():
 
     sp = sub.add_parser("clear-active", help="remove the active marker")
     sp.set_defaults(func=cmd_clear_active)
+
+    sp = sub.add_parser(
+        "record-reviewed-head",
+        help="bind a clean commit to a fresh set of review verdicts",
+    )
+    sp.add_argument("--run-id", help="target run (default: the active run)")
+    sp.add_argument(
+        "--no-git",
+        action="store_true",
+        help="skip worktree inspection (tests only; requires --head)",
+    )
+    sp.add_argument(
+        "--head",
+        help="reviewed commit override (tests only; requires --no-git)",
+    )
+    sp.set_defaults(func=cmd_record_reviewed_head)
 
     sp = sub.add_parser(
         "validate-resume",

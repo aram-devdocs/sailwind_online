@@ -44,8 +44,9 @@ condition, recorded through the state machine, before the next begins.
 - **verify** Run `make validate` (the canonical gate). Attempt cap: three fix
   cycles on the same failure, then escalate. Never `--no-verify`, never weaken
   a test to go green. Exit: `make validate` passes locally.
-- **review** Run the four review gates in fixed order (see below). Exit: all
-  four verdicts recorded and none is REJECT / unaddressed REQUEST-CHANGES.
+- **review** Record the reviewed head, then run the four review gates in fixed
+  order (see below). Exit: all four verdicts apply to the recorded commit and
+  none is REJECT / unaddressed REQUEST-CHANGES.
 - **pr** Push the branch and open a PR to `dev` with a Conventional Commit
   title and `Fixes #<N>` in the body. Record the PR with
   `update-state --key pr`. Exit: PR exists and is recorded.
@@ -102,6 +103,16 @@ read-only:
 
     02-spec-reviewer -> 03-code-quality-reviewer -> 04-architecture-validator -> 05-security-auditor
 
+Before dispatching `02-spec-reviewer`, bind the clean worktree commit and clear
+every prior verdict:
+
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py record-reviewed-head
+
+This command MUST run through the state machine, because the `reviewed-head`
+companion marker is the durable proof that all four verdicts apply to one exact
+commit. Any commit after the marker is recorded invalidates the review set:
+return to `review`, record the new head, and run all four reviewers again.
+
 Each emits a verdict line beginning APPROVE, REQUEST-CHANGES, or REJECT. The
 `review-gate-tracker` hook records each verdict into `state.json` as
 `gate_spec`, `gate_quality`, `gate_architecture`, `gate_security` so the
@@ -126,6 +137,8 @@ dead-run failure.
 
 - The orchestrator delegates; it does not implement (dispatch `01-implementer`).
 - Reviewers are read-only; never let a reviewer edit the work it judges.
-- The run does NOT merge its own PR. Merging is a separate, human-gated step.
+- The `/gh-issue` run does NOT merge its own PR. The top-level `/work` wrapper
+  owns the post-CI merge and may proceed only after its separate merge gate
+  proves the PR head equals this run's `reviewed-head`.
 - One issue per run. File a new issue for adjacent problems; do not fix them
   silently.

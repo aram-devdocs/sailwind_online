@@ -143,6 +143,22 @@ def parse_recorded_pr(value):
     )
 
 
+def load_reviewed_head(runs_dir, run_id):
+    """Read the state-machine-owned commit approved by all four reviewers."""
+    marker = Path(runs_dir) / run_id / "reviewed-head"
+    try:
+        head = marker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise MergePreconditionError(
+            f"cannot read state-machine reviewed head at {marker}: {exc}"
+        ) from exc
+    if not HEAD_OID_RE.fullmatch(head):
+        raise MergePreconditionError(
+            f"state-machine reviewed head is invalid: {head!r}"
+        )
+    return head.lower()
+
+
 def repository_name(runner):
     result = runner(["gh", "repo", "view", "--json", "nameWithOwner"])
     data = read_json_result(
@@ -391,6 +407,7 @@ def confirm_merged(runner, pr_number, issue_number, repo):
 def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
     """Validate, squash-merge, delete the branch, and confirm closure."""
     state = load_state(runs_dir, run_id)
+    reviewed_head = load_reviewed_head(runs_dir, run_id)
     issue_number = int(state["issue"])
     pr_number, recorded_repo = parse_recorded_pr(state.get("pr", ""))
     repo = repository_name(runner)
@@ -406,6 +423,11 @@ def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
         pr_number,
         state["branch"],
     )
+    if head_oid.lower() != reviewed_head:
+        raise MergePreconditionError(
+            f"PR #{pr_number} head {head_oid} does not match reviewed head "
+            f"{reviewed_head}; all four reviewers must approve the exact head"
+        )
     validate_closure_reference(
         runner,
         pr_number,

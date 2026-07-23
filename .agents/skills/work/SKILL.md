@@ -114,6 +114,11 @@ Then run the `/gh-issue` lifecycle: investigate -> plan -> implement -> verify
 `gh_issue_run.py`; the `implement` phase dispatches `01-implementer` (the
 orchestrator never edits files); the `review` phase runs `02` -> `03` -> `04`
 -> `05` in the fixed order with each verdict recorded through the state machine.
+Immediately before `02`, run `gh_issue_run.py record-reviewed-head`; it binds
+the clean worktree commit and clears every old verdict. Any later commit,
+including a CI fix, MUST return to `review`, record the new head, and rerun all
+four reviewers, because verdicts for an earlier commit cannot authorize the
+merge.
 `make validate` is the canonical gate and MUST pass locally before the PR.
 Attempt cap: three fix cycles on the same failure, then Escalate.
 
@@ -141,12 +146,13 @@ run reaches `done`, `/work` owns the merge:
 The script MUST be the only merge path in this loop, because it binds the
 operation to the completed run rather than trusting conversational memory. It
 requires `phase=done`, `plan_open=0`, all four recorded verdicts equal to
-`APPROVE`, and an issue, branch, and PR that exactly match the run. It then
-rechecks through `gh` that the PR is open, not a draft, targets `dev`, comes
-from the recorded branch, links the recorded issue for closure, reports
-`mergeStateStatus=CLEAN`, and has no pending or failed required checks. The
-required `gate` check proves the current PR head passed the CI mirror of
-`make validate`.
+`APPROVE`, a state-machine-owned `reviewed-head`, and an issue, branch, and PR
+that exactly match the run. It then rechecks through `gh` that the PR is open,
+not a draft, targets `dev`, comes from the recorded branch, links the recorded
+issue for closure, reports `mergeStateStatus=CLEAN`, and has no pending or
+failed required checks. The PR head MUST equal `reviewed-head`, because every
+review verdict must cover the exact commit merged. The required `gate` check
+proves that same PR head passed the CI mirror of `make validate`.
 
 Immediately before merging, the script reads the PR again and refuses a changed
 head. It passes that exact head to `gh pr merge --match-head-commit`, uses

@@ -34,6 +34,25 @@ non-string value.
 A freshly initialized run has `phase=investigate`, empty gates, empty `pr`,
 empty `plan_open`, and `branch`/`worktree` derived from `run_id`.
 
+### Reviewed-head companion
+
+The flat schema stays unchanged. The state machine writes the reviewed commit
+to `.agents/runs/<run_id>/reviewed-head` immediately before the fixed review
+sequence:
+
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py record-reviewed-head
+
+The command requires the recorded worktree to be clean, on the recorded branch,
+and in `phase=review`. Under the run's single-writer lock it clears all four
+`gate_*` verdicts, updates `state.json`, and atomically writes the 40-character
+commit marker. Clearing verdicts before writing the marker is fail-closed:
+interruption can leave gates empty, but cannot make old approvals apply to a
+new commit.
+
+Any commit after this command requires recording the new head and rerunning all
+four reviewers. `/work` refuses to merge when the marker is missing, malformed,
+or different from the PR head.
+
 ### Load-bearing write invariants
 
 - **Backup before write.** `state.json` is copied to `state.json.bak` before
@@ -55,11 +74,11 @@ through the state machine.
 | plan          | implement     | plan written; `plan_open` set to the item count                   |
 | implement     | verify        | implementer done; `plan_open` drawn down to `0`                   |
 | verify        | review        | `make validate` passes locally                                    |
-| review        | pr            | `gate_spec`,`gate_quality`,`gate_architecture`,`gate_security` all recorded, none blocking |
+| review        | pr            | `reviewed-head` recorded; all four `gate_*` verdicts recorded for that commit, none blocking |
 | pr            | wait-ci       | PR opened to `dev`; `pr` recorded                                 |
 | wait-ci       | cleanup       | CI green (`poll-pr` reports PASS)                                 |
 | cleanup       | done          | worktree removed; active marker cleared                           |
-| done          | (terminal)    | run reports and stops; does NOT merge its own PR                  |
+| done          | (terminal)    | run reports and stops; does NOT merge; `/work` owns its separate post-CI merge gate |
 
 The `review` phase runs the four gates in the fixed order spec -> quality ->
 architecture -> security. A REJECT or an unaddressed REQUEST-CHANGES blocks the
