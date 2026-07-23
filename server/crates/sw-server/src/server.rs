@@ -4,7 +4,7 @@ use crate::clock::{clock_from_epoch, WorldClock};
 use crate::codec::{self, BoatSnap, Caps, MooringSnap, PlayerSnap};
 use crate::config::Config;
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{GlobalRateLimiter, RateLimiter};
 use crate::validate;
 use std::collections::HashMap;
 use std::io::Write;
@@ -15,7 +15,7 @@ use sw_contracts::decode_envelope;
 use sw_contracts::sw_proto as p;
 use sw_econ::{Ledger, Market, MarketAck, Trade, Txn};
 use sw_net::{protocol, DisconnectReason, Event, Host, PeerId};
-use sw_persist::{Db, MooringRow};
+use sw_persist::{Db, MooringRow, PlayerAdmission};
 use sw_world::{AoiUpdate, Cell, Subscription, World};
 
 /// LiteNetLib connect key clients must present.
@@ -61,6 +61,7 @@ pub struct Server {
     weather_seed: u64,
     weather_epoch_day: u32,
     hello_limiter: RateLimiter,
+    new_session_limiter: GlobalRateLimiter,
     trade_limiter: RateLimiter,
     client_state_limiter: RateLimiter,
     chat_limiter: RateLimiter,
@@ -91,6 +92,7 @@ impl Server {
         let host = Host::bind(&cfg.bind, CONNECT_KEY)?;
         let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -110,6 +112,7 @@ impl Server {
             weather_seed,
             weather_epoch_day,
             hello_limiter,
+            new_session_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -320,9 +323,23 @@ impl Server {
             return Ok(());
         }
 
-        let player = self
-            .db
-            .upsert_player_by_token(&identity_hash, &name, persistence_ms)?;
+        if !self.new_session_limiter.allow(admission_ms) {
+            self.reject_hello(peer, "server busy; retry");
+            return Ok(());
+        }
+
+        let player = match self.db.admit_player_by_token(
+            &identity_hash,
+            &name,
+            persistence_ms,
+            self.cfg.max_player_rows_u32(),
+        )? {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => {
+                self.reject_hello(peer, "server player capacity reached");
+                return Ok(());
+            }
+        };
         let player_id = player.id as u64;
 
         // Drop any prior session for this identity (reconnect from a new peer).
@@ -998,6 +1015,7 @@ mod handshake_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter: RateLimiter::new(cfg.hello_min_interval_ms_i64()),
+            new_session_limiter: GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64()),
             trade_limiter: RateLimiter::new(cfg.trade_min_interval_ms_i64()),
             client_state_limiter: RateLimiter::new(cfg.client_state_min_interval_ms_i64()),
             chat_limiter: RateLimiter::new(cfg.chat_min_interval_ms_i64()),
@@ -1084,7 +1102,7 @@ mod handshake_tests {
             .on_hello_at(
                 2,
                 env.payload_as_client_hello().unwrap(),
-                ADMISSION_MS,
+                ADMISSION_MS + hello_interval_ms,
                 RETURN_EPOCH_MS,
             )
             .unwrap();
@@ -1494,7 +1512,7 @@ mod handshake_tests {
             Some("surface-hash"),
             sw_contracts::PROTOCOL_VERSION,
         );
-        deliver_hello(&mut server, peer, &hello);
+        deliver_hello_at(&mut server, peer, &hello, 1_000);
         assert_eq!(receive_server_hello(&client), (true, String::new()));
         let observer_hello = hello_envelope_with_strings(
             Some("observer-token"),
@@ -1504,7 +1522,13 @@ mod handshake_tests {
             Some("surface-hash"),
             sw_contracts::PROTOCOL_VERSION,
         );
-        deliver_hello(&mut server, observer_peer, &observer_hello);
+        let observer_admission_ms = 1_000 + server.cfg.new_session_min_interval_ms_i64();
+        deliver_hello_at(
+            &mut server,
+            observer_peer,
+            &observer_hello,
+            observer_admission_ms,
+        );
         assert_eq!(receive_server_hello(&observer), (true, String::new()));
         client
             .set_read_timeout(Some(Duration::from_millis(20)))
@@ -1572,7 +1596,7 @@ mod handshake_tests {
             Some("surface-hash"),
             sw_contracts::PROTOCOL_VERSION,
         );
-        deliver_hello(&mut server, sender_peer, &sender_hello);
+        deliver_hello_at(&mut server, sender_peer, &sender_hello, 1_000);
         assert_eq!(receive_server_hello(&sender), (true, String::new()));
         let observer_hello = hello_envelope_with_strings(
             Some("observer-token"),
@@ -1582,7 +1606,13 @@ mod handshake_tests {
             Some("surface-hash"),
             sw_contracts::PROTOCOL_VERSION,
         );
-        deliver_hello(&mut server, observer_peer, &observer_hello);
+        let observer_admission_ms = 1_000 + server.cfg.new_session_min_interval_ms_i64();
+        deliver_hello_at(
+            &mut server,
+            observer_peer,
+            &observer_hello,
+            observer_admission_ms,
+        );
         assert_eq!(receive_server_hello(&observer), (true, String::new()));
 
         let sender_player = server.sessions[&sender_peer].player_id;
@@ -1725,6 +1755,129 @@ mod handshake_tests {
     }
 
     #[test]
+    fn rotating_fresh_peers_cannot_bypass_global_new_session_admission() {
+        let mut server = make_server();
+        let admission_ms = 1_000;
+
+        for peer in 1..=64 {
+            let hello = hello_envelope(
+                &format!("rotated-token-{peer}"),
+                sw_contracts::PROTOCOL_VERSION,
+                Some("surface-hash"),
+            );
+            deliver_hello_at(&mut server, peer, &hello, admission_ms);
+            server
+                .on_disconnect(peer, DisconnectReason::Remote)
+                .unwrap();
+        }
+
+        assert!(
+            server.db.player(1).unwrap().is_some(),
+            "the first valid new session should be admitted"
+        );
+        assert!(
+            server.db.player(2).unwrap().is_none(),
+            "one admission window must create at most one player row across all peer ids"
+        );
+        assert_eq!(
+            server.hello_limiter.tracked_count(),
+            0,
+            "disconnect churn must still clear per-peer buckets"
+        );
+
+        let next = hello_envelope(
+            "next-window-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let next_admission_ms = admission_ms + server.cfg.new_session_min_interval_ms_i64();
+        deliver_hello_at(&mut server, 65, &next, next_admission_ms);
+        assert!(
+            server.db.player(2).unwrap().is_some(),
+            "normal admission must resume after the monotonic global window"
+        );
+    }
+
+    #[test]
+    fn player_capacity_refuses_new_identity_without_state_and_allows_reconnect() {
+        let mut server = make_server();
+        server.cfg.max_player_rows = 1;
+        let interval = server.cfg.new_session_min_interval_ms_i64();
+
+        let (first_client, first_peer) = connect_peer(&mut server);
+        let first = hello_envelope(
+            "capacity-existing-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, first_peer, &first, 1_000);
+        assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+        let existing_player = server.sessions[&first_peer].player_id;
+        server
+            .on_disconnect(first_peer, DisconnectReason::Remote)
+            .unwrap();
+        assert!(server.sessions.is_empty());
+        assert_eq!(server.world.len(), 0);
+
+        let (refused_client, refused_peer) = connect_peer(&mut server);
+        let new_identity = hello_envelope(
+            "capacity-new-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, refused_peer, &new_identity, 1_000 + interval);
+        assert_eq!(
+            receive_server_hello(&refused_client),
+            (false, "server player capacity reached".to_string())
+        );
+        assert!(!server.sessions.contains_key(&refused_peer));
+        assert_eq!(server.world.len(), 0);
+        assert!(
+            server
+                .db
+                .player(existing_player as i64 + 1)
+                .unwrap()
+                .is_none(),
+            "capacity refusal must not create a player row"
+        );
+
+        let (returning_client, returning_peer) = connect_peer(&mut server);
+        deliver_hello_at(&mut server, returning_peer, &first, 1_000 + 2 * interval);
+        assert_eq!(
+            receive_server_hello(&returning_client),
+            (true, String::new())
+        );
+        assert_eq!(server.sessions[&returning_peer].player_id, existing_player);
+        assert_eq!(server.world.len(), 1);
+    }
+
+    #[test]
+    fn established_duplicate_does_not_consume_global_new_session_admission() {
+        let mut server = make_server();
+        let interval = server.cfg.new_session_min_interval_ms_i64();
+        let established = hello_envelope(
+            "established-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, 1, &established, 1_000);
+        assert!(server.sessions.contains_key(&1));
+
+        deliver_hello_at(&mut server, 1, &established, 1_000 + interval);
+        let fresh = hello_envelope(
+            "fresh-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, 2, &fresh, 1_000 + interval);
+
+        assert!(
+            server.sessions.contains_key(&2),
+            "idempotent established hello must not charge the global admission gate"
+        );
+    }
+
+    #[test]
     fn hello_limit_is_independent_per_peer() {
         let mut server = make_server();
         let first = hello_envelope(
@@ -1743,7 +1896,8 @@ mod handshake_tests {
         deliver_hello_at(&mut server, 1, &first, 1_001);
         assert_eq!(server.seq, seq_after_first);
 
-        deliver_hello_at(&mut server, 2, &second, 1_001);
+        let second_admission_ms = 1_000 + server.cfg.new_session_min_interval_ms_i64();
+        deliver_hello_at(&mut server, 2, &second, second_admission_ms);
         assert_ne!(server.seq, seq_after_first);
         assert!(server.sessions.contains_key(&1));
         assert!(server.sessions.contains_key(&2));
@@ -1840,6 +1994,7 @@ mod aoi_harden_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -1857,6 +2012,7 @@ mod aoi_harden_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter,
+            new_session_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -2038,6 +2194,7 @@ mod market_dispatch_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -2055,6 +2212,7 @@ mod market_dispatch_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter,
+            new_session_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,
@@ -2269,6 +2427,7 @@ mod input_hardening_tests {
     fn make_server(cfg: Config) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
         let chat_limiter = RateLimiter::new(cfg.chat_min_interval_ms_i64());
@@ -2286,6 +2445,7 @@ mod input_hardening_tests {
             weather_seed: 0,
             weather_epoch_day: 0,
             hello_limiter,
+            new_session_limiter,
             trade_limiter,
             client_state_limiter,
             chat_limiter,

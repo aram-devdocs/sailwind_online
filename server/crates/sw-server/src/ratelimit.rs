@@ -16,6 +16,41 @@
 
 use std::collections::{hash_map::Entry, HashMap};
 
+/// One process-wide minimum-interval gate with constant memory.
+#[derive(Debug)]
+pub struct GlobalRateLimiter {
+    min_interval_ms: i64,
+    last: Option<i64>,
+}
+
+impl GlobalRateLimiter {
+    /// Build a global limiter with the given minimum interval in milliseconds.
+    pub fn new(min_interval_ms: i64) -> GlobalRateLimiter {
+        GlobalRateLimiter {
+            min_interval_ms,
+            last: None,
+        }
+    }
+
+    /// Admit at most one operation in each process-wide interval.
+    ///
+    /// A rejected attempt does not extend the cooldown. Timestamp rollback is
+    /// treated as no elapsed time, matching [`RateLimiter`].
+    pub fn allow(&mut self, now_ms: i64) -> bool {
+        if self.min_interval_ms <= 0 {
+            return true;
+        }
+        if self
+            .last
+            .is_some_and(|last| now_ms.saturating_sub(last) < self.min_interval_ms)
+        {
+            return false;
+        }
+        self.last = Some(now_ms);
+        true
+    }
+}
+
 /// Tracks the last accepted message time per lifecycle-bounded key and admits a
 /// new message only once the configured interval has elapsed.
 #[derive(Debug)]
@@ -166,5 +201,24 @@ mod tests {
         assert!(rl.allow(1, 1000));
         assert!(rl.allow(1, 1000));
         assert_eq!(rl.tracked_count(), 0);
+    }
+
+    #[test]
+    fn global_limiter_has_one_rotation_proof_admission_window() {
+        let mut limiter = GlobalRateLimiter::new(250);
+        assert!(limiter.allow(1_000));
+        for _rotated_peer in 0..10_000 {
+            assert!(!limiter.allow(1_001));
+        }
+        assert!(limiter.allow(1_250));
+    }
+
+    #[test]
+    fn global_limiter_rollback_does_not_bypass_window() {
+        let mut limiter = GlobalRateLimiter::new(250);
+        assert!(limiter.allow(1_000));
+        assert!(!limiter.allow(900));
+        assert!(!limiter.allow(1_249));
+        assert!(limiter.allow(1_250));
     }
 }

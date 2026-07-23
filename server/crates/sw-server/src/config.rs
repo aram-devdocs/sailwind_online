@@ -40,6 +40,16 @@ pub const MAX_HELLO_MIN_INTERVAL_MS: u32 = 250;
 /// unthrottled flood.
 const MIN_HELLO_MIN_INTERVAL_MS: u32 = 1;
 
+/// Upper bound on the process-wide admission interval for new sessions. It
+/// matches the client's retry cadence so a busy rejection can be retried on
+/// the next scheduled hello.
+pub const MAX_NEW_SESSION_MIN_INTERVAL_MS: u32 = 250;
+
+/// Highest configurable persistent player-row ceiling. The server still uses
+/// the operator's lower configured value; this only prevents an accidental
+/// effectively-unbounded cap.
+pub const MAX_PLAYER_ROWS: u32 = 1_000_000;
+
 /// Upper bound on the per-message wire-string length cap, in bytes. Bounds the
 /// [`Config::max_wire_string_len`] knob so a misconfiguration cannot admit an
 /// unbounded string, and so the saturating accessor has a finite ceiling. The
@@ -72,6 +82,15 @@ pub struct Config {
     /// matches the client's handshake retry cadence. Bounded to
     /// `1..=`[`MAX_HELLO_MIN_INTERVAL_MS`].
     pub hello_min_interval_ms: u32,
+    /// Process-wide minimum interval, in milliseconds, between database
+    /// admissions for sessions not already established on their peer. This
+    /// constant-memory gate bounds connection/token rotation across peer IDs.
+    /// Bounded to `1..=`[`MAX_NEW_SESSION_MIN_INTERVAL_MS`].
+    pub new_session_min_interval_ms: u32,
+    /// Hard ceiling on persistent rows in the `players` table. Existing
+    /// identities may reconnect at capacity; new identities are refused.
+    /// Bounded to `1..=`[`MAX_PLAYER_ROWS`].
+    pub max_player_rows: u32,
     /// Minimum interval, in milliseconds, between two accepted market trades by
     /// the same player (an aggregate per-player throttle, independent of which
     /// port the request names). A new trade inside this window is rejected; an
@@ -117,6 +136,8 @@ impl Default for Config {
             aoi_radius_cells: sw_world::AOI_RADIUS_CELLS as u32,
             cell_size_m: sw_world::Grid::DEFAULT_CELL_SIZE_M,
             hello_min_interval_ms: 250,
+            new_session_min_interval_ms: 30,
+            max_player_rows: 10_000,
             trade_min_interval_ms: 250,
             client_state_min_interval_ms: 20,
             chat_min_interval_ms: 500,
@@ -215,6 +236,18 @@ impl Config {
                 "hello_min_interval_ms must be in {MIN_HELLO_MIN_INTERVAL_MS}..={MAX_HELLO_MIN_INTERVAL_MS}"
             ));
         }
+        if !(MIN_HELLO_MIN_INTERVAL_MS..=MAX_NEW_SESSION_MIN_INTERVAL_MS)
+            .contains(&self.new_session_min_interval_ms)
+        {
+            return Err(anyhow::anyhow!(
+                "new_session_min_interval_ms must be in {MIN_HELLO_MIN_INTERVAL_MS}..={MAX_NEW_SESSION_MIN_INTERVAL_MS}"
+            ));
+        }
+        if self.max_player_rows == 0 || self.max_player_rows > MAX_PLAYER_ROWS {
+            return Err(anyhow::anyhow!(
+                "max_player_rows must be in 1..={MAX_PLAYER_ROWS}"
+            ));
+        }
         for (name, value) in [
             ("trade_min_interval_ms", self.trade_min_interval_ms),
             (
@@ -260,6 +293,17 @@ impl Config {
     pub fn hello_min_interval_ms_i64(&self) -> i64 {
         self.hello_min_interval_ms
             .clamp(MIN_HELLO_MIN_INTERVAL_MS, MAX_HELLO_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Process-wide new-session admission interval as bounded milliseconds.
+    pub fn new_session_min_interval_ms_i64(&self) -> i64 {
+        self.new_session_min_interval_ms
+            .clamp(MIN_HELLO_MIN_INTERVAL_MS, MAX_NEW_SESSION_MIN_INTERVAL_MS) as i64
+    }
+
+    /// Persistent player-row ceiling with a defense-in-depth clamp.
+    pub fn max_player_rows_u32(&self) -> u32 {
+        self.max_player_rows.clamp(1, MAX_PLAYER_ROWS)
     }
 
     /// Client-state throttle min-interval as a bounded `i64` of milliseconds.
@@ -679,6 +723,8 @@ mod tests {
     #[test]
     fn parses_new_hardening_keys() {
         let toml_text = r#"
+            new_session_min_interval_ms = 125
+            max_player_rows = 5000
             client_state_min_interval_ms = 33
             chat_min_interval_ms = 750
             econ_min_interval_ms = 200
@@ -686,12 +732,62 @@ mod tests {
             max_wire_string_len = 256
         "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.new_session_min_interval_ms, 125);
+        assert_eq!(cfg.max_player_rows, 5000);
         assert_eq!(cfg.client_state_min_interval_ms, 33);
         assert_eq!(cfg.chat_min_interval_ms, 750);
         assert_eq!(cfg.econ_min_interval_ms, 200);
         assert_eq!(cfg.moor_min_interval_ms, 400);
         assert_eq!(cfg.max_wire_string_len, 256);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn new_session_budget_defaults_and_bounds_are_safe() {
+        let cfg = Config::default();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.new_session_min_interval_ms, 30);
+        assert_eq!(cfg.max_player_rows, 10_000);
+        assert_eq!(
+            cfg.new_session_min_interval_ms_i64(),
+            i64::from(cfg.new_session_min_interval_ms)
+        );
+        assert_eq!(cfg.max_player_rows_u32(), cfg.max_player_rows);
+
+        for value in [0, MAX_NEW_SESSION_MIN_INTERVAL_MS + 1, u32::MAX] {
+            let invalid = Config {
+                new_session_min_interval_ms: value,
+                ..Config::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "new-session interval {value} must be rejected"
+            );
+        }
+        for value in [0, MAX_PLAYER_ROWS + 1, u32::MAX] {
+            let invalid = Config {
+                max_player_rows: value,
+                ..Config::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "player-row capacity {value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn new_session_budget_accessors_clamp_bypassed_validation() {
+        let invalid = Config {
+            new_session_min_interval_ms: u32::MAX,
+            max_player_rows: u32::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            invalid.new_session_min_interval_ms_i64(),
+            i64::from(MAX_NEW_SESSION_MIN_INTERVAL_MS)
+        );
+        assert_eq!(invalid.max_player_rows_u32(), MAX_PLAYER_ROWS);
     }
 
     #[test]

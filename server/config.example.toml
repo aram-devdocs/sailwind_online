@@ -43,6 +43,17 @@ trade_min_interval_ms = 250
 # protection.
 hello_min_interval_ms = 250
 
+# Process-wide minimum interval between database admissions for sessions that
+# are not already established on their peer. Unlike the per-peer hello throttle,
+# this constant-memory gate cannot be bypassed by reconnecting with new peer IDs
+# or rotating tokens. Must be in 1..=250.
+new_session_min_interval_ms = 30
+
+# Hard ceiling on persistent player rows. Existing identities can reconnect
+# after the table reaches this limit; new identities are refused without
+# creating session or world state. Must be in 1..=1000000.
+max_player_rows = 10000
+
 # Per-player throttles (milliseconds) for the other inbound message classes,
 # mirroring the rotation-proof, memory-bounded trade limiter above. A message
 # beyond the configured rate is dropped before it drives work; an idempotent

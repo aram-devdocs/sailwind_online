@@ -8,7 +8,7 @@
 //! earlier table. Synchronous by design — it is driven directly from the
 //! server's single-threaded tick loop.
 
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 pub use rusqlite::{Error, Result};
 
@@ -94,6 +94,14 @@ pub struct PlayerRow {
     pub gold: i64,
     pub created_at: i64,
     pub last_seen: i64,
+}
+
+/// Result of atomically admitting a player identity against the configured
+/// persistent-row ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerAdmission {
+    Admitted(PlayerRow),
+    CapacityReached,
 }
 
 /// A row of the `moorings` table (a persisted boat mooring).
@@ -187,6 +195,63 @@ impl Db {
             params![name, token_hash, now],
             player_from_row,
         )
+    }
+
+    /// Create or refresh a player while atomically enforcing `max_rows`.
+    ///
+    /// An immediate transaction serializes the existence check, count, and
+    /// insert across SQLite connections. Existing identities remain admissible
+    /// after the table reaches capacity; a refused new identity makes no change.
+    pub fn admit_player_by_token(
+        &mut self,
+        token_hash: &str,
+        name: &str,
+        now: i64,
+        max_rows: u32,
+    ) -> Result<PlayerAdmission> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_id = tx
+            .query_row(
+                "SELECT id FROM players WHERE token_hash = ?1",
+                params![token_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing_id {
+            tx.execute(
+                "UPDATE players SET name = ?2, last_seen = ?3 WHERE id = ?1",
+                params![id, name, now],
+            )?;
+            let player = tx.query_row(
+                "SELECT id, name, token_hash, gold, created_at, last_seen
+                 FROM players WHERE id = ?1",
+                params![id],
+                player_from_row,
+            )?;
+            tx.commit()?;
+            return Ok(PlayerAdmission::Admitted(player));
+        }
+
+        let count = tx.query_row("SELECT COUNT(*) FROM players", [], |row| {
+            row.get::<_, u64>(0)
+        })?;
+        if count >= u64::from(max_rows) {
+            tx.commit()?;
+            return Ok(PlayerAdmission::CapacityReached);
+        }
+
+        let player = tx.query_row(
+            "INSERT INTO players (name, token_hash, gold, created_at, last_seen)
+             VALUES (?1, ?2, 0, ?3, ?3)
+             RETURNING id, name, token_hash, gold, created_at, last_seen",
+            params![name, token_hash, now],
+            player_from_row,
+        )?;
+        tx.commit()?;
+        Ok(PlayerAdmission::Admitted(player))
     }
 
     /// Fetch a player by id.
@@ -533,6 +598,51 @@ mod tests {
         // Different token -> different player.
         let c = db.upsert_player_by_token("hash-xyz", "Other", 300).unwrap();
         assert_ne!(c.id, a.id);
+    }
+
+    #[test]
+    fn player_admission_enforces_capacity_without_blocking_existing_identity() {
+        let mut db = Db::open_in_memory().unwrap();
+
+        let first = match db
+            .admit_player_by_token("hash-one", "First", 100, 2)
+            .unwrap()
+        {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => panic!("first player must fit"),
+        };
+        let second = match db
+            .admit_player_by_token("hash-two", "Second", 100, 2)
+            .unwrap()
+        {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => panic!("second player must fit"),
+        };
+        assert_ne!(first.id, second.id);
+
+        assert_eq!(
+            db.admit_player_by_token("hash-three", "Third", 200, 2)
+                .unwrap(),
+            PlayerAdmission::CapacityReached
+        );
+        assert!(
+            db.player(second.id + 1).unwrap().is_none(),
+            "capacity refusal must not insert a player row"
+        );
+
+        let reconnected = match db
+            .admit_player_by_token("hash-one", "Renamed", 300, 2)
+            .unwrap()
+        {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => {
+                panic!("an existing identity must reconnect at capacity")
+            }
+        };
+        assert_eq!(reconnected.id, first.id);
+        assert_eq!(reconnected.name, "Renamed");
+        assert_eq!(reconnected.created_at, first.created_at);
+        assert_eq!(reconnected.last_seen, 300);
     }
 
     #[test]
