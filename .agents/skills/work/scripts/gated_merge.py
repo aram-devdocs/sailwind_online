@@ -17,6 +17,20 @@ from urllib.parse import urlparse
 
 
 GATES = ("spec", "quality", "architecture", "security")
+STATE_KEYS = {
+    "run_id",
+    "issue",
+    "phase",
+    "branch",
+    "worktree",
+    "pr",
+    "gate_spec",
+    "gate_quality",
+    "gate_architecture",
+    "gate_security",
+    "plan_open",
+    "updated_at",
+}
 PR_FIELDS = (
     "number,state,isDraft,baseRefName,headRefName,headRefOid,"
     "mergeStateStatus,mergedAt"
@@ -145,6 +159,12 @@ def load_state(runs_dir, run_id):
         raise MergePreconditionError(
             "completed run state must follow the flat string-value contract"
         )
+    if set(state) != STATE_KEYS:
+        raise MergePreconditionError(
+            "completed run state keys do not match the exact flat contract: "
+            f"missing={sorted(STATE_KEYS - set(state))}, "
+            f"extra={sorted(set(state) - STATE_KEYS)}"
+        )
     if state.get("run_id") != run_id:
         raise MergePreconditionError(
             f"state run_id {state.get('run_id')!r} does not match {run_id!r}"
@@ -154,7 +174,6 @@ def load_state(runs_dir, run_id):
         raise MergePreconditionError(
             f"recorded issue {issue!r} does not match run {run_id!r}"
         )
-    repository_from_issue_url(state.get("issue_url", ""), int(issue))
     if state.get("branch") != f"feat/{run_id}":
         raise MergePreconditionError(
             f"recorded branch {state.get('branch')!r} does not match run "
@@ -213,6 +232,25 @@ def load_reviewed_head(runs_dir, run_id):
     return head.lower()
 
 
+def load_issue_url(runs_dir, run_id, expected_issue):
+    """Read the immutable state-machine-owned issue URL companion marker."""
+    marker = Path(runs_dir) / run_id / "issue-url"
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MergePreconditionError(
+            f"cannot read state-machine issue URL marker at {marker}: {exc}"
+        ) from exc
+    if not raw or raw != raw.strip() + "\n" or "\n" in raw[:-1]:
+        raise MergePreconditionError(
+            f"state-machine issue URL marker at {marker} must contain "
+            "exactly one canonical URL line"
+        )
+    issue_url = raw[:-1]
+    repository_from_issue_url(issue_url, expected_issue)
+    return issue_url
+
+
 def repository_from_issue_url(value, expected_issue):
     """Return durable owner/repo from one canonical recorded issue URL."""
     parsed = urlparse(value)
@@ -227,7 +265,7 @@ def repository_from_issue_url(value, expected_issue):
         or parts[3] != str(expected_issue)
     ):
         raise MergePreconditionError(
-            f"recorded issue_url is not canonical for issue "
+            f"recorded issue URL marker is not canonical for issue "
             f"#{expected_issue}: {value!r}"
         )
     repo = f"{parts[0]}/{parts[1]}"
@@ -237,13 +275,13 @@ def repository_from_issue_url(value, expected_issue):
         or value != f"https://github.com/{repo}/issues/{expected_issue}"
     ):
         raise MergePreconditionError(
-            f"recorded issue_url contains invalid repository identity: "
+            f"recorded issue URL marker contains invalid repository identity: "
             f"{value!r}"
         )
     configured = trusted_repository()
     if repo != configured:
         raise MergePreconditionError(
-            f"recorded issue_url repository {repo!r} does not match tracked "
+            f"recorded issue URL marker repository {repo!r} does not match tracked "
             f"repository {configured!r}"
         )
     return repo
@@ -649,7 +687,10 @@ def merge_completed_run(
     reviewed_head = load_reviewed_head(runs_dir, run_id)
     issue_number = int(state["issue"])
     pr_number, recorded_repo = parse_recorded_pr(state.get("pr", ""))
-    repo = repository_from_issue_url(state["issue_url"], issue_number)
+    repo = repository_from_issue_url(
+        load_issue_url(runs_dir, run_id, issue_number),
+        issue_number,
+    )
     if recorded_repo is not None and recorded_repo != repo:
         raise MergePreconditionError(
             f"recorded PR repository {recorded_repo!r} does not match "

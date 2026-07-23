@@ -76,12 +76,12 @@ not memory, so a run that died mid-task recovers cleanly. The full loop is in
 5. Recheck and merge. After `/gh-issue` reaches `done`, `/work` reads that
    completed run and requires `plan_open=0` plus four `APPROVE` verdicts. Its
    deterministic merge script derives owner/repository only from the immutable
-   canonical `issue_url` recorded at run creation and checks it against the
-   strictly parsed `.agents/repository.json` bootstrap identity. It never
-   discovers identity from checkout remotes. Using that explicit repository,
-   it verifies the recorded PR is open, not a draft, targets `dev`, comes from
-   the recorded branch, links the recorded issue, reports a clean merge state,
-   and has no pending or failed required checks.
+   canonical `issue-url` companion marker recorded at run creation and checks
+   it against the strictly parsed `.agents/repository.json` bootstrap identity.
+   It never discovers identity from checkout remotes. Using that explicit
+   repository, it verifies the recorded PR is open, not a draft, targets `dev`,
+   comes from the recorded branch, links the recorded issue, reports a clean
+   merge state, and has no pending or failed required checks.
    It rereads the head before a squash merge guarded by that exact commit,
    rechecks linkage and required checks at the final mutation boundary,
    omits GitHub's unguarded branch-delete flag, then confirms `MERGED`, `CLOSED`,
@@ -133,11 +133,13 @@ unfenced.
 ## How merging works in practice
 
 The `/gh-issue` state machine remains responsible for producing a green PR and
-does not merge. It records the selected canonical GitHub issue URL as immutable
-`issue_url`; legacy runs missing the marker use the locked `migrate-issue-url`
-command with an independently recorded URL and otherwise fail closed. Active
-non-`done` migration additionally requires the exact clean recorded worktree
-and branch. `/work` owns the post-CI merge and
+does not merge. It atomically records the selected canonical GitHub issue URL
+in an immutable `issue-url` companion marker without changing the flat
+`state.json` schema. Legacy runs missing the marker use the locked
+`migrate-issue-url` command with an independently recorded URL and otherwise
+fail closed. That command also removes a legacy `issue_url` state key through
+the state machine. Active non-`done` migration additionally requires the exact
+clean recorded worktree and branch. `/work` owns the post-CI merge and
 MUST call `.agents/skills/work/scripts/gated_merge.py`, because a single
 deterministic path prevents a conversational shortcut around the gates.
 
@@ -158,9 +160,9 @@ PR, reviewed head, required checks, and closing issue link, skips a second merge
 call, and finishes confirmation before clearing the active marker. If the
 recorded remote branch remains at the reviewed head, the retry deletes it with
 an atomic `--force-with-lease` bound to that commit and rechecks it. The push
-targets the HTTPS URL derived from durable `issue_url`, not a configurable
-local remote or an implicit `gh repo view`. A move before or during
-deletion fails the lease and is never deleted.
+targets the HTTPS URL derived from the durable `issue-url` companion marker,
+not a configurable local remote or an implicit `gh repo view`. A move before
+or during deletion fails the lease and is never deleted.
 
 The final active-marker clear goes through the run state machine under its
 global lock and deletes only a marker still naming the completed run. A marker

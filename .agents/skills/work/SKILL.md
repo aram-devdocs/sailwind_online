@@ -162,15 +162,16 @@ The script MUST be the only merge path in this loop, because it binds the
 operation to the completed run rather than trusting conversational memory. It
 requires `phase=done`, `plan_open=0`, all four recorded verdicts equal to
 `APPROVE`, a state-machine-owned `reviewed-head`, and a canonical durable
-`issue_url`, issue, branch, and PR that exactly match the run. Owner/repository
-identity comes only from `issue_url`; the script never asks the checkout or a
-local remote which repository it is in. Every GitHub command or GraphQL query
-uses that explicit expected repository. It then rechecks through `gh` that the
-PR is open, not a draft, targets `dev`, comes from the recorded branch, links
-the recorded issue for closure, reports `mergeStateStatus=CLEAN`, and has no
-pending or failed required checks. The PR head MUST equal `reviewed-head`,
-because every review verdict must cover the exact commit merged. The required
-`gate` check proves that same PR head passed the CI mirror of `make validate`.
+`issue-url` companion marker, issue, branch, and PR that exactly match the run.
+Owner/repository identity comes only from that marker; the script never asks
+the checkout or a local remote which repository it is in. Every GitHub command
+or GraphQL query uses that explicit expected repository. It then rechecks
+through `gh` that the PR is open, not a draft, targets `dev`, comes from the
+recorded branch, links the recorded issue for closure, reports
+`mergeStateStatus=CLEAN`, and has no pending or failed required checks. The PR
+head MUST equal `reviewed-head`, because every review verdict must cover the
+exact commit merged. The required `gate` check proves that same PR head passed
+the CI mirror of `make validate`.
 
 Immediately before merging, the script reads the PR again and refuses a changed
 head, rechecks issue linkage, and reads required checks again. It passes that
@@ -182,7 +183,7 @@ confirmation. Every external command has a fixed timeout and fails closed with
 the command purpose. It then independently queries the recorded remote feature
 ref. An absent ref succeeds. A ref still at the reviewed head is deleted with a
 SHA-bound `--force-with-lease` pushed directly to the HTTPS URL derived from the
-durable `issue_url`, then queried again. Local `origin`
+durable `issue-url` marker, then queried again. Local `origin`
 configuration cannot redirect this mutation. A move between lookup and deletion
 makes the atomic operation fail. A ref at any other commit is never deleted.
 

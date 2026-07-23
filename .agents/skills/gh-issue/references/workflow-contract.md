@@ -20,7 +20,6 @@ non-string value.
 | ------------------- | ----------------------------------------------------------- | -------------------------- |
 | `run_id`            | run identifier and directory name, `<N>-<slug>`             | `42-fix-login`             |
 | `issue`             | GitHub issue number, as a string                            | `42`                       |
-| `issue_url`         | immutable canonical URL binding owner, repository, and issue | `https://github.com/o/r/issues/42` |
 | `phase`             | current lifecycle phase (see table)                         | `implement`                |
 | `branch`            | working branch, `feat/<N>-<slug>`                           | `feat/42-fix-login`        |
 | `worktree`          | worktree path, `.worktrees/<N>-<slug>`                      | `.worktrees/42-fix-login`  |
@@ -33,8 +32,9 @@ non-string value.
 | `updated_at`        | UTC ISO-8601 timestamp of the last write                    | `2026-07-21T14:03:11Z`     |
 
 A freshly initialized run requires a canonical GitHub issue URL and has
-`phase=investigate`, immutable `issue_url`, empty gates, empty `pr`, empty
-`plan_open`, and `branch`/`worktree` derived from `run_id`.
+`phase=investigate`, empty gates, empty `pr`, empty `plan_open`, and
+`branch`/`worktree` derived from `run_id`. Repository identity does not add a
+state key.
 
 ### Repository identity and legacy migration
 
@@ -46,16 +46,27 @@ configuration fails closed.
 Pre-run selection, blocker checks, assignment, and comments supply that
 repository through `--repo`. The selected explicit result supplies the
 canonical issue URL to `init-run`. Every later GitHub operation derives
-owner/repository from immutable `issue_url`, checks it against the tracked
-identity, and supplies it explicitly. Checkout remotes are never an identity
-source. `update-state` cannot change `issue_url`.
+owner/repository from the immutable state-machine-owned `issue-url` companion
+marker, checks it against the tracked identity, and supplies it explicitly.
+Checkout remotes are never an identity source. `update-state` cannot change
+the companion marker.
 
-A legacy run without this key fails closed until `migrate-issue-url` records an
-independently supplied canonical issue URL whose issue number matches the run.
-Migration holds the global and per-run locks, backs up `state.json`, and refuses
-replacement of an existing identity. When the run is active and non-`done`, it
-also requires the active marker, exact recorded worktree and branch, a clean
-worktree, and the expected checked-out branch.
+A legacy run without this marker fails closed until `migrate-issue-url`
+atomically records an independently supplied canonical issue URL whose issue
+number matches the run. Migration holds the global and per-run advisory locks
+and refuses replacement of an existing identity. When a prior implementation
+stored `issue_url` in `state.json`, migration removes that key through the
+state machine, backs up the old state, and restores the exact schema above.
+When the run is active and non-`done`, migration also requires the active
+marker, exact recorded worktree and branch, a clean worktree, and the expected
+checked-out branch.
+
+### Issue URL companion
+
+`issue-url` contains exactly one canonical URL line. `init-run` creates it with
+a same-directory temporary file and atomic replacement while holding the
+global and per-run locks. Readers reject missing, malformed, wrong-issue, or
+wrong-repository content. Once present, the marker is immutable.
 
 ### Reviewed-head companion
 

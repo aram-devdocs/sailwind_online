@@ -40,6 +40,23 @@ class GatedMergeTests(unittest.TestCase):
     run_id = "48-gated-self-merge"
     repo = "aram-devdocs/sailwind_online"
     head = "a" * 40
+    issue_url = (
+        "https://github.com/aram-devdocs/sailwind_online/issues/48"
+    )
+    original_state_keys = {
+        "run_id",
+        "issue",
+        "phase",
+        "branch",
+        "worktree",
+        "pr",
+        "gate_spec",
+        "gate_quality",
+        "gate_architecture",
+        "gate_security",
+        "plan_open",
+        "updated_at",
+    }
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -54,13 +71,10 @@ class GatedMergeTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def write_state(self, **overrides):
+    def write_state(self, issue_url_marker=None, **overrides):
         state = {
             "run_id": self.run_id,
             "issue": "48",
-            "issue_url": (
-                "https://github.com/aram-devdocs/sailwind_online/issues/48"
-            ),
             "phase": "done",
             "branch": "feat/48-gated-self-merge",
             "worktree": ".worktrees/48-gated-self-merge",
@@ -78,6 +92,16 @@ class GatedMergeTests(unittest.TestCase):
         (run_dir / "state.json").write_text(
             json.dumps(state), encoding="utf-8"
         )
+        marker = run_dir / "issue-url"
+        marker_value = (
+            self.issue_url
+            if issue_url_marker is None
+            else issue_url_marker
+        )
+        if marker_value:
+            marker.write_text(marker_value + "\n", encoding="utf-8")
+        else:
+            marker.unlink(missing_ok=True)
 
     def write_reviewed_head(self, head=None):
         run_dir = self.runs_dir / self.run_id
@@ -500,13 +524,7 @@ class GatedMergeTests(unittest.TestCase):
             "spec gate": {"gate_spec": "REQUEST-CHANGES"},
             "run id": {"run_id": "49-other-run"},
             "issue": {"issue": "49"},
-            "missing issue URL": {"issue_url": ""},
-            "malformed issue URL": {"issue_url": "https://example.com/48"},
-            "wrong issue URL": {
-                "issue_url": (
-                    "https://github.com/aram-devdocs/sailwind_online/issues/49"
-                )
-            },
+            "state schema extension": {"issue_url": self.issue_url},
             "branch": {"branch": "feat/49-other-run"},
             "wrong PR repository": {
                 "pr": "https://github.com/attacker/unrelated/pull/52"
@@ -522,6 +540,35 @@ class GatedMergeTests(unittest.TestCase):
                         self.runs_dir, self.run_id, runner=runner
                     )
                 self.assertEqual(runner.calls, [])
+
+        for label, marker in {
+            "missing issue URL marker": "",
+            "malformed issue URL marker": "https://example.com/48",
+            "wrong issue URL marker": (
+                "https://github.com/aram-devdocs/sailwind_online/issues/49"
+            ),
+        }.items():
+            with self.subTest(label=label):
+                self.write_state(issue_url_marker=marker)
+                runner = FakeRunner([])
+                with self.assertRaises(gated_merge.MergePreconditionError):
+                    gated_merge.merge_completed_run(
+                        self.runs_dir,
+                        self.run_id,
+                        runner=runner,
+                    )
+                self.assertEqual(runner.calls, [])
+
+    def test_completed_state_uses_original_exact_schema(self):
+        state = json.loads(
+            (
+                self.runs_dir
+                / self.run_id
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(state), self.original_state_keys)
+        self.assertNotIn("issue_url", state)
 
     def test_rejects_missing_or_malformed_reviewed_head_before_gh(self):
         marker = self.runs_dir / self.run_id / "reviewed-head"

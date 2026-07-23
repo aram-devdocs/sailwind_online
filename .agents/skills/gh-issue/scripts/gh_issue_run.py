@@ -17,7 +17,6 @@ each key lands on its own line.
 Allowed flat keys (nothing else may be set):
     run_id            <N>-<slug> identifier, also the run directory name
     issue             the GitHub issue number, as a string
-    issue_url         canonical GitHub issue URL binding owner/repo/issue
     phase             one of: investigate plan implement verify review
                               pr wait-ci cleanup done
     branch            feat/<N>-<slug>
@@ -29,6 +28,9 @@ Allowed flat keys (nothing else may be set):
     gate_security     security-review verdict, empty until recorded
     plan_open         count of open plan items, as a string ("0"/"" = none)
     updated_at        UTC ISO-8601 timestamp of the last write
+
+The immutable companion marker `issue-url` stores the canonical GitHub issue
+URL without extending this flat state schema.
 
 Two invariants are load-bearing and MUST NOT be removed:
     1. Backup-before-write: state.json is copied to state.json.bak before any
@@ -96,7 +98,6 @@ PHASES = (
 ALLOWED_KEYS = (
     "run_id",
     "issue",
-    "issue_url",
     "phase",
     "branch",
     "worktree",
@@ -162,6 +163,10 @@ def state_path(args, run_id):
 
 def reviewed_head_path(args, run_id):
     return run_dir(args, run_id) / "reviewed-head"
+
+
+def issue_url_path(args, run_id):
+    return run_dir(args, run_id) / "issue-url"
 
 
 def active_path(args):
@@ -358,12 +363,59 @@ def parse_issue_url(value, expected_issue):
     return repository
 
 
-def blank_state(run_id, issue, slug, issue_url):
+def write_issue_url_marker(path, issue_url):
+    """Atomically create one immutable issue URL marker."""
+    expected = issue_url + "\n"
+    if path.exists():
+        try:
+            recorded = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(
+                f"error: cannot read issue URL marker at {path}: {exc}"
+            ) from exc
+        if recorded == expected:
+            return False
+        raise SystemExit(
+            f"error: issue URL marker at {path} is immutable and already "
+            "contains a different value"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(expected, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except OSError as exc:
+        raise SystemExit(
+            f"error: cannot atomically write issue URL marker at {path}: {exc}"
+        ) from exc
+    return True
+
+
+def read_issue_url_marker(args, run_id, expected_issue):
+    """Read and validate the immutable companion repository identity."""
+    marker = issue_url_path(args, run_id)
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            f"error: missing or unreadable issue URL marker at {marker}: {exc}; "
+            "use migrate-issue-url with an independently recorded GitHub URL"
+        ) from exc
+    if not raw or raw != raw.strip() + "\n" or "\n" in raw[:-1]:
+        raise SystemExit(
+            f"error: issue URL marker at {marker} must contain exactly one "
+            "canonical URL line"
+        )
+    issue_url = raw[:-1]
+    parse_issue_url(issue_url, expected_issue)
+    return issue_url
+
+
+def blank_state(run_id, issue, slug):
     """A fresh state dict with keys in contract order; phase=investigate."""
     return {
         "run_id": run_id,
         "issue": str(issue),
-        "issue_url": issue_url,
         "phase": "investigate",
         "branch": f"feat/{run_id}",
         "worktree": f".worktrees/{run_id}",
@@ -377,7 +429,7 @@ def blank_state(run_id, issue, slug, issue_url):
     }
 
 
-def read_state(path):
+def read_state(path, allow_legacy_issue_url=False):
     """Load state.json as a dict. Raises SystemExit with a clear message."""
     if not path.exists():
         raise SystemExit(f"error: no state at {path}")
@@ -387,11 +439,40 @@ def read_state(path):
         raise SystemExit(f"error: cannot read {path}: {exc}")
     if not isinstance(data, dict):
         raise SystemExit(f"error: {path} is not a flat object")
+    if allow_legacy_issue_url:
+        keys = set(data)
+        allowed = set(ALLOWED_KEYS)
+        if keys not in (allowed, allowed | {"issue_url"}):
+            raise SystemExit(
+                f"error: legacy state keys are invalid; "
+                f"missing={sorted(allowed - keys)}, "
+                f"extra={sorted(keys - allowed)}"
+            )
+        for key, value in data.items():
+            if not isinstance(value, str):
+                raise SystemExit(
+                    f"error: legacy key {key!r} has non-string value "
+                    f"{value!r}"
+                )
+    else:
+        validate_flat(data)
     return data
 
 
 def validate_flat(data):
     """Every value MUST be a string (flat contract). Reject nested structures."""
+    if set(data) != set(ALLOWED_KEYS):
+        missing = sorted(set(ALLOWED_KEYS) - set(data))
+        extra = sorted(set(data) - set(ALLOWED_KEYS))
+        if not missing and extra == ["issue_url"]:
+            raise SystemExit(
+                "error: legacy state.json contains issue_url; use "
+                "migrate-issue-url to move it into the companion marker"
+            )
+        raise SystemExit(
+            f"error: state keys must exactly match the flat contract; "
+            f"missing={missing}, extra={extra}"
+        )
     for key, val in data.items():
         if not isinstance(val, str):
             raise SystemExit(
@@ -437,21 +518,24 @@ def cmd_init_run(args):
                 "--resume to reattach to it"
         )
         if spath.exists() and args.resume:
-            data = read_state(spath)
-            recorded_url = data.get("issue_url", "")
-            if not recorded_url:
+            data = read_state(spath, allow_legacy_issue_url=True)
+            if "issue_url" in data:
                 raise SystemExit(
-                    f"error: legacy run '{run_id}' has no issue_url; use "
-                    "migrate-issue-url with an independently recorded GitHub "
-                    "issue URL"
+                    f"error: legacy run '{run_id}' stores issue_url in "
+                    "state.json; use migrate-issue-url to move it into the "
+                    "companion marker"
                 )
-            else:
-                parse_issue_url(recorded_url, args.issue)
-                if args.issue_url and args.issue_url != recorded_url:
-                    raise SystemExit(
-                        f"error: --issue-url {args.issue_url!r} does not match "
-                        f"recorded identity {recorded_url!r}"
-                    )
+            validate_flat(data)
+            recorded_url = read_issue_url_marker(
+                args,
+                run_id,
+                args.issue,
+            )
+            if args.issue_url and args.issue_url != recorded_url:
+                raise SystemExit(
+                    f"error: --issue-url {args.issue_url!r} does not match "
+                    f"recorded identity {recorded_url!r}"
+                )
             data["updated_at"] = now_utc()
             write_state(spath, data)
             print(f"resumed existing run '{run_id}' at phase '{data.get('phase')}'")
@@ -465,6 +549,9 @@ def cmd_init_run(args):
                 run_id,
                 args.issue,
                 args.slug,
+            )
+            write_issue_url_marker(
+                issue_url_path(args, run_id),
                 args.issue_url,
             )
             write_state(spath, data)
@@ -510,10 +597,6 @@ def cmd_update_state(args):
             f"error: '{args.key}' is not an allowed flat key. Allowed: "
             + ", ".join(ALLOWED_KEYS)
         )
-    if args.key == "issue_url":
-        raise SystemExit(
-            "error: issue_url is immutable; use init-run or migrate-issue-url"
-        )
     if args.key == "phase" and args.value not in PHASES:
         raise SystemExit(
             f"error: phase '{args.value}' is not valid. One of: "
@@ -535,7 +618,7 @@ def cmd_update_state(args):
 
 
 def cmd_migrate_issue_url(args):
-    """Bind a legacy run missing repository identity to an explicit issue URL."""
+    """Move legacy identity into an immutable companion marker."""
     run_id = resolve_run_id(args)
     global_lock = acquire_lock(runs_dir(args))
     lock = None
@@ -543,7 +626,7 @@ def cmd_migrate_issue_url(args):
         rundir = run_dir(args, run_id)
         lock = acquire_lock(rundir)
         spath = state_path(args, run_id)
-        data = read_state(spath)
+        data = read_state(spath, allow_legacy_issue_url=True)
         issue = data.get("issue", "")
         if not issue.isdigit() or int(issue) <= 0:
             raise SystemExit(
@@ -555,15 +638,23 @@ def cmd_migrate_issue_url(args):
                 f"{issue!r}"
             )
         parse_issue_url(args.issue_url, issue)
-        recorded = data.get("issue_url", "")
-        if recorded and recorded != args.issue_url:
+        legacy_url = data.get("issue_url", "")
+        if legacy_url:
+            parse_issue_url(legacy_url, issue)
+        if legacy_url and legacy_url != args.issue_url:
             raise SystemExit(
-                f"error: legacy run already records issue_url {recorded!r}; "
+                f"error: legacy run already records issue_url {legacy_url!r}; "
                 "repository identity is immutable"
             )
-        if recorded == args.issue_url:
-            print(f"issue URL already recorded for run '{run_id}'")
-            return
+        marker = issue_url_path(args, run_id)
+        marker_exists = marker.exists()
+        if marker_exists:
+            recorded = read_issue_url_marker(args, run_id, issue)
+            if recorded != args.issue_url:
+                raise SystemExit(
+                    f"error: issue URL marker already records {recorded!r}; "
+                    "repository identity is immutable"
+                )
         if data.get("phase") != "done":
             active = active_path(args)
             try:
@@ -612,9 +703,16 @@ def cmd_migrate_issue_url(args):
                     f"error: active legacy worktree branch must be "
                     f"{recorded_branch!r}, found {branch!r}: {err}"
                 )
-        data["issue_url"] = args.issue_url
-        data["updated_at"] = now_utc()
-        write_state(spath, data)
+        marker_created = write_issue_url_marker(marker, args.issue_url)
+        state_migrated = "issue_url" in data
+        if state_migrated:
+            data.pop("issue_url")
+        if marker_created or state_migrated:
+            data["updated_at"] = now_utc()
+            write_state(spath, data)
+        else:
+            print(f"issue URL already recorded for run '{run_id}'")
+            return
     finally:
         if lock is not None:
             release_lock(lock)
@@ -772,9 +870,10 @@ def cmd_validate_resume(args):
              f"  recorded phase: {data.get('phase', '?')}"]
 
     if data.get("phase") == "done":
-        if not data.get("issue_url"):
+        marker = issue_url_path(args, run_id)
+        if not marker.is_file():
             lines.append(
-                "  repository: MISSING durable issue_url for legacy run"
+                "  repository: MISSING durable issue-url marker for legacy run"
             )
             lines.append(
                 "  ACTION: run migrate-issue-url with an independently "
@@ -782,7 +881,7 @@ def cmd_validate_resume(args):
             )
             print("\n".join(lines))
             return
-        parse_issue_url(data["issue_url"], data.get("issue", ""))
+        read_issue_url_marker(args, run_id, data.get("issue", ""))
         lines.append(
             "  worktree: cleanup complete; absence is expected at phase done"
         )
@@ -797,7 +896,11 @@ def cmd_validate_resume(args):
         return
 
     repo = parse_issue_url(
-        data.get("issue_url", ""),
+        read_issue_url_marker(
+            args,
+            run_id,
+            data.get("issue", ""),
+        ),
         data.get("issue", ""),
     )
 
@@ -874,7 +977,11 @@ def cmd_poll_pr(args):
     if not pr:
         raise SystemExit(f"error: run '{run_id}' has no PR recorded yet")
     repo = parse_issue_url(
-        data.get("issue_url", ""),
+        read_issue_url_marker(
+            args,
+            run_id,
+            data.get("issue", ""),
+        ),
         data.get("issue", ""),
     )
     rc, out, err = run_cmd(

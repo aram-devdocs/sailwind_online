@@ -10,9 +10,10 @@ Exits nonzero on any problem so a run can gate on skill integrity. Checks:
      real argparse surface).
   5. Runtime and workflow GitHub commands use an explicit repository.
   6. Every production and validator subprocess has a timeout.
-  7. The state.json flat-key contract is documented in the module docstring
-     and in the workflow contract.
-  8. Required SKILL.md sections are present.
+  7. The state.json keys match the original exact schema.
+  8. The flat-key contract and companion markers are documented in the module
+     docstring and workflow contract.
+  9. Required SKILL.md sections are present.
 
 Stdlib only. Tries python3 then python for the subcommand probe so the check is
 portable; the dev path on this Windows machine is `python`.
@@ -59,7 +60,7 @@ REQUIRED_SECTIONS = (
 
 # Flat keys the contract must document.
 REQUIRED_KEYS = (
-    "run_id", "issue", "issue_url", "phase", "branch", "worktree", "pr",
+    "run_id", "issue", "phase", "branch", "worktree", "pr",
     "gate_spec", "gate_quality", "gate_architecture", "gate_security",
     "plan_open", "updated_at",
 )
@@ -151,6 +152,38 @@ def check_subprocess_timeouts(path, problems):
                 f"{path.relative_to(AGENTS_DIR)} has an unbounded "
                 f"subprocess.run at line {node.lineno}"
             )
+
+
+def check_exact_state_schema(script, problems):
+    """Require the original flat state keys and companion identity marker."""
+    try:
+        tree = ast.parse(script.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError) as exc:
+        problems.append(f"cannot parse state schema: {exc}")
+        return
+    assignments = {
+        node.targets[0].id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    value = assignments.get("ALLOWED_KEYS")
+    if not isinstance(value, (ast.Tuple, ast.List)):
+        problems.append("gh_issue_run.py has no literal ALLOWED_KEYS schema")
+        return
+    keys = tuple(
+        element.value
+        for element in value.elts
+        if isinstance(element, ast.Constant)
+        and isinstance(element.value, str)
+    )
+    if keys != REQUIRED_KEYS:
+        problems.append(
+            f"ALLOWED_KEYS changed from the original schema: {keys!r}"
+        )
+    if '"issue-url"' not in script.read_text(encoding="utf-8"):
+        problems.append("gh_issue_run.py does not own the issue-url marker")
 
 
 def main():
@@ -250,7 +283,11 @@ def main():
     for runtime in (script, WORK_RUNTIME, Path(__file__).resolve()):
         check_subprocess_timeouts(runtime, problems)
 
-    # 7. Flat-key contract documented (module docstring + workflow contract).
+    # 7. Original flat-key contract and companion identity marker.
+    if script.is_file():
+        check_exact_state_schema(script, problems)
+
+    # 8. Flat-key contract documented (module docstring + workflow contract).
     script_text = script.read_text(encoding="utf-8") if script.is_file() else ""
     for key in REQUIRED_KEYS:
         if key not in script_text:
@@ -261,8 +298,13 @@ def main():
         problems.append("gh_issue_run.py docstring does not state the flat-key contract")
     if contract_text and "flat" not in contract_text.lower():
         problems.append("workflow-contract.md does not state the flat-key contract")
+    for marker in ("issue-url", "reviewed-head"):
+        if contract_text and marker not in contract_text:
+            problems.append(
+                f"workflow-contract.md does not document {marker}"
+            )
 
-    # 8. Required SKILL.md sections.
+    # 9. Required SKILL.md sections.
     for sec in REQUIRED_SECTIONS:
         if skill_text and sec.lower() not in skill_text.lower():
             problems.append(f"SKILL.md missing a '{sec}' section")

@@ -30,6 +30,23 @@ VALIDATOR_SPEC.loader.exec_module(validate_skill)
 class ReviewedHeadTests(unittest.TestCase):
     run_id = "15-ingame-handshake"
     head = "a" * 40
+    issue_url = (
+        "https://github.com/aram-devdocs/sailwind_online/issues/15"
+    )
+    original_state_keys = {
+        "run_id",
+        "issue",
+        "phase",
+        "branch",
+        "worktree",
+        "pr",
+        "gate_spec",
+        "gate_quality",
+        "gate_architecture",
+        "gate_security",
+        "plan_open",
+        "updated_at",
+    }
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -38,6 +55,10 @@ class ReviewedHeadTests(unittest.TestCase):
         self.run_dir.mkdir(parents=True)
         self.state_path = self.run_dir / "state.json"
         self.write_state()
+        (self.run_dir / "issue-url").write_text(
+            self.issue_url + "\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -48,10 +69,6 @@ class ReviewedHeadTests(unittest.TestCase):
                 {
                     "run_id": self.run_id,
                     "issue": "15",
-                    "issue_url": (
-                        "https://github.com/aram-devdocs/sailwind_online/"
-                        "issues/15"
-                    ),
                     "phase": "review",
                     "branch": "feat/15-ingame-handshake",
                     "worktree": ".worktrees/15-ingame-handshake",
@@ -127,7 +144,7 @@ class ReviewedHeadTests(unittest.TestCase):
             )
         )
 
-    def test_init_run_records_explicit_issue_url(self):
+    def test_init_run_preserves_exact_state_schema_and_records_marker(self):
         run_id = "16-explicit-repository"
         issue_url = (
             "https://github.com/aram-devdocs/sailwind_online/issues/16"
@@ -159,7 +176,14 @@ class ReviewedHeadTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(state["issue_url"], issue_url)
+        self.assertEqual(set(state), self.original_state_keys)
+        self.assertNotIn("issue_url", state)
+        self.assertEqual(
+            (self.runs_dir / run_id / "issue-url").read_text(
+                encoding="utf-8"
+            ),
+            issue_url + "\n",
+        )
 
     def test_init_run_refuses_missing_issue_url(self):
         result = subprocess.run(
@@ -336,12 +360,10 @@ class ReviewedHeadTests(unittest.TestCase):
 
     def test_migrates_completed_legacy_run_from_explicit_issue_url(self):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        state.pop("issue_url")
+        state["issue_url"] = self.issue_url
         state["phase"] = "done"
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
-        issue_url = (
-            "https://github.com/aram-devdocs/sailwind_online/issues/15"
-        )
+        (self.run_dir / "issue-url").unlink()
 
         result = subprocess.run(
             [
@@ -353,7 +375,7 @@ class ReviewedHeadTests(unittest.TestCase):
                 "--run-id",
                 self.run_id,
                 "--issue-url",
-                issue_url,
+                self.issue_url,
             ],
             capture_output=True,
             text=True,
@@ -362,13 +384,16 @@ class ReviewedHeadTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         migrated = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["issue_url"], issue_url)
+        self.assertEqual(set(migrated), self.original_state_keys)
+        self.assertNotIn("issue_url", migrated)
+        self.assertEqual(
+            (self.run_dir / "issue-url").read_text(encoding="utf-8"),
+            self.issue_url + "\n",
+        )
         self.assertTrue(self.state_path.with_suffix(".json.bak").exists())
 
     def test_migrates_active_legacy_run_after_clean_identity_check(self):
-        state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        state.pop("issue_url")
-        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        (self.run_dir / "issue-url").unlink()
         (self.runs_dir / "active").write_text(
             self.run_id + "\n",
             encoding="utf-8",
@@ -408,12 +433,14 @@ class ReviewedHeadTests(unittest.TestCase):
             ],
         )
         migrated = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["issue_url"], args.issue_url)
+        self.assertEqual(set(migrated), self.original_state_keys)
+        self.assertEqual(
+            (self.run_dir / "issue-url").read_text(encoding="utf-8"),
+            args.issue_url + "\n",
+        )
 
     def test_active_legacy_migration_refuses_dirty_worktree(self):
-        state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        state.pop("issue_url")
-        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        (self.run_dir / "issue-url").unlink()
         (self.runs_dir / "active").write_text(
             self.run_id + "\n",
             encoding="utf-8",
@@ -445,6 +472,35 @@ class ReviewedHeadTests(unittest.TestCase):
 
         unchanged = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertNotIn("issue_url", unchanged)
+        self.assertFalse((self.run_dir / "issue-url").exists())
+
+    def test_issue_url_marker_is_immutable_and_config_bound(self):
+        marker = self.run_dir / "issue-url"
+        with self.assertRaisesRegex(SystemExit, "immutable"):
+            gh_issue_run.write_issue_url_marker(
+                marker,
+                self.issue_url + "/replacement",
+            )
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            self.issue_url + "\n",
+        )
+
+        marker.write_text(
+            "https://github.com/attacker/unrelated/issues/15\n",
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            issue_url=self.issue_url,
+        )
+        with self.assertRaisesRegex(SystemExit, "tracked repository"):
+            gh_issue_run.cmd_migrate_issue_url(args)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            "https://github.com/attacker/unrelated/issues/15\n",
+        )
 
     def test_invalid_test_head_fails_without_changing_state(self):
         before = self.state_path.read_text(encoding="utf-8")

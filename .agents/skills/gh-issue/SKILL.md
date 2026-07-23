@@ -92,19 +92,22 @@ depends on the exact flat-key shape, and a hand edit silently breaks them.
 
 `init-run` requires the canonical issue URL selected from an explicit
 `--repo aram-devdocs/sailwind_online` GitHub result. It checks that URL against
-the strictly parsed `.agents/repository.json` identity and records it as
-immutable `issue_url`, so repository identity never depends on local Git
-configuration. A missing, malformed, or mismatched configuration fails closed.
-A legacy run created before this key existed also fails closed. Migrate the
-missing marker only from an independently recorded canonical issue URL:
+the strictly parsed `.agents/repository.json` identity and atomically records
+it in the immutable state-machine-owned `issue-url` companion marker, so the
+flat `state.json` schema remains unchanged and repository identity never
+depends on local Git configuration. A missing, malformed, or mismatched
+configuration fails closed. A legacy run created before this marker existed
+also fails closed. Migrate the missing marker only from an independently
+recorded canonical issue URL:
 
     python .agents/skills/gh-issue/scripts/gh_issue_run.py migrate-issue-url --run-id 42-fix-login --issue-url https://github.com/aram-devdocs/sailwind_online/issues/42
 
 The migration command requires the URL issue number to match, writes through
 the state-machine locks, and refuses to replace an existing repository
-identity. For a non-`done` active run, it also requires the active marker,
-recorded worktree path and branch, clean worktree, and checked-out branch to
-match before writing.
+identity. It also removes a legacy `issue_url` key from `state.json` through
+the state machine and restores the exact original key set. For a non-`done`
+active run, it requires the active marker, recorded worktree path and branch,
+clean worktree, and checked-out branch to match before writing.
 
 The exact flat-key schema, the phase transition table, and which hook reads
 which key live in `references/workflow-contract.md`.
