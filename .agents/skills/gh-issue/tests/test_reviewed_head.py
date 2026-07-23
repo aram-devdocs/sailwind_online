@@ -36,6 +36,10 @@ class ReviewedHeadTests(unittest.TestCase):
                 {
                     "run_id": self.run_id,
                     "issue": "15",
+                    "issue_url": (
+                        "https://github.com/aram-devdocs/sailwind_online/"
+                        "issues/15"
+                    ),
                     "phase": "review",
                     "branch": "feat/15-ingame-handshake",
                     "worktree": ".worktrees/15-ingame-handshake",
@@ -110,6 +114,126 @@ class ReviewedHeadTests(unittest.TestCase):
                 for gate in ("spec", "quality", "architecture", "security")
             )
         )
+
+    def test_init_run_records_explicit_issue_url(self):
+        run_id = "16-explicit-repository"
+        issue_url = (
+            "https://github.com/aram-devdocs/sailwind_online/issues/16"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "init-run",
+                "--issue",
+                "16",
+                "--slug",
+                "explicit-repository",
+                "--issue-url",
+                issue_url,
+                "--no-git",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(
+            (self.runs_dir / run_id / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["issue_url"], issue_url)
+
+    def test_init_run_refuses_missing_issue_url(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "init-run",
+                "--issue",
+                "16",
+                "--slug",
+                "missing-repository",
+                "--no-git",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--issue-url", result.stderr)
+        self.assertFalse(
+            (self.runs_dir / "16-missing-repository" / "state.json").exists()
+        )
+
+    def test_migrates_completed_legacy_run_from_explicit_issue_url(self):
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state.pop("issue_url")
+        state["phase"] = "done"
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        issue_url = (
+            "https://github.com/aram-devdocs/sailwind_online/issues/15"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "migrate-issue-url",
+                "--run-id",
+                self.run_id,
+                "--issue-url",
+                issue_url,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        migrated = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["issue_url"], issue_url)
+        self.assertTrue(self.state_path.with_suffix(".json.bak").exists())
+
+    def test_refuses_legacy_migration_before_done(self):
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state.pop("issue_url")
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "migrate-issue-url",
+                "--run-id",
+                self.run_id,
+                "--issue-url",
+                (
+                    "https://github.com/aram-devdocs/sailwind_online/"
+                    "issues/15"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only for completed legacy runs", result.stderr)
+        unchanged = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertNotIn("issue_url", unchanged)
 
     def test_invalid_test_head_fails_without_changing_state(self):
         before = self.state_path.read_text(encoding="utf-8")

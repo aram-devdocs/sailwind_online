@@ -20,6 +20,7 @@ non-string value.
 | ------------------- | ----------------------------------------------------------- | -------------------------- |
 | `run_id`            | run identifier and directory name, `<N>-<slug>`             | `42-fix-login`             |
 | `issue`             | GitHub issue number, as a string                            | `42`                       |
+| `issue_url`         | immutable canonical URL binding owner, repository, and issue | `https://github.com/o/r/issues/42` |
 | `phase`             | current lifecycle phase (see table)                         | `implement`                |
 | `branch`            | working branch, `feat/<N>-<slug>`                           | `feat/42-fix-login`        |
 | `worktree`          | worktree path, `.worktrees/<N>-<slug>`                      | `.worktrees/42-fix-login`  |
@@ -31,12 +32,25 @@ non-string value.
 | `plan_open`         | count of open plan items; `"0"` or `""` means none open     | `3`                        |
 | `updated_at`        | UTC ISO-8601 timestamp of the last write                    | `2026-07-21T14:03:11Z`     |
 
-A freshly initialized run has `phase=investigate`, empty gates, empty `pr`,
-empty `plan_open`, and `branch`/`worktree` derived from `run_id`.
+A freshly initialized run requires a canonical GitHub issue URL and has
+`phase=investigate`, immutable `issue_url`, empty gates, empty `pr`, empty
+`plan_open`, and `branch`/`worktree` derived from `run_id`.
+
+### Repository identity and legacy migration
+
+Every GitHub operation derives owner/repository from `issue_url` and supplies it
+explicitly. Checkout remotes are never an identity source. `update-state`
+cannot change `issue_url`.
+
+A completed legacy run without this key fails closed until
+`migrate-issue-url` records an independently supplied canonical issue URL whose
+issue number matches the run. Migration holds the global and per-run locks,
+backs up `state.json`, and refuses non-`done` runs or replacement of an existing
+identity.
 
 ### Reviewed-head companion
 
-The flat schema stays unchanged. The state machine writes the reviewed commit
+The reviewed commit remains a companion rather than a nested value. The state machine writes it
 to `.agents/runs/<run_id>/reviewed-head` immediately before the fixed review
 sequence:
 

@@ -76,19 +76,19 @@ running app, open the PR, and keep it green. After `/gh-issue` reaches `done`,
 `/work` rechecks the completed run, exact PR head, mergeability, and required
 checks before merging and confirming issue closure. The exact PR head must equal
 the state-machine-owned reviewed head, so a commit after review requires all
-four verdicts again. Cleanup retains the active run until merge and closure are
-confirmed, so a crash resumes that handoff before issue selection. The merge
-path is retry-safe after partial success and gives every external command a
-bounded timeout. Remote deletion uses a lease bound to the reviewed head, so a
-concurrent branch move is never deleted, and targets the validated repository
-URL rather than local remote configuration. The state machine clears the
+four verdicts again. Repository identity comes from the immutable canonical
+issue URL recorded by the state machine, never checkout remotes. Cleanup
+retains the active run until merge and closure are confirmed, so a crash resumes
+that handoff before issue selection. The merge path is retry-safe after partial
+success and gives every external command a bounded timeout. Remote deletion
+uses a lease bound to the reviewed head, so a concurrent branch move is never
+deleted, and targets the durable repository URL. The state machine clears the
 handoff under its lock only when it still names the completed run. Worktree
 cleanup binds removal to the run path, branch, and reviewed head, then holds the
 lifecycle lock through absence verification and `done`; any failure stays
 non-done and retryable. It resumes from durable run state after any compaction
 and never starts a second issue in the same invocation. Full loop:
-`.agents/skills/work/SKILL.md`; delegation model:
-`.agents/skills/subagent-driven-development`.
+`.agents/skills/work/SKILL.md`; delegation: `.agents/skills/subagent-driven-development`.
 
 ## Trust and writing
 

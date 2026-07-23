@@ -74,7 +74,7 @@ Every transition goes THROUGH `scripts/gh_issue_run.py`. Never hand-edit
 depends on the exact flat-key shape, and a hand edit silently breaks them.
 
     # start a run (also creates the worktree)
-    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue 42 --slug fix-login
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue 42 --issue-url https://github.com/owner/repo/issues/42 --slug fix-login
 
     # advance a phase
     python .agents/skills/gh-issue/scripts/gh_issue_run.py update-state --key phase --value implement
@@ -87,6 +87,17 @@ depends on the exact flat-key shape, and a hand edit silently breaks them.
 
     # read state on resume
     python .agents/skills/gh-issue/scripts/gh_issue_run.py get-state
+
+`init-run` requires the canonical issue URL selected from GitHub and records it
+as immutable `issue_url`, so repository identity never depends on local Git
+configuration. A completed run created before this key existed fails closed.
+Migrate it only from an independently recorded canonical issue URL:
+
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py migrate-issue-url --run-id 42-fix-login --issue-url https://github.com/owner/repo/issues/42
+
+The migration command accepts only a `done` legacy run whose issue number
+matches the URL, writes through the state-machine locks, and refuses to replace
+an existing repository identity.
 
 The exact flat-key schema, the phase transition table, and which hook reads
 which key live in `references/workflow-contract.md`.

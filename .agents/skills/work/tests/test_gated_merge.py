@@ -56,6 +56,9 @@ class GatedMergeTests(unittest.TestCase):
         state = {
             "run_id": self.run_id,
             "issue": "48",
+            "issue_url": (
+                "https://github.com/aram-devdocs/sailwind_online/issues/48"
+            ),
             "phase": "done",
             "branch": "feat/48-gated-self-merge",
             "worktree": ".worktrees/48-gated-self-merge",
@@ -253,12 +256,6 @@ class GatedMergeTests(unittest.TestCase):
 
     def success_responses(self):
         return [
-            (
-                ["gh", "repo", "view", "--json", "nameWithOwner"],
-                0,
-                {"nameWithOwner": self.repo},
-                "",
-            ),
             (self.pr_view_command(), 0, self.open_pr(), ""),
             (self.closure_command(), 0, self.closure_result(), ""),
             self.checks_response(),
@@ -293,12 +290,6 @@ class GatedMergeTests(unittest.TestCase):
 
     def merged_retry_responses(self, *issue_states, include_branch=True):
         responses = [
-            (
-                ["gh", "repo", "view", "--json", "nameWithOwner"],
-                0,
-                {"nameWithOwner": self.repo},
-                "",
-            ),
             (self.pr_view_command(), 0, self.merged_pr(), ""),
             (self.closure_command(), 0, self.closure_result(), ""),
             self.checks_response(),
@@ -337,7 +328,7 @@ class GatedMergeTests(unittest.TestCase):
         runner.assert_finished()
 
     def test_dry_run_checks_every_precondition_without_merging(self):
-        responses = self.success_responses()[:7]
+        responses = self.success_responses()[:6]
         runner = FakeRunner(responses)
 
         result = gated_merge.merge_completed_run(
@@ -382,6 +373,49 @@ class GatedMergeTests(unittest.TestCase):
         self.assertEqual(result.pr_number, 52)
         runner.assert_finished()
 
+    def test_uses_only_durable_repository_identity(self):
+        unrelated = "attacker/unrelated"
+
+        class WrongImplicitRepoRunner(FakeRunner):
+            def __call__(self, command):
+                if command == [
+                    "gh",
+                    "repo",
+                    "view",
+                    "--json",
+                    "nameWithOwner",
+                ]:
+                    self.calls.append(command)
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        json.dumps({"nameWithOwner": unrelated}),
+                        "",
+                    )
+                return super().__call__(command)
+
+        runner = WrongImplicitRepoRunner(self.success_responses())
+
+        result = gated_merge.merge_completed_run(
+            self.runs_dir,
+            self.run_id,
+            runner=runner,
+        )
+
+        self.assertTrue(result.merged)
+        self.assertNotIn(
+            ["gh", "repo", "view", "--json", "nameWithOwner"],
+            runner.calls,
+        )
+        self.assertFalse(
+            any(unrelated in part for call in runner.calls for part in call)
+        )
+        for call in runner.calls:
+            if call[:2] in (["gh", "pr"], ["gh", "issue"]):
+                self.assertIn("--repo", call)
+                self.assertEqual(call[call.index("--repo") + 1], self.repo)
+        runner.assert_finished()
+
     def test_rejects_incomplete_or_inconsistent_run_state_before_gh(self):
         cases = {
             "phase": {"phase": "wait-ci"},
@@ -389,7 +423,17 @@ class GatedMergeTests(unittest.TestCase):
             "spec gate": {"gate_spec": "REQUEST-CHANGES"},
             "run id": {"run_id": "49-other-run"},
             "issue": {"issue": "49"},
+            "missing issue URL": {"issue_url": ""},
+            "malformed issue URL": {"issue_url": "https://example.com/48"},
+            "wrong issue URL": {
+                "issue_url": (
+                    "https://github.com/aram-devdocs/sailwind_online/issues/49"
+                )
+            },
             "branch": {"branch": "feat/49-other-run"},
+            "wrong PR repository": {
+                "pr": "https://github.com/attacker/unrelated/pull/52"
+            },
             "pr": {"pr": "not-a-pr"},
         }
         for label, overrides in cases.items():
@@ -424,7 +468,7 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_rejects_pr_head_that_differs_from_reviewed_head(self):
         responses = self.success_responses()
-        responses[1] = (
+        responses[0] = (
             self.pr_view_command(),
             0,
             self.open_pr(headRefOid="b" * 40),
@@ -459,7 +503,7 @@ class GatedMergeTests(unittest.TestCase):
         for label, overrides in cases.items():
             with self.subTest(label=label):
                 responses = self.success_responses()
-                responses[1] = (
+                responses[0] = (
                     self.pr_view_command(),
                     0,
                     self.open_pr(**overrides),
@@ -491,7 +535,7 @@ class GatedMergeTests(unittest.TestCase):
         for label, checks in cases.items():
             with self.subTest(label=label):
                 responses = self.success_responses()
-                responses[3] = (responses[3][0], 1, checks, "")
+                responses[2] = (responses[2][0], 1, checks, "")
                 runner = FakeRunner(responses)
                 with self.assertRaises(gated_merge.MergePreconditionError):
                     gated_merge.merge_completed_run(
@@ -514,7 +558,7 @@ class GatedMergeTests(unittest.TestCase):
             with self.subTest(label=label):
                 responses = self.success_responses()
                 rc, output, error = replacement
-                responses[2] = (
+                responses[1] = (
                     self.closure_command(),
                     rc,
                     output,
@@ -531,7 +575,7 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_rechecks_the_same_head_immediately_before_merge(self):
         responses = self.success_responses()
-        responses[4] = (
+        responses[3] = (
             self.pr_view_command(),
             0,
             self.open_pr(headRefOid="b" * 40),
@@ -552,7 +596,7 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_rechecks_required_checks_at_the_final_mutation_boundary(self):
         responses = self.success_responses()
-        responses[6] = (
+        responses[5] = (
             self.checks_response()[0],
             1,
             [{"name": "gate", "state": "FAILURE", "bucket": "fail"}],
@@ -583,15 +627,15 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_rejects_failed_merge_or_post_merge_confirmation(self):
         cases = {
-            "merge command": (7, 1, "", "merge refused"),
+            "merge command": (6, 1, "", "merge refused"),
             "pr confirmation": (
-                8,
+                7,
                 0,
                 {"number": 52, "state": "OPEN", "mergedAt": None},
                 "",
             ),
             "issue confirmation": (
-                9,
+                8,
                 0,
                 {"number": 48, "state": "OPEN"},
                 "",
@@ -615,7 +659,7 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_retry_after_transient_confirmation_failure_is_idempotent(self):
         first_responses = self.success_responses()
-        first_responses[8] = (
+        first_responses[7] = (
             self.confirmation_pr_response()[0],
             1,
             "",

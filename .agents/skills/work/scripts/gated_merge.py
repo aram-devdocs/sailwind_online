@@ -125,6 +125,7 @@ def load_state(runs_dir, run_id):
         raise MergePreconditionError(
             f"recorded issue {issue!r} does not match run {run_id!r}"
         )
+    repository_from_issue_url(state.get("issue_url", ""), int(issue))
     if state.get("branch") != f"feat/{run_id}":
         raise MergePreconditionError(
             f"recorded branch {state.get('branch')!r} does not match run "
@@ -183,21 +184,32 @@ def load_reviewed_head(runs_dir, run_id):
     return head.lower()
 
 
-def repository_name(runner):
-    result = runner(["gh", "repo", "view", "--json", "nameWithOwner"])
-    data = read_json_result(
-        result,
-        "repository lookup",
-        MergePreconditionError,
-    )
-    repo = data.get("nameWithOwner") if isinstance(data, dict) else None
+def repository_from_issue_url(value, expected_issue):
+    """Return durable owner/repo from one canonical recorded issue URL."""
+    parsed = urlparse(value)
+    parts = [part for part in parsed.path.split("/") if part]
     if (
-        not isinstance(repo, str)
-        or not REPOSITORY_RE.fullmatch(repo)
-        or any(part in (".", "..") for part in repo.split("/"))
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 4
+        or parts[2] != "issues"
+        or parts[3] != str(expected_issue)
     ):
         raise MergePreconditionError(
-            f"repository lookup returned invalid nameWithOwner: {repo!r}"
+            f"recorded issue_url is not canonical for issue "
+            f"#{expected_issue}: {value!r}"
+        )
+    repo = f"{parts[0]}/{parts[1]}"
+    if (
+        not REPOSITORY_RE.fullmatch(repo)
+        or any(part in (".", "..") for part in repo.split("/"))
+        or value != f"https://github.com/{repo}/issues/{expected_issue}"
+    ):
+        raise MergePreconditionError(
+            f"recorded issue_url contains invalid repository identity: "
+            f"{value!r}"
         )
     return repo
 
@@ -602,11 +614,11 @@ def merge_completed_run(
     reviewed_head = load_reviewed_head(runs_dir, run_id)
     issue_number = int(state["issue"])
     pr_number, recorded_repo = parse_recorded_pr(state.get("pr", ""))
-    repo = repository_name(runner)
+    repo = repository_from_issue_url(state["issue_url"], issue_number)
     if recorded_repo is not None and recorded_repo != repo:
         raise MergePreconditionError(
             f"recorded PR repository {recorded_repo!r} does not match "
-            f"current repository {repo!r}"
+            f"durable issue repository {repo!r}"
         )
 
     first_pr = load_pr(runner, pr_number, repo)

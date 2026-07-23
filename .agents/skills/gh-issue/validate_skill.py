@@ -25,6 +25,7 @@ SKILL_DIR = Path(__file__).resolve().parent
 # Subcommands the docs promise and callers rely on.
 REQUIRED_SUBCOMMANDS = (
     "init-run",
+    "migrate-issue-url",
     "update-state",
     "get-state",
     "set-active",
@@ -47,7 +48,7 @@ REQUIRED_SECTIONS = (
 
 # Flat keys the contract must document.
 REQUIRED_KEYS = (
-    "run_id", "issue", "phase", "branch", "worktree", "pr",
+    "run_id", "issue", "issue_url", "phase", "branch", "worktree", "pr",
     "gate_spec", "gate_quality", "gate_architecture", "gate_security",
     "plan_open", "updated_at",
 )

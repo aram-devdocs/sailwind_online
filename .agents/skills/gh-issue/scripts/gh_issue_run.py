@@ -17,6 +17,7 @@ each key lands on its own line.
 Allowed flat keys (nothing else may be set):
     run_id            <N>-<slug> identifier, also the run directory name
     issue             the GitHub issue number, as a string
+    issue_url         canonical GitHub issue URL binding owner/repo/issue
     phase             one of: investigate plan implement verify review
                               pr wait-ci cleanup done
     branch            feat/<N>-<slug>
@@ -37,7 +38,8 @@ Two invariants are load-bearing and MUST NOT be removed:
 
 Subcommands
 -----------
-    init-run --issue N --slug SLUG [--resume] [--no-git]
+    init-run --issue N --slug SLUG --issue-url URL [--resume] [--no-git]
+    migrate-issue-url --run-id RUN_ID --issue-url URL
     update-state --key K --value V
     get-state [--key K]
     set-active RUN_ID
@@ -62,6 +64,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 # The four review gates in fixed order (spec first, security last). Mirrors
 # SW_GATE_ORDER in .claude/hooks/_lib.sh; keep the two in sync.
@@ -86,6 +89,7 @@ PHASES = (
 ALLOWED_KEYS = (
     "run_id",
     "issue",
+    "issue_url",
     "phase",
     "branch",
     "worktree",
@@ -252,11 +256,45 @@ def now_utc():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def blank_state(run_id, issue, slug):
+def parse_issue_url(value, expected_issue):
+    """Validate a canonical GitHub issue URL and return owner/repository."""
+    if not isinstance(value, str):
+        raise SystemExit("error: --issue-url must be a canonical GitHub URL")
+    parsed = urlparse(value)
+    parts = [part for part in parsed.path.split("/") if part]
+    canonical = ""
+    if len(parts) == 4:
+        canonical = (
+            f"https://github.com/{parts[0]}/{parts[1]}/issues/"
+            f"{expected_issue}"
+        )
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 4
+        or parts[2] != "issues"
+        or parts[3] != str(expected_issue)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[0])
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1])
+        or parts[0] in (".", "..")
+        or parts[1] in (".", "..")
+        or value != canonical
+    ):
+        raise SystemExit(
+            f"error: --issue-url must be the canonical GitHub URL for issue "
+            f"#{expected_issue}, found {value!r}"
+        )
+    return f"{parts[0]}/{parts[1]}"
+
+
+def blank_state(run_id, issue, slug, issue_url):
     """A fresh state dict with keys in contract order; phase=investigate."""
     return {
         "run_id": run_id,
         "issue": str(issue),
+        "issue_url": issue_url,
         "phase": "investigate",
         "branch": f"feat/{run_id}",
         "worktree": f".worktrees/{run_id}",
@@ -328,14 +366,46 @@ def cmd_init_run(args):
             raise SystemExit(
                 f"error: run '{run_id}' already exists at {spath}; pass "
                 "--resume to reattach to it"
-            )
+        )
         if spath.exists() and args.resume:
             data = read_state(spath)
+            recorded_url = data.get("issue_url", "")
+            if not recorded_url:
+                if data.get("phase") == "done":
+                    raise SystemExit(
+                        f"error: completed legacy run '{run_id}' has no "
+                        "issue_url; use migrate-issue-url with an independently "
+                        "recorded GitHub issue URL"
+                    )
+                if not args.issue_url:
+                    raise SystemExit(
+                        f"error: legacy run '{run_id}' has no issue_url; pass "
+                        "--issue-url to bind its repository identity"
+                    )
+                parse_issue_url(args.issue_url, args.issue)
+                data["issue_url"] = args.issue_url
+            else:
+                parse_issue_url(recorded_url, args.issue)
+                if args.issue_url and args.issue_url != recorded_url:
+                    raise SystemExit(
+                        f"error: --issue-url {args.issue_url!r} does not match "
+                        f"recorded identity {recorded_url!r}"
+                    )
             data["updated_at"] = now_utc()
             write_state(spath, data)
             print(f"resumed existing run '{run_id}' at phase '{data.get('phase')}'")
         else:
-            data = blank_state(run_id, args.issue, args.slug)
+            if not args.issue_url:
+                raise SystemExit(
+                    "error: --issue-url is required when initializing a run"
+                )
+            parse_issue_url(args.issue_url, args.issue)
+            data = blank_state(
+                run_id,
+                args.issue,
+                args.slug,
+                args.issue_url,
+            )
             write_state(spath, data)
             print(f"initialized run '{run_id}' (phase=investigate) at {spath}")
 
@@ -379,6 +449,10 @@ def cmd_update_state(args):
             f"error: '{args.key}' is not an allowed flat key. Allowed: "
             + ", ".join(ALLOWED_KEYS)
         )
+    if args.key == "issue_url":
+        raise SystemExit(
+            "error: issue_url is immutable; use init-run or migrate-issue-url"
+        )
     if args.key == "phase" and args.value not in PHASES:
         raise SystemExit(
             f"error: phase '{args.value}' is not valid. One of: "
@@ -397,6 +471,51 @@ def cmd_update_state(args):
     finally:
         release_lock(lock)
     print(f"set {args.key}={args.value!r} in run '{run_id}'")
+
+
+def cmd_migrate_issue_url(args):
+    """Bind a completed legacy run to an independently supplied issue URL."""
+    run_id = resolve_run_id(args)
+    global_lock = acquire_lock(runs_dir(args))
+    lock = None
+    try:
+        rundir = run_dir(args, run_id)
+        lock = acquire_lock(rundir)
+        spath = state_path(args, run_id)
+        data = read_state(spath)
+        if data.get("phase") != "done":
+            raise SystemExit(
+                f"error: migrate-issue-url is only for completed legacy runs; "
+                f"{run_id!r} is at phase {data.get('phase')!r}"
+            )
+        issue = data.get("issue", "")
+        if not issue.isdigit() or int(issue) <= 0:
+            raise SystemExit(
+                f"error: legacy run {run_id!r} has invalid issue {issue!r}"
+            )
+        if not run_id.startswith(issue + "-"):
+            raise SystemExit(
+                f"error: legacy run {run_id!r} does not match issue "
+                f"{issue!r}"
+            )
+        parse_issue_url(args.issue_url, issue)
+        recorded = data.get("issue_url", "")
+        if recorded and recorded != args.issue_url:
+            raise SystemExit(
+                f"error: legacy run already records issue_url {recorded!r}; "
+                "repository identity is immutable"
+            )
+        if recorded == args.issue_url:
+            print(f"issue URL already recorded for run '{run_id}'")
+            return
+        data["issue_url"] = args.issue_url
+        data["updated_at"] = now_utc()
+        write_state(spath, data)
+    finally:
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
+    print(f"migrated issue URL for completed run '{run_id}'")
 
 
 def cmd_get_state(args):
@@ -549,6 +668,17 @@ def cmd_validate_resume(args):
              f"  recorded phase: {data.get('phase', '?')}"]
 
     if data.get("phase") == "done":
+        if not data.get("issue_url"):
+            lines.append(
+                "  repository: MISSING durable issue_url for legacy run"
+            )
+            lines.append(
+                "  ACTION: run migrate-issue-url with an independently "
+                "recorded canonical GitHub issue URL before gated merge"
+            )
+            print("\n".join(lines))
+            return
+        parse_issue_url(data["issue_url"], data.get("issue", ""))
         lines.append(
             "  worktree: cleanup complete; absence is expected at phase done"
         )
@@ -561,6 +691,11 @@ def cmd_validate_resume(args):
         )
         print("\n".join(lines))
         return
+
+    repo = parse_issue_url(
+        data.get("issue_url", ""),
+        data.get("issue", ""),
+    )
 
     # Worktree present?
     if data.get("worktree") and worktree.exists():
@@ -592,7 +727,16 @@ def cmd_validate_resume(args):
     # PR reality?
     if pr:
         rc, out, _ = run_cmd(
-            ["gh", "pr", "view", pr, "--json", "state,mergeStateStatus,number"]
+            [
+                "gh",
+                "pr",
+                "view",
+                pr,
+                "--repo",
+                repo,
+                "--json",
+                "state,mergeStateStatus,number",
+            ]
         )
         if rc == 0 and out:
             try:
@@ -625,13 +769,28 @@ def cmd_poll_pr(args):
     pr = data.get("pr", "")
     if not pr:
         raise SystemExit(f"error: run '{run_id}' has no PR recorded yet")
+    repo = parse_issue_url(
+        data.get("issue_url", ""),
+        data.get("issue", ""),
+    )
     rc, out, err = run_cmd(
-        ["gh", "pr", "checks", pr, "--json", "name,state,bucket"]
+        [
+            "gh",
+            "pr",
+            "checks",
+            pr,
+            "--repo",
+            repo,
+            "--json",
+            "name,state,bucket",
+        ]
     )
     if rc != 0 or not out:
         # gh pr checks exits non-zero when checks are failing/pending; fall back
         # to the plain text form so we still print something useful.
-        rc2, out2, err2 = run_cmd(["gh", "pr", "checks", pr])
+        rc2, out2, err2 = run_cmd(
+            ["gh", "pr", "checks", pr, "--repo", repo]
+        )
         print(f"pr {pr} checks (raw):")
         print(out2 or err2 or err or "no output")
         return
@@ -871,11 +1030,27 @@ def build_parser():
     sp = sub.add_parser("init-run", help="create a run and its worktree")
     sp.add_argument("--issue", required=True, help="GitHub issue number N")
     sp.add_argument("--slug", required=True, help="kebab-case slug for the run")
+    sp.add_argument(
+        "--issue-url",
+        help="canonical https://github.com/<owner>/<repo>/issues/<N> URL",
+    )
     sp.add_argument("--resume", action="store_true",
                     help="reattach to an existing run instead of refusing")
     sp.add_argument("--no-git", action="store_true",
                     help="skip 'git worktree add' (tests / authoring)")
     sp.set_defaults(func=cmd_init_run)
+
+    sp = sub.add_parser(
+        "migrate-issue-url",
+        help="bind a completed legacy run to an explicit GitHub issue URL",
+    )
+    sp.add_argument("--run-id", required=True, help="completed legacy run id")
+    sp.add_argument(
+        "--issue-url",
+        required=True,
+        help="canonical https://github.com/<owner>/<repo>/issues/<N> URL",
+    )
+    sp.set_defaults(func=cmd_migrate_issue_url)
 
     sp = sub.add_parser("update-state", help="set one flat key (locked, backed up)")
     sp.add_argument("--key", required=True, help="flat key to set")
