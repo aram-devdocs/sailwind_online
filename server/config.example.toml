@@ -47,7 +47,7 @@ hello_min_interval_ms = 250
 # Process-wide minimum interval between database admissions for identities
 # without an active session. Active-identity reconnects have a separate
 # per-player window, so reconnect churn cannot monopolize this new-identity
-# budget. Must be in 1..=250.
+# budget. Must be in 1..=1000.
 new_session_min_interval_ms = 30
 
 # Hard ceilings on live LiteNetLib transport peers, including peers that have

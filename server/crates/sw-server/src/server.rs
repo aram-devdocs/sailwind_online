@@ -64,7 +64,7 @@ pub struct Server {
     weather_epoch_day: u32,
     hello_limiter: RateLimiter,
     source_session_limiter: BoundedRateLimiter<IpAddr>,
-    reconnect_limiter: RateLimiter,
+    reconnect_limiter: BoundedRateLimiter<u64>,
     new_session_limiter: GlobalRateLimiter,
     trade_limiter: RateLimiter,
     client_state_limiter: RateLimiter,
@@ -106,7 +106,12 @@ impl Server {
             cfg.hello_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
-        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let reconnect_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            identity_players
+                .len()
+                .max(cfg.max_player_rows_u32() as usize),
+        );
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -801,11 +806,11 @@ impl Server {
         self.hello_limiter.clear(u64::from(peer));
         if let Some(s) = self.sessions.remove(&peer) {
             self.world.remove(s.player_id);
-            // Drop the player's throttle state across every message class: a
-            // departed player's entries are useless and leaving them behind would
-            // let connection churn accrete stale entries in the limiter maps.
+            // Drop session-scoped message throttles. The reconnect cooldown is
+            // intentionally retained in its bounded map, otherwise a known
+            // identity can disconnect and rotate source addresses to repeat
+            // persistence admission inside one per-player window.
             self.trade_limiter.clear(s.player_id);
-            self.reconnect_limiter.clear(s.player_id);
             self.client_state_limiter.clear(s.player_id);
             self.chat_limiter.clear(s.player_id);
             self.econ_limiter.clear(s.player_id);
@@ -1111,6 +1116,9 @@ mod handshake_tests {
         let cfg = Config::default();
         let world = World::new(Grid::new(cfg.cell_size_m));
         let identity_players = load_identity_players(&db).unwrap();
+        let reconnect_key_budget = identity_players
+            .len()
+            .max(cfg.max_player_rows_u32() as usize);
         Server {
             host: Host::bind_with_limits(
                 "127.0.0.1:0",
@@ -1134,7 +1142,10 @@ mod handshake_tests {
                 cfg.hello_min_interval_ms_i64(),
                 cfg.max_transport_peers_usize(),
             ),
-            reconnect_limiter: RateLimiter::new(cfg.hello_min_interval_ms_i64()),
+            reconnect_limiter: BoundedRateLimiter::new(
+                cfg.hello_min_interval_ms_i64(),
+                reconnect_key_budget,
+            ),
             new_session_limiter: GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64()),
             trade_limiter: RateLimiter::new(cfg.trade_min_interval_ms_i64()),
             client_state_limiter: RateLimiter::new(cfg.client_state_min_interval_ms_i64()),
@@ -1935,6 +1946,49 @@ mod handshake_tests {
     }
 
     #[test]
+    fn reconnect_cooldown_survives_disconnect_and_source_rotation() {
+        let mut server = make_server();
+        let hello = hello_envelope(
+            "disconnect-rotation-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let first_admission_ms = 1_000;
+        let (first_client, first_peer) = connect_peer_from(&mut server, "127.0.0.1");
+
+        deliver_hello_at(&mut server, first_peer, &hello, first_admission_ms);
+        assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+        let player_id = server.sessions[&first_peer].player_id;
+
+        server
+            .on_disconnect(first_peer, DisconnectReason::Remote)
+            .unwrap();
+        assert_eq!(
+            server.reconnect_limiter.tracked_count(),
+            1,
+            "a completed disconnect must retain the per-player reconnect window"
+        );
+
+        let (rotated_client, rotated_peer) = connect_peer_from(&mut server, "127.0.0.2");
+        deliver_hello_at(&mut server, rotated_peer, &hello, first_admission_ms + 1);
+        assert_eq!(
+            receive_server_hello(&rotated_client),
+            (false, "server busy; retry".to_string()),
+            "source rotation inside the window must not repeat persistence admission"
+        );
+        assert!(!server.sessions.contains_key(&rotated_peer));
+
+        let after_expiry_ms = first_admission_ms + server.cfg.hello_min_interval_ms_i64() + 1;
+        deliver_hello_at(&mut server, rotated_peer, &hello, after_expiry_ms);
+        assert_eq!(
+            receive_server_hello(&rotated_client),
+            (true, String::new()),
+            "the same reconnect must become eligible when the window expires"
+        );
+        assert_eq!(server.sessions[&rotated_peer].player_id, player_id);
+    }
+
+    #[test]
     fn same_identity_port_rotation_does_not_starve_another_source() {
         let mut server = make_server();
         let (first_client, first_peer) = connect_peer_from(&mut server, "127.0.0.1");
@@ -2322,7 +2376,10 @@ mod aoi_harden_tests {
             cfg.hello_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
-        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let reconnect_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_player_rows_u32() as usize,
+        );
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -2536,7 +2593,10 @@ mod market_dispatch_tests {
             cfg.hello_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
-        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let reconnect_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_player_rows_u32() as usize,
+        );
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -2783,7 +2843,10 @@ mod input_hardening_tests {
             cfg.hello_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
-        let reconnect_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
+        let reconnect_limiter = BoundedRateLimiter::new(
+            cfg.hello_min_interval_ms_i64(),
+            cfg.max_player_rows_u32() as usize,
+        );
         let new_session_limiter = GlobalRateLimiter::new(cfg.new_session_min_interval_ms_i64());
         let trade_limiter = RateLimiter::new(cfg.trade_min_interval_ms_i64());
         let client_state_limiter = RateLimiter::new(cfg.client_state_min_interval_ms_i64());
@@ -3321,10 +3384,10 @@ mod input_hardening_tests {
         );
     }
 
-    // ---- disconnect clears every class ----
+    // ---- disconnect clears session classes and retains reconnect cooldown ----
 
     #[test]
-    fn disconnect_clears_every_message_class_limiter() {
+    fn disconnect_clears_session_limiters_and_retains_reconnect_cooldown() {
         let mut server = make_server(Config {
             hello_min_interval_ms: 250,
             client_state_min_interval_ms: 250,
@@ -3348,9 +3411,10 @@ mod input_hardening_tests {
         send_moor(&mut server, peer, &moor_envelope(0.0, 0.0, "m"), 1_000);
         // Seed the trade limiter directly (its handler needs a market envelope,
         // covered in the market dispatch suite); the point here is that
-        // on_disconnect clears every class.
+        // on_disconnect clears each session-scoped class.
         server.trade_limiter.allow(pid, 1_000);
         assert_eq!(server.hello_limiter.tracked_count(), 1);
+        assert_eq!(server.reconnect_limiter.tracked_count(), 1);
         assert_eq!(server.client_state_limiter.tracked_count(), 1);
         assert_eq!(server.econ_limiter.tracked_count(), 1);
         assert_eq!(server.chat_limiter.tracked_count(), 1);
@@ -3362,6 +3426,11 @@ mod input_hardening_tests {
             .unwrap();
 
         assert_eq!(server.hello_limiter.tracked_count(), 0);
+        assert_eq!(
+            server.reconnect_limiter.tracked_count(),
+            1,
+            "disconnect must retain the bounded per-player reconnect cooldown"
+        );
         assert_eq!(server.client_state_limiter.tracked_count(), 0);
         assert_eq!(server.econ_limiter.tracked_count(), 0);
         assert_eq!(server.chat_limiter.tracked_count(), 0);

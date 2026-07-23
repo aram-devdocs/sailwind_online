@@ -40,10 +40,10 @@ pub const MAX_HELLO_MIN_INTERVAL_MS: u32 = 250;
 /// unthrottled flood.
 const MIN_HELLO_MIN_INTERVAL_MS: u32 = 1;
 
-/// Upper bound on the process-wide admission interval for new sessions. It
-/// matches the client's retry cadence so a busy rejection can be retried on
-/// the next scheduled hello.
-pub const MAX_NEW_SESSION_MIN_INTERVAL_MS: u32 = 250;
+/// Upper bound on the process-wide admission interval for new sessions. One
+/// second is long enough to enforce a bounded retry exchange while keeping an
+/// operator misconfiguration from wedging fresh identities indefinitely.
+pub const MAX_NEW_SESSION_MIN_INTERVAL_MS: u32 = 1_000;
 
 /// Highest configurable live transport-peer ceiling.
 pub const MAX_TRANSPORT_PEERS: u32 = 65_535;

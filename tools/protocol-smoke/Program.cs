@@ -113,9 +113,11 @@ namespace Sailwind.ProtocolSmoke
                 "server_name = \"protocol-smoke\"\n" +
                 "tick_hz = 30\n" +
                 "snapshot_hz = 4\n" +
-                // Force consecutive fresh identities through the retryable
-                // admission response so check 3 cannot pass by timing luck.
-                "new_session_min_interval_ms = 250\n";
+                // Check 3 bounds B's first hello exchange to half a second after
+                // B is already transport-connected. This one-second gate makes
+                // the exact transient response an enforced precondition rather
+                // than a scheduler-dependent observation.
+                "new_session_min_interval_ms = 1000\n";
             File.WriteAllText(configPath, contents);
             return configPath;
         }
