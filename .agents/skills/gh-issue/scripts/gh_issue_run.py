@@ -117,6 +117,7 @@ LOCK_WAIT_SECONDS = 10
 COMMAND_TIMEOUT_SECONDS = 30
 PROBE_TIMEOUT_SECONDS = 5
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+RUN_ID_RE = re.compile(r"[1-9][0-9]*-[a-z0-9]+(?:-[a-z0-9]+)*")
 REPOSITORY_CONFIG = Path(__file__).resolve().parents[3] / "repository.json"
 
 
@@ -153,8 +154,32 @@ def runs_dir(args):
     return repo_root() / ".agents" / "runs"
 
 
+def validate_run_id(run_id):
+    """Return one canonical run id or fail before it can become a path."""
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise SystemExit(
+            f"error: invalid run id {run_id!r}; expected "
+            "<positive-issue>-<lowercase-hyphen-slug>"
+        )
+    return run_id
+
+
 def run_dir(args, run_id):
-    return runs_dir(args) / run_id
+    run_id = validate_run_id(run_id)
+    root = runs_dir(args).resolve(strict=False)
+    candidate = (root / run_id).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit(
+            f"error: invalid run id {run_id!r}; resolved path escapes {root}"
+        ) from exc
+    if candidate.parent != root:
+        raise SystemExit(
+            f"error: invalid run id {run_id!r}; run must be a direct child "
+            f"of {root}"
+        )
+    return candidate
 
 
 def state_path(args, run_id):
@@ -175,6 +200,7 @@ def active_path(args):
 
 def write_active_run_locked(args, run_id):
     """Atomically replace the active marker while the global lock is held."""
+    run_id = validate_run_id(run_id)
     marker = active_path(args)
     marker.parent.mkdir(parents=True, exist_ok=True)
     tmp = marker.with_name(marker.name + ".tmp")
@@ -248,8 +274,12 @@ def unlock_file(stream):
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def acquire_lock(rundir):
+def acquire_lock(rundir, clock=None, sleeper=None):
     """Take a bounded process-owned advisory lock."""
+    if clock is None:
+        clock = time.monotonic
+    if sleeper is None:
+        sleeper = time.sleep
     lock = rundir / ".lock"
     rundir.mkdir(parents=True, exist_ok=True)
     try:
@@ -261,18 +291,18 @@ def acquire_lock(rundir):
     except OSError as exc:
         raise SystemExit(f"error: cannot open lock {lock}: {exc}") from exc
 
-    deadline = time.time() + LOCK_WAIT_SECONDS
+    deadline = clock() + LOCK_WAIT_SECONDS
     while True:
         try:
             try_lock_file(stream)
             return LockHandle(lock, stream)
         except OSError:
-            if time.time() > deadline:
+            if clock() >= deadline:
                 stream.close()
                 raise SystemExit(
                     f"error: could not acquire {lock}; another writer is active"
                 )
-            time.sleep(0.2)
+            sleeper(0.2)
 
 
 def release_lock(lock):
@@ -504,7 +534,7 @@ def write_state(path, data):
 # --------------------------------------------------------------------------- #
 
 def cmd_init_run(args):
-    run_id = f"{args.issue}-{args.slug}"
+    run_id = validate_run_id(f"{args.issue}-{args.slug}")
     rundir = run_dir(args, run_id)
     spath = state_path(args, run_id)
 
@@ -816,7 +846,7 @@ def cmd_record_reviewed_head(args):
 
 
 def cmd_set_active(args):
-    run_id = args.run_id
+    run_id = validate_run_id(args.run_id)
     if not state_path(args, run_id).exists():
         raise SystemExit(
             f"error: run '{run_id}' has no state.json; cannot set it active"
@@ -826,6 +856,7 @@ def cmd_set_active(args):
 
 
 def cmd_clear_active(args):
+    expected_run_id = validate_run_id(args.expected_run_id)
     root = runs_dir(args)
     lock = acquire_lock(root)
     try:
@@ -837,16 +868,17 @@ def cmd_clear_active(args):
             named = ap.read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise SystemExit(f"error: cannot read active run marker: {exc}")
-        if named != args.expected_run_id:
+        named = validate_run_id(named)
+        if named != expected_run_id:
             raise SystemExit(
                 f"error: active run changed to {named!r}; expected "
-                f"{args.expected_run_id!r}, so the replacement was preserved"
+                f"{expected_run_id!r}, so the replacement was preserved"
             )
         try:
             ap.unlink()
         except OSError as exc:
             raise SystemExit(f"error: cannot clear active run marker: {exc}")
-        print(f"active run '{args.expected_run_id}' cleared")
+        print(f"active run '{expected_run_id}' cleared")
     finally:
         release_lock(lock)
 
@@ -1207,6 +1239,10 @@ def cmd_cleanup_worktree(args):
             else:
                 print(f"worktree {worktree} already absent")
 
+            after_remove = getattr(args, "_after_remove_hook", None)
+            if after_remove is not None:
+                after_remove()
+
             if target in registered_worktrees(root):
                 raise SystemExit(
                     f"error: worktree {worktree} remains registered after "
@@ -1236,12 +1272,12 @@ def cmd_cleanup_worktree(args):
 
 def resolve_run_id(args):
     if getattr(args, "run_id", None):
-        return args.run_id
+        return validate_run_id(args.run_id)
     ap = active_path(args)
     if ap.exists():
         named = ap.read_text(encoding="utf-8").strip()
         if named:
-            return named
+            return validate_run_id(named)
     raise SystemExit(
         "error: no run specified and no active run marker; pass --run-id or "
         "set-active first"

@@ -570,6 +570,32 @@ class GatedMergeTests(unittest.TestCase):
         self.assertEqual(set(state), self.original_state_keys)
         self.assertNotIn("issue_url", state)
 
+    def test_run_id_is_validated_before_any_run_path_read(self):
+        outside = self.runs_dir.parent / (
+            self.runs_dir.name + "-outside-run"
+        )
+        for run_id in (
+            "../outside-run",
+            r"..\outside-run",
+            str(outside.resolve()),
+            "/absolute-run",
+            "48-nested/run",
+            "48-dot.",
+        ):
+            with (
+                self.subTest(run_id=run_id),
+                self.assertRaisesRegex(
+                    gated_merge.MergePreconditionError,
+                    "invalid",
+                ),
+            ):
+                gated_merge.merge_completed_run(
+                    self.runs_dir,
+                    run_id,
+                    runner=FakeRunner([]),
+                )
+            self.assertFalse(outside.exists())
+
     def test_rejects_missing_or_malformed_reviewed_head_before_gh(self):
         marker = self.runs_dir / self.run_id / "reviewed-head"
         for label, value in {

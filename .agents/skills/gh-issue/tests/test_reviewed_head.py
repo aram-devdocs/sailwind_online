@@ -358,6 +358,74 @@ class ReviewedHeadTests(unittest.TestCase):
         replacement = gh_issue_run.acquire_lock(first_dir)
         gh_issue_run.release_lock(replacement)
 
+    def test_lock_deadline_uses_monotonic_clock_during_wall_rollback(self):
+        owner = gh_issue_run.acquire_lock(self.runs_dir / "clock-lock")
+        ticks = iter((10.0, 10.0, 11.0))
+        wall_clock = mock.Mock(side_effect=(1000.0, -1000.0))
+        try:
+            with (
+                mock.patch.object(
+                    gh_issue_run,
+                    "LOCK_WAIT_SECONDS",
+                    1,
+                ),
+                mock.patch.object(gh_issue_run.time, "time", wall_clock),
+                self.assertRaisesRegex(SystemExit, "another writer is active"),
+            ):
+                gh_issue_run.acquire_lock(
+                    self.runs_dir / "clock-lock",
+                    clock=lambda: next(ticks),
+                    sleeper=lambda _: None,
+                )
+        finally:
+            gh_issue_run.release_lock(owner)
+        wall_clock.assert_not_called()
+
+    def test_run_paths_reject_traversal_and_absolute_ids_before_io(self):
+        args = SimpleNamespace(runs_dir=str(self.runs_dir))
+        outside = self.runs_dir.parent / (
+            self.runs_dir.name + "-outside-run"
+        )
+        invalid_ids = (
+            "../outside-run",
+            r"..\outside-run",
+            str(outside.resolve()),
+            "/absolute-run",
+            "15-dot.",
+            "15-nested/run",
+        )
+        helpers = (
+            gh_issue_run.run_dir,
+            gh_issue_run.state_path,
+            gh_issue_run.reviewed_head_path,
+            gh_issue_run.issue_url_path,
+        )
+        for run_id in invalid_ids:
+            for helper in helpers:
+                with (
+                    self.subTest(run_id=run_id, helper=helper.__name__),
+                    self.assertRaisesRegex(SystemExit, "invalid run id"),
+                ):
+                    helper(args, run_id)
+
+            migrate_args = SimpleNamespace(
+                runs_dir=str(self.runs_dir),
+                run_id=run_id,
+                issue_url=self.issue_url,
+            )
+            with (
+                self.subTest(run_id=run_id, command="migrate"),
+                mock.patch.object(
+                    gh_issue_run,
+                    "acquire_lock",
+                    side_effect=AssertionError("lock attempted"),
+                ) as acquire,
+                self.assertRaisesRegex(SystemExit, "invalid run id"),
+            ):
+                gh_issue_run.cmd_migrate_issue_url(migrate_args)
+            acquire.assert_not_called()
+            self.assertFalse(outside.exists())
+
     def test_migrates_completed_legacy_run_from_explicit_issue_url(self):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         state["issue_url"] = self.issue_url
@@ -841,11 +909,23 @@ class ReviewedHeadTests(unittest.TestCase):
             self.run_id + "\n",
         )
 
-    def test_cleanup_holds_global_lock_through_done_write(self):
+    def test_cleanup_excludes_recreation_through_done_write(self):
         (self.runs_dir / "active").write_text(
             self.run_id + "\n",
             encoding="utf-8",
         )
+        (self.run_dir / "reviewed-head").write_text(
+            self.head + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        worktree.mkdir(parents=True)
+        registry = (
+            f"worktree {worktree}\n"
+            f"HEAD {self.head}\n"
+            "branch refs/heads/feat/15-ingame-handshake\n"
+        )
+        checkpoints = []
         args = SimpleNamespace(
             runs_dir=str(self.runs_dir),
             run_id=self.run_id,
@@ -856,18 +936,45 @@ class ReviewedHeadTests(unittest.TestCase):
 
         def inspect_registry(command, cwd=None):
             nonlocal registry_reads
-            registry_reads += 1
-            self.assertEqual(
-                command,
-                ["git", "worktree", "list", "--porcelain"],
-            )
-            self.assertTrue((self.runs_dir / ".lock").exists())
-            return 0, "", ""
+            if command == ["git", "worktree", "list", "--porcelain"]:
+                registry_reads += 1
+                return (0, registry, "") if registry_reads == 1 else (0, "", "")
+            if command[:2] == ["git", "status"]:
+                return 0, "", ""
+            if command[:3] == ["git", "worktree", "remove"]:
+                worktree.rmdir()
+                return 0, "", ""
+            raise AssertionError(f"unexpected command: {command}")
+
+        competing = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            issue="15",
+            slug="ingame-handshake",
+            issue_url=self.issue_url,
+            resume=True,
+            no_git=False,
+        )
+
+        def attempt_recreation():
+            checkpoints.append("after-remove")
+            self.assertFalse(worktree.exists())
+            with self.assertRaisesRegex(
+                SystemExit,
+                "another writer is active",
+            ):
+                gh_issue_run.cmd_init_run(competing)
+            self.assertFalse(worktree.exists())
 
         def assert_locked_write(path, data):
-            self.assertTrue((self.runs_dir / ".lock").exists())
+            checkpoints.append("done-write")
+            with self.assertRaisesRegex(
+                SystemExit,
+                "another writer is active",
+            ):
+                gh_issue_run.acquire_lock(self.runs_dir)
             return original_write_state(path, data)
 
+        args._after_remove_hook = attempt_recreation
         with (
             mock.patch.object(
                 gh_issue_run,
@@ -884,10 +991,13 @@ class ReviewedHeadTests(unittest.TestCase):
                 "write_state",
                 side_effect=assert_locked_write,
             ),
+            mock.patch.object(gh_issue_run, "LOCK_WAIT_SECONDS", 0),
         ):
             gh_issue_run.cmd_cleanup_worktree(args)
 
         self.assertEqual(registry_reads, 2)
+        self.assertEqual(checkpoints, ["after-remove", "done-write"])
+        self.assertFalse(worktree.exists())
         replacement = gh_issue_run.acquire_lock(self.runs_dir)
         gh_issue_run.release_lock(replacement)
         state = json.loads(self.state_path.read_text(encoding="utf-8"))

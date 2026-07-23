@@ -76,6 +76,27 @@ class MergeResult(NamedTuple):
     merged: bool
 
 
+def run_directory(runs_dir, run_id):
+    """Return a contained direct-child run path for one canonical run id."""
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise MergePreconditionError(
+            f"recorded run id is invalid: {run_id!r}"
+        )
+    root = Path(runs_dir).resolve(strict=False)
+    candidate = (root / run_id).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise MergePreconditionError(
+            f"recorded run id resolves outside the runs directory: {run_id!r}"
+        ) from exc
+    if candidate.parent != root:
+        raise MergePreconditionError(
+            f"recorded run id is not a direct child: {run_id!r}"
+        )
+    return candidate
+
+
 def trusted_repository():
     """Read the one tracked GitHub repository identity, failing closed."""
     try:
@@ -146,7 +167,7 @@ def load_state(runs_dir, run_id):
         raise MergePreconditionError(
             f"recorded run id is invalid: {run_id!r}"
         )
-    state_path = Path(runs_dir) / run_id / "state.json"
+    state_path = run_directory(runs_dir, run_id) / "state.json"
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -218,7 +239,7 @@ def parse_recorded_pr(value):
 
 def load_reviewed_head(runs_dir, run_id):
     """Read the state-machine-owned commit approved by all four reviewers."""
-    marker = Path(runs_dir) / run_id / "reviewed-head"
+    marker = run_directory(runs_dir, run_id) / "reviewed-head"
     try:
         head = marker.read_text(encoding="utf-8").strip()
     except OSError as exc:
@@ -234,7 +255,7 @@ def load_reviewed_head(runs_dir, run_id):
 
 def load_issue_url(runs_dir, run_id, expected_issue):
     """Read the immutable state-machine-owned issue URL companion marker."""
-    marker = Path(runs_dir) / run_id / "issue-url"
+    marker = run_directory(runs_dir, run_id) / "issue-url"
     try:
         raw = marker.read_text(encoding="utf-8")
     except OSError as exc:
@@ -682,6 +703,7 @@ def merge_completed_run(
     sleeper=time.sleep,
 ):
     """Validate, squash-merge, delete the branch, and confirm closure."""
+    run_directory(runs_dir, run_id)
     validate_active_handoff(runs_dir, run_id)
     state = load_state(runs_dir, run_id)
     reviewed_head = load_reviewed_head(runs_dir, run_id)
