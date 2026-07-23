@@ -224,16 +224,17 @@ impl Server {
     }
 
     fn on_hello(&mut self, peer: PeerId, hello: p::ClientHello<'_>) -> anyhow::Result<()> {
-        self.on_hello_at(peer, hello, self.hello_admission_ms())
+        self.on_hello_at(peer, hello, self.hello_admission_ms(), now_ms())
     }
 
     fn on_hello_at(
         &mut self,
         peer: PeerId,
         hello: p::ClientHello<'_>,
-        now_ms: i64,
+        admission_ms: i64,
+        persistence_ms: i64,
     ) -> anyhow::Result<()> {
-        if !self.hello_limiter.allow(u64::from(peer), now_ms) {
+        if !self.hello_limiter.allow(u64::from(peer), admission_ms) {
             return Ok(());
         }
 
@@ -290,7 +291,7 @@ impl Server {
 
         let player = self
             .db
-            .upsert_player_by_token(&identity_hash, &name, now_ms)?;
+            .upsert_player_by_token(&identity_hash, &name, persistence_ms)?;
         let player_id = player.id as u64;
 
         // Drop any prior session for this identity (reconnect from a new peer).
@@ -968,6 +969,74 @@ mod handshake_tests {
         );
     }
 
+    #[test]
+    fn hello_separates_admission_time_from_persistence_time() {
+        const ADMISSION_MS: i64 = 2_000;
+        const FIRST_EPOCH_MS: i64 = 1_700_000_000_000;
+        const RETURN_EPOCH_MS: i64 = 1_700_000_010_000;
+
+        let mut server = make_server();
+        let hello = hello_envelope(
+            "clock-domain-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let env = decode_envelope(&hello).unwrap();
+        server
+            .on_hello_at(
+                1,
+                env.payload_as_client_hello().unwrap(),
+                ADMISSION_MS,
+                FIRST_EPOCH_MS,
+            )
+            .unwrap();
+
+        let player_id = server.sessions[&1].player_id as i64;
+        let created = server.db.player(player_id).unwrap().unwrap();
+        assert_eq!(created.created_at, FIRST_EPOCH_MS);
+        assert_eq!(created.last_seen, FIRST_EPOCH_MS);
+
+        let hello_interval_ms = server.cfg.hello_min_interval_ms_i64();
+        let seq_after_first = server.seq;
+        let env = decode_envelope(&hello).unwrap();
+        server
+            .on_hello_at(
+                1,
+                env.payload_as_client_hello().unwrap(),
+                ADMISSION_MS + hello_interval_ms - 1,
+                RETURN_EPOCH_MS,
+            )
+            .unwrap();
+        assert_eq!(server.seq, seq_after_first);
+        assert_eq!(server.db.player(player_id).unwrap().unwrap(), created);
+
+        let env = decode_envelope(&hello).unwrap();
+        server
+            .on_hello_at(
+                1,
+                env.payload_as_client_hello().unwrap(),
+                ADMISSION_MS + hello_interval_ms,
+                RETURN_EPOCH_MS,
+            )
+            .unwrap();
+        assert_ne!(server.seq, seq_after_first);
+        assert_eq!(server.db.player(player_id).unwrap().unwrap(), created);
+
+        let env = decode_envelope(&hello).unwrap();
+        server
+            .on_hello_at(
+                2,
+                env.payload_as_client_hello().unwrap(),
+                ADMISSION_MS,
+                RETURN_EPOCH_MS,
+            )
+            .unwrap();
+        let returned = server.db.player(player_id).unwrap().unwrap();
+        assert_eq!(server.sessions[&2].player_id as i64, player_id);
+        assert_eq!(returned.created_at, FIRST_EPOCH_MS);
+        assert_eq!(returned.last_seen, RETURN_EPOCH_MS);
+    }
+
     fn hello_envelope(
         token: &str,
         protocol_version: u16,
@@ -1018,7 +1087,7 @@ mod handshake_tests {
     fn deliver_hello_at(server: &mut Server, peer: PeerId, bytes: &[u8], now_ms: i64) {
         let env = decode_envelope(bytes).unwrap();
         server
-            .on_hello_at(peer, env.payload_as_client_hello().unwrap(), now_ms)
+            .on_hello_at(peer, env.payload_as_client_hello().unwrap(), now_ms, now_ms)
             .unwrap();
     }
 
