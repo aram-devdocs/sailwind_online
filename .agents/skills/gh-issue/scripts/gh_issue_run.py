@@ -371,19 +371,11 @@ def cmd_init_run(args):
             data = read_state(spath)
             recorded_url = data.get("issue_url", "")
             if not recorded_url:
-                if data.get("phase") == "done":
-                    raise SystemExit(
-                        f"error: completed legacy run '{run_id}' has no "
-                        "issue_url; use migrate-issue-url with an independently "
-                        "recorded GitHub issue URL"
-                    )
-                if not args.issue_url:
-                    raise SystemExit(
-                        f"error: legacy run '{run_id}' has no issue_url; pass "
-                        "--issue-url to bind its repository identity"
-                    )
-                parse_issue_url(args.issue_url, args.issue)
-                data["issue_url"] = args.issue_url
+                raise SystemExit(
+                    f"error: legacy run '{run_id}' has no issue_url; use "
+                    "migrate-issue-url with an independently recorded GitHub "
+                    "issue URL"
+                )
             else:
                 parse_issue_url(recorded_url, args.issue)
                 if args.issue_url and args.issue_url != recorded_url:
@@ -474,7 +466,7 @@ def cmd_update_state(args):
 
 
 def cmd_migrate_issue_url(args):
-    """Bind a completed legacy run to an independently supplied issue URL."""
+    """Bind a legacy run missing repository identity to an explicit issue URL."""
     run_id = resolve_run_id(args)
     global_lock = acquire_lock(runs_dir(args))
     lock = None
@@ -483,11 +475,6 @@ def cmd_migrate_issue_url(args):
         lock = acquire_lock(rundir)
         spath = state_path(args, run_id)
         data = read_state(spath)
-        if data.get("phase") != "done":
-            raise SystemExit(
-                f"error: migrate-issue-url is only for completed legacy runs; "
-                f"{run_id!r} is at phase {data.get('phase')!r}"
-            )
         issue = data.get("issue", "")
         if not issue.isdigit() or int(issue) <= 0:
             raise SystemExit(
@@ -508,6 +495,54 @@ def cmd_migrate_issue_url(args):
         if recorded == args.issue_url:
             print(f"issue URL already recorded for run '{run_id}'")
             return
+        if data.get("phase") != "done":
+            active = active_path(args)
+            try:
+                active_run = active.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise SystemExit(
+                    f"error: active legacy migration requires readable "
+                    f"{active}: {exc}"
+                ) from exc
+            if active_run != run_id:
+                raise SystemExit(
+                    f"error: active marker names {active_run!r}, not legacy "
+                    f"run {run_id!r}"
+                )
+            recorded_worktree = data.get("worktree", "")
+            recorded_branch = data.get("branch", "")
+            if (
+                Path(recorded_worktree) != Path(".worktrees") / run_id
+                or recorded_branch != f"feat/{run_id}"
+            ):
+                raise SystemExit(
+                    f"error: active legacy run has mismatched worktree or "
+                    f"branch identity: {recorded_worktree!r}/"
+                    f"{recorded_branch!r}"
+                )
+            worktree = repo_root() / recorded_worktree
+            if not worktree.is_dir():
+                raise SystemExit(
+                    f"error: active legacy worktree is missing at {worktree}"
+                )
+            rc, dirty, err = run_cmd(
+                ["git", "status", "--porcelain"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or dirty:
+                raise SystemExit(
+                    f"error: active legacy worktree must be clean before "
+                    f"migration: {err or dirty}"
+                )
+            rc, branch, err = run_cmd(
+                ["git", "branch", "--show-current"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or branch != recorded_branch:
+                raise SystemExit(
+                    f"error: active legacy worktree branch must be "
+                    f"{recorded_branch!r}, found {branch!r}: {err}"
+                )
         data["issue_url"] = args.issue_url
         data["updated_at"] = now_utc()
         write_state(spath, data)
@@ -515,7 +550,7 @@ def cmd_migrate_issue_url(args):
         if lock is not None:
             release_lock(lock)
         release_lock(global_lock)
-    print(f"migrated issue URL for completed run '{run_id}'")
+    print(f"migrated issue URL for legacy run '{run_id}'")
 
 
 def cmd_get_state(args):
@@ -1042,9 +1077,9 @@ def build_parser():
 
     sp = sub.add_parser(
         "migrate-issue-url",
-        help="bind a completed legacy run to an explicit GitHub issue URL",
+        help="bind a legacy run missing identity to an explicit issue URL",
     )
-    sp.add_argument("--run-id", required=True, help="completed legacy run id")
+    sp.add_argument("--run-id", required=True, help="legacy run id")
     sp.add_argument(
         "--issue-url",
         required=True,

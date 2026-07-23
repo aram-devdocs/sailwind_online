@@ -42,11 +42,12 @@ Every GitHub operation derives owner/repository from `issue_url` and supplies it
 explicitly. Checkout remotes are never an identity source. `update-state`
 cannot change `issue_url`.
 
-A completed legacy run without this key fails closed until
-`migrate-issue-url` records an independently supplied canonical issue URL whose
-issue number matches the run. Migration holds the global and per-run locks,
-backs up `state.json`, and refuses non-`done` runs or replacement of an existing
-identity.
+A legacy run without this key fails closed until `migrate-issue-url` records an
+independently supplied canonical issue URL whose issue number matches the run.
+Migration holds the global and per-run locks, backs up `state.json`, and refuses
+replacement of an existing identity. When the run is active and non-`done`, it
+also requires the active marker, exact recorded worktree and branch, a clean
+worktree, and the expected checked-out branch.
 
 ### Reviewed-head companion
 

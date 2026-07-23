@@ -90,14 +90,17 @@ depends on the exact flat-key shape, and a hand edit silently breaks them.
 
 `init-run` requires the canonical issue URL selected from GitHub and records it
 as immutable `issue_url`, so repository identity never depends on local Git
-configuration. A completed run created before this key existed fails closed.
-Migrate it only from an independently recorded canonical issue URL:
+configuration. A legacy run created before this key existed fails closed.
+Migrate the missing marker only from an independently recorded canonical issue
+URL:
 
     python .agents/skills/gh-issue/scripts/gh_issue_run.py migrate-issue-url --run-id 42-fix-login --issue-url https://github.com/owner/repo/issues/42
 
-The migration command accepts only a `done` legacy run whose issue number
-matches the URL, writes through the state-machine locks, and refuses to replace
-an existing repository identity.
+The migration command requires the URL issue number to match, writes through
+the state-machine locks, and refuses to replace an existing repository
+identity. For a non-`done` active run, it also requires the active marker,
+recorded worktree path and branch, clean worktree, and checked-out branch to
+match before writing.
 
 The exact flat-key schema, the phase transition table, and which hook reads
 which key live in `references/workflow-contract.md`.

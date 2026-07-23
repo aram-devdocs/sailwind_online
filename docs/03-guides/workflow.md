@@ -133,8 +133,10 @@ unfenced.
 
 The `/gh-issue` state machine remains responsible for producing a green PR and
 does not merge. It records the selected canonical GitHub issue URL as immutable
-`issue_url`; completed legacy runs use the locked `migrate-issue-url` command
-with an independently recorded URL and otherwise fail closed. `/work` owns the post-CI merge and
+`issue_url`; legacy runs missing the marker use the locked `migrate-issue-url`
+command with an independently recorded URL and otherwise fail closed. Active
+non-`done` migration additionally requires the exact clean recorded worktree
+and branch. `/work` owns the post-CI merge and
 MUST call `.agents/skills/work/scripts/gated_merge.py`, because a single
 deterministic path prevents a conversational shortcut around the gates.
 

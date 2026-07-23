@@ -205,33 +205,84 @@ class ReviewedHeadTests(unittest.TestCase):
         self.assertEqual(migrated["issue_url"], issue_url)
         self.assertTrue(self.state_path.with_suffix(".json.bak").exists())
 
-    def test_refuses_legacy_migration_before_done(self):
+    def test_migrates_active_legacy_run_after_clean_identity_check(self):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         state.pop("issue_url")
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "--runs-dir",
-                str(self.runs_dir),
-                "migrate-issue-url",
-                "--run-id",
-                self.run_id,
-                "--issue-url",
-                (
-                    "https://github.com/aram-devdocs/sailwind_online/"
-                    "issues/15"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        worktree.mkdir(parents=True)
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            issue_url=(
+                "https://github.com/aram-devdocs/sailwind_online/issues/15"
+            ),
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("only for completed legacy runs", result.stderr)
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                side_effect=[
+                    (0, "", ""),
+                    (0, "feat/15-ingame-handshake", ""),
+                ],
+            ) as run,
+        ):
+            gh_issue_run.cmd_migrate_issue_url(args)
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "status", "--porcelain"],
+                ["git", "branch", "--show-current"],
+            ],
+        )
+        migrated = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["issue_url"], args.issue_url)
+
+    def test_active_legacy_migration_refuses_dirty_worktree(self):
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state.pop("issue_url")
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        worktree.mkdir(parents=True)
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            issue_url=(
+                "https://github.com/aram-devdocs/sailwind_online/issues/15"
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                return_value=(0, "M unrelated.txt", ""),
+            ),
+            self.assertRaisesRegex(SystemExit, "must be clean"),
+        ):
+            gh_issue_run.cmd_migrate_issue_url(args)
+
         unchanged = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertNotIn("issue_url", unchanged)
 
