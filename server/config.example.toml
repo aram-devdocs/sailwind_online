@@ -39,7 +39,8 @@ trade_min_interval_ms = 250
 # Per-peer ClientHello throttle in milliseconds. This runs before protocol/hash
 # validation, database access, and ServerHello generation. Keep it at or below
 # the client's 250 ms retry cadence so a lost ServerHello can be retried on the
-# next attempt. Must be in 0..=3600000 (0 disables the throttle).
+# next attempt. Must be in 1..=250; zero would disable pre-authentication flood
+# protection.
 hello_min_interval_ms = 250
 
 # Per-player throttles (milliseconds) for the other inbound message classes,

@@ -23,12 +23,22 @@ const MAX_CELL_SIZE_M: f32 = 1_000_000.0;
 /// numerator, so the divisor needs its own floor here.
 const MIN_CELL_SIZE_M: f32 = 1.0;
 
-/// Upper bound on any aggregate peer/player message-class min-interval, in
-/// milliseconds (hello, market trade, client-state, chat, econ, moor). Bounds the
+/// Upper bound on any aggregate player message-class min-interval, in
+/// milliseconds (market trade, client-state, chat, econ, moor). Bounds the
 /// rate-limit knobs so a misconfiguration cannot wedge a message class behind an
 /// absurd cooldown, and so the saturating accessors have a finite ceiling. One
 /// hour is already far beyond any sane throttle.
 pub const MAX_TRADE_MIN_INTERVAL_MS: u32 = 3_600_000;
+
+/// Upper bound on the pre-authentication hello throttle. It matches the
+/// client's fixed retry interval, so the first retry after a lost response is
+/// eligible for admission.
+pub const MAX_HELLO_MIN_INTERVAL_MS: u32 = 250;
+
+/// Lower bound on the pre-authentication hello throttle. Zero would disable the
+/// limiter and expose validation, persistence, and response generation to an
+/// unthrottled flood.
+const MIN_HELLO_MIN_INTERVAL_MS: u32 = 1;
 
 /// Upper bound on the per-message wire-string length cap, in bytes. Bounds the
 /// [`Config::max_wire_string_len`] knob so a misconfiguration cannot admit an
@@ -59,8 +69,8 @@ pub struct Config {
     /// Minimum interval, in milliseconds, between two processed `ClientHello`
     /// messages from the same peer. A flood beyond this rate is dropped before
     /// validation, persistence, or response generation. The 250 ms default
-    /// matches the client's handshake retry cadence. Bounded by
-    /// [`MAX_TRADE_MIN_INTERVAL_MS`]; 0 disables the throttle.
+    /// matches the client's handshake retry cadence. Bounded to
+    /// `1..=`[`MAX_HELLO_MIN_INTERVAL_MS`].
     pub hello_min_interval_ms: u32,
     /// Minimum interval, in milliseconds, between two accepted market trades by
     /// the same player (an aggregate per-player throttle, independent of which
@@ -198,8 +208,14 @@ impl Config {
                 "cell_size_m must be a finite value in [{MIN_CELL_SIZE_M}, {MAX_CELL_SIZE_M}]"
             ));
         }
+        if !(MIN_HELLO_MIN_INTERVAL_MS..=MAX_HELLO_MIN_INTERVAL_MS)
+            .contains(&self.hello_min_interval_ms)
+        {
+            return Err(anyhow::anyhow!(
+                "hello_min_interval_ms must be in {MIN_HELLO_MIN_INTERVAL_MS}..={MAX_HELLO_MIN_INTERVAL_MS}"
+            ));
+        }
         for (name, value) in [
-            ("hello_min_interval_ms", self.hello_min_interval_ms),
             ("trade_min_interval_ms", self.trade_min_interval_ms),
             (
                 "client_state_min_interval_ms",
@@ -239,10 +255,11 @@ impl Config {
     }
 
     /// Client-hello throttle min-interval as a bounded `i64` of milliseconds.
-    /// Saturates at [`MAX_TRADE_MIN_INTERVAL_MS`] so the limiter math stays
-    /// finite even if a caller bypasses [`Config::validate`].
+    /// Clamps to the security- and liveness-safe hello-specific range even if a
+    /// caller bypasses [`Config::validate`].
     pub fn hello_min_interval_ms_i64(&self) -> i64 {
-        self.hello_min_interval_ms.min(MAX_TRADE_MIN_INTERVAL_MS) as i64
+        self.hello_min_interval_ms
+            .clamp(MIN_HELLO_MIN_INTERVAL_MS, MAX_HELLO_MIN_INTERVAL_MS) as i64
     }
 
     /// Client-state throttle min-interval as a bounded `i64` of milliseconds.
@@ -498,11 +515,44 @@ mod tests {
     #[test]
     fn parses_hello_interval_key() {
         let toml_text = r#"
-            hello_min_interval_ms = 500
+            hello_min_interval_ms = 249
         "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
-        assert_eq!(cfg.hello_min_interval_ms, 500);
+        assert_eq!(cfg.hello_min_interval_ms, 249);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn hello_interval_enforces_security_and_client_retry_liveness() {
+        for value in [0, MAX_HELLO_MIN_INTERVAL_MS + 1, 3_600_000] {
+            let cfg = Config {
+                hello_min_interval_ms: value,
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "hello interval {value} must be rejected"
+            );
+        }
+
+        let disabled = Config {
+            hello_min_interval_ms: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            disabled.hello_min_interval_ms_i64(),
+            i64::from(MIN_HELLO_MIN_INTERVAL_MS)
+        );
+
+        let boundary = Config {
+            hello_min_interval_ms: MAX_HELLO_MIN_INTERVAL_MS,
+            ..Config::default()
+        };
+        boundary.validate().unwrap();
+        assert_eq!(
+            boundary.hello_min_interval_ms_i64(),
+            i64::from(MAX_HELLO_MIN_INTERVAL_MS)
+        );
     }
 
     #[test]
@@ -511,7 +561,7 @@ mod tests {
         cfg.validate().unwrap();
         // A permissive-but-finite default for each per-class throttle.
         assert_eq!(cfg.hello_min_interval_ms, 250);
-        assert!(cfg.hello_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
+        assert!(cfg.hello_min_interval_ms <= MAX_HELLO_MIN_INTERVAL_MS);
         assert!(cfg.client_state_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.chat_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
         assert!(cfg.econ_min_interval_ms <= MAX_TRADE_MIN_INTERVAL_MS);
@@ -546,7 +596,6 @@ mod tests {
     #[test]
     fn rejects_out_of_range_message_intervals() {
         for mutate in [
-            |c: &mut Config| c.hello_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.client_state_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.chat_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
             |c: &mut Config| c.econ_min_interval_ms = MAX_TRADE_MIN_INTERVAL_MS + 1,
@@ -573,7 +622,7 @@ mod tests {
         };
         assert_eq!(
             cfg.hello_min_interval_ms_i64(),
-            MAX_TRADE_MIN_INTERVAL_MS as i64
+            MAX_HELLO_MIN_INTERVAL_MS as i64
         );
         assert_eq!(
             cfg.client_state_min_interval_ms_i64(),

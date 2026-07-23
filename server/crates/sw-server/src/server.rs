@@ -224,7 +224,7 @@ impl Server {
     }
 
     fn on_hello(&mut self, peer: PeerId, hello: p::ClientHello<'_>) -> anyhow::Result<()> {
-        self.on_hello_at(peer, hello, now_ms())
+        self.on_hello_at(peer, hello, self.hello_admission_ms())
     }
 
     fn on_hello_at(
@@ -825,6 +825,10 @@ impl Server {
         self.boot.elapsed().as_millis() as u32
     }
 
+    fn hello_admission_ms(&self) -> i64 {
+        self.boot.elapsed().as_millis().min(i64::MAX as u128) as i64
+    }
+
     fn send(&mut self, peer: PeerId, bytes: &[u8]) {
         if let Err(e) = self.host.send_unreliable(peer, bytes) {
             tracing::warn!(peer, error = %e, "send failed");
@@ -944,6 +948,24 @@ mod handshake_tests {
             running: Arc::new(AtomicBool::new(true)),
             cfg,
         }
+    }
+
+    #[test]
+    fn production_hello_admission_uses_monotonic_uptime() {
+        let mut server = make_server();
+        let hello = hello_envelope(
+            "handshake-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        assert!(server.hello_limiter.allow(1, 86_400_000));
+
+        deliver_hello(&mut server, 1, &hello);
+
+        assert!(
+            !server.sessions.contains_key(&1),
+            "boot-elapsed time must not jump forward to the Unix epoch"
+        );
     }
 
     fn hello_envelope(
