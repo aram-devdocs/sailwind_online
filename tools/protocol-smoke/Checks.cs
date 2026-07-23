@@ -86,7 +86,7 @@ namespace Sailwind.ProtocolSmoke
                     handshook ? "LiteNetLib Connect completed within 2s"
                               : "no PeerConnected within 2s (sw-net LiteNetLib framing not interoperating yet)"));
 
-                ServerHello? helloA = handshook ? DoHello(a, "Smoke-A", TokenA) : null;
+                ServerHello? helloA = handshook ? DoHello(a, "Smoke-A", TokenA).Response : null;
                 bool helloOk = IsValidHello(helloA);
                 playerIdA = helloA.HasValue ? helloA.Value.PlayerId : 0;
                 results.Add(new Result(2, "hello", helloOk,
@@ -146,9 +146,15 @@ namespace Sailwind.ProtocolSmoke
                 }
 
                 var helloB = DoHello(b, "Smoke-B", TokenB);
-                if (!IsValidHello(helloB))
+                if (!IsValidHello(helloB.Response))
                 {
                     return new Result(3, "presence-aoi", false, "client B failed the hello exchange");
+                }
+
+                if (!helloB.SawRetryableResponse)
+                {
+                    return new Result(3, "presence-aoi", false,
+                        $"client B did not observe exact transient response '{RetryableHelloReason}' before acceptance");
                 }
 
                 bool sawAddedCell = false;
@@ -180,7 +186,7 @@ namespace Sailwind.ProtocolSmoke
                 bool increasing = IsIncreasing(xs);
                 bool ok = sawAddedCell && increasing;
                 var detail = ok
-                    ? $"B saw A's cell added and {xs.Count} monotonically increasing x samples"
+                    ? $"B observed '{RetryableHelloReason}', then saw A's cell added and {xs.Count} monotonically increasing x samples"
                     : $"sawAddedCell={sawAddedCell}, x-samples={xs.Count}, increasing={increasing}";
                 return new Result(3, "presence-aoi", ok, detail);
             }
@@ -328,7 +334,7 @@ namespace Sailwind.ProtocolSmoke
                     return new Result(6, "restart-persistence", false, "reconnect after restart failed");
                 }
 
-                var hello = DoHello(a2, "Smoke-A", TokenA);
+                var hello = DoHello(a2, "Smoke-A", TokenA).Response;
                 if (!IsValidHello(hello))
                 {
                     return new Result(6, "restart-persistence", false, "hello after restart failed");
@@ -434,9 +440,13 @@ namespace Sailwind.ProtocolSmoke
             }
         }
 
-        private ServerHello? DoHello(SmokeClient c, string name, string token)
+        private (ServerHello? Response, bool SawRetryableResponse) DoHello(
+            SmokeClient c,
+            string name,
+            string token)
         {
             const string apiSurfaceHashSentinel = "protocol-smoke-surface-hash";
+            var sawRetryableResponse = false;
             var hello = Codec.EncodeClientHello(_seq++, name, token, "smoke", "0.0.0", apiSurfaceHashSentinel);
             var env = SendAndWait(
                 c,
@@ -449,12 +459,17 @@ namespace Sailwind.ProtocolSmoke
                     }
 
                     var response = e.PayloadAsServerHello();
-                    return response.Accepted
-                           || !string.Equals(response.Reason, RetryableHelloReason, StringComparison.Ordinal);
+                    if (string.Equals(response.Reason, RetryableHelloReason, StringComparison.Ordinal))
+                    {
+                        sawRetryableResponse = true;
+                        return false;
+                    }
+
+                    return true;
                 },
                 6000,
                 250);
-            return env.HasValue ? env.Value.PayloadAsServerHello() : (ServerHello?)null;
+            return (env.HasValue ? env.Value.PayloadAsServerHello() : (ServerHello?)null, sawRetryableResponse);
         }
 
         // Resends `payload` every retryMs (safe because hello, econ and moorage
