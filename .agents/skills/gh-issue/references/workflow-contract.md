@@ -77,8 +77,8 @@ through the state machine.
 | review        | pr            | `reviewed-head` recorded; all four `gate_*` verdicts recorded for that commit, none blocking |
 | pr            | wait-ci       | PR opened to `dev`; `pr` recorded                                 |
 | wait-ci       | cleanup       | CI green (`poll-pr` reports PASS)                                 |
-| cleanup       | done          | worktree removed; active marker cleared                           |
-| done          | (terminal)    | run reports and stops; does NOT merge; `/work` owns its separate post-CI merge gate |
+| cleanup       | done          | worktree removed; active marker retained for `/work` merge resume |
+| done          | (terminal)    | `/gh-issue` stops; `/work` owns merge, confirmation, and active-marker clearing |
 
 The `review` phase runs the four gates in the fixed order spec -> quality ->
 architecture -> security. A REJECT or an unaddressed REQUEST-CHANGES blocks the
@@ -88,7 +88,9 @@ advance; the implementer is re-dispatched and the gate re-run.
 
 Which hook reads which key. All hooks are inert unless a run is active (that is,
 `.agents/runs/active` names a run whose `state.json` exists, or some run's
-`phase` is not `done`).
+`phase` is not `done`). Cleanup intentionally retains the active marker at
+`phase=done`, so a crash before or after merge stays discoverable. `/work`
+clears that marker only after it confirms both the merged PR and closed issue.
 
 | hook                          | trigger        | reads                          | effect                                                                 |
 | ----------------------------- | -------------- | ------------------------------ | ---------------------------------------------------------------------- |

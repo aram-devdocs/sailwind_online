@@ -76,8 +76,11 @@ running app, open the PR, and keep it green. After `/gh-issue` reaches `done`,
 `/work` rechecks the completed run, exact PR head, mergeability, and required
 checks before merging and confirming issue closure. The exact PR head must equal
 the state-machine-owned reviewed head, so a commit after review requires all
-four verdicts again. It resumes from durable run state after any compaction and
-never starts a second issue in the same invocation. Full loop:
+four verdicts again. Cleanup retains the active run until merge and closure are
+confirmed, so a crash resumes that handoff before issue selection. The merge
+path is retry-safe after partial success and gives every GitHub call a bounded
+timeout. It resumes from durable run state after any compaction and never starts
+a second issue in the same invocation. Full loop:
 `.agents/skills/work/SKILL.md`; delegation model:
 `.agents/skills/subagent-driven-development`.
 

@@ -106,6 +106,9 @@ STALE_LOCK_SECONDS = 30
 # How long to wait for a live lock before giving up.
 LOCK_WAIT_SECONDS = 10
 
+# External probes must not hang a durable run forever.
+COMMAND_TIMEOUT_SECONDS = 30
+
 
 # --------------------------------------------------------------------------- #
 # Paths
@@ -163,9 +166,20 @@ def run_cmd(cmd, cwd=None):
     """Run a command, returning (returncode, stdout, stderr). Never raises."""
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, check=False,
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return (
+            124,
+            "",
+            f"command timed out after {COMMAND_TIMEOUT_SECONDS} seconds",
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
 
@@ -493,6 +507,20 @@ def cmd_validate_resume(args):
     lines = [f"reconciliation for run '{run_id}':",
              f"  recorded phase: {data.get('phase', '?')}"]
 
+    if data.get("phase") == "done":
+        lines.append(
+            "  worktree: cleanup complete; absence is expected at phase done"
+        )
+        lines.append(
+            f"  pr: {pr or 'none recorded'}"
+        )
+        lines.append(
+            "  ACTION: resume the /work gated merge for this run; do not "
+            "select another issue while its active handoff remains"
+        )
+        print("\n".join(lines))
+        return
+
     # Worktree present?
     if data.get("worktree") and worktree.exists():
         lines.append(f"  worktree: present at {worktree}")
@@ -616,14 +644,7 @@ def cmd_cleanup_worktree(args):
     finally:
         release_lock(lock)
     print(f"phase set to 'done' for run '{run_id}'")
-
-    # Clear the active marker only if it names this run.
-    ap = active_path(args)
-    if ap.exists():
-        named = ap.read_text(encoding="utf-8").strip()
-        if named == run_id:
-            ap.unlink()
-            print("active run cleared")
+    print("active run retained for the /work merge handoff")
 
 
 # --------------------------------------------------------------------------- #
@@ -717,7 +738,7 @@ def build_parser():
 
     sp = sub.add_parser(
         "cleanup-worktree",
-        help="remove the worktree, set phase=done, clear active",
+        help="remove the worktree, set phase=done, retain active for /work",
     )
     sp.add_argument("--run-id", help="target run (default: the active run)")
     sp.add_argument("--no-git", action="store_true",

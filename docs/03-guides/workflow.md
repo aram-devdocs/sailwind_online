@@ -80,6 +80,8 @@ not memory, so a run that died mid-task recovers cleanly. The full loop is in
    reports a clean merge state, and has no pending or failed required checks.
    It rereads the head before a squash merge guarded by that exact commit,
    requests remote branch deletion, then confirms both `MERGED` and `CLOSED`.
+   Cleanup retains the active-run marker until those confirmations succeed, so
+   a restart resumes this handoff before selecting another issue.
 
 Supporting skills, all under `.agents/skills/`: `gh-runbook` (decompose a large
 issue), `gh-issue` (the per-issue lifecycle state machine), `gh-review` (the
@@ -137,6 +139,12 @@ merging and gives it to GitHub as the expected head commit. GitHub refuses the
 merge if the branch changed in that interval. A successful run squash-merges,
 deletes the remote feature branch, confirms the PR is `MERGED`, and confirms
 the linked issue is `CLOSED`.
+
+The confirmation path uses bounded issue-closure polling and fixed timeouts for
+every GitHub command. If confirmation fails after GitHub accepted the merge,
+the active run remains discoverable. A retry verifies the exact already-merged
+PR, reviewed head, required checks, and closing issue link, skips a second merge
+call, and finishes confirmation before clearing the active marker.
 
 Any mismatch prints the exact failure and stops. `/work` does not merge a
 different PR, repair state by hand, or select another issue in that invocation.

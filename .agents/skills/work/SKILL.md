@@ -62,6 +62,11 @@ deliberately, never blind-reset. When the resumed run reaches `done`, continue
 to the gated merge in step 8, report, and stop; do not also pick a new issue
 this invocation.
 
+If the active run is already at `done`, go directly to step 8. Cleanup retains
+the active marker for this handoff, so a crash cannot make an unmerged PR
+disappear from issue selection. The gated merge clears the marker only after it
+confirms both the PR merge and issue closure.
+
 If no run is active and the tree is clean:
 
     git switch dev && git pull --ff-only
@@ -157,7 +162,14 @@ proves that same PR head passed the CI mirror of `make validate`.
 Immediately before merging, the script reads the PR again and refuses a changed
 head. It passes that exact head to `gh pr merge --match-head-commit`, uses
 squash merge, and requests remote branch deletion. It then confirms the PR is
-`MERGED` and the linked issue is `CLOSED`.
+`MERGED` and polls the linked issue for bounded closure confirmation. Every
+`gh` call has a fixed timeout and fails closed with the command purpose.
+
+The merge command is retry-safe. If GitHub accepted the squash merge but a
+confirmation call failed or issue closure was delayed, rerun the same command.
+It accepts only the exact recorded PR, branch, issue link, reviewed head, and
+required checks; when that PR is already `MERGED`, it skips the merge call,
+finishes bounded confirmation, and clears the active handoff.
 
 If the command prints `STOP`, report its exact precondition failure and stop
 without merging or selecting another issue. If it prints `ERROR`, report the
@@ -203,4 +215,5 @@ After three failed attempts on the same gate or CI failure:
 - Hand-editing `state.json` instead of going through `gh_issue_run.py`.
 - Silent scope creep, silent test weakening, silent hook edits.
 - Calling `gh pr merge` directly instead of the gated merge script.
+- Clearing a completed run's active marker before merge confirmation.
 - Starting the next issue after either a successful or failed merge attempt.

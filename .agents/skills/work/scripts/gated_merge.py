@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -18,7 +19,7 @@ from urllib.parse import urlparse
 GATES = ("spec", "quality", "architecture", "security")
 PR_FIELDS = (
     "number,state,isDraft,baseRefName,headRefName,headRefOid,"
-    "mergeStateStatus"
+    "mergeStateStatus,mergedAt"
 )
 CLOSURE_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){"
@@ -28,6 +29,9 @@ CLOSURE_QUERY = (
 )
 RUN_ID_RE = re.compile(r"(?P<issue>[1-9][0-9]*)-[a-z0-9]+(?:-[a-z0-9]+)*")
 HEAD_OID_RE = re.compile(r"[0-9a-fA-F]{40}")
+GH_TIMEOUT_SECONDS = 30
+CLOSURE_CONFIRMATION_ATTEMPTS = 5
+CLOSURE_POLL_INTERVAL_SECONDS = 2
 
 
 class MergePreconditionError(RuntimeError):
@@ -53,6 +57,14 @@ def run_command(command):
             capture_output=True,
             text=True,
             check=False,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            "",
+            f"gh command timed out after {GH_TIMEOUT_SECONDS} seconds",
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
@@ -206,14 +218,15 @@ def load_pr(runner, pr_number, repo):
 
 
 def validate_pr(pr, pr_number, branch):
-    """Validate PR identity, mergeability, and head."""
+    """Validate shared PR identity and its open or already-merged state."""
     if pr.get("number") != pr_number:
         raise MergePreconditionError(
             f"PR lookup returned #{pr.get('number')!r}, expected #{pr_number}"
         )
-    if pr.get("state") != "OPEN":
+    state = pr.get("state")
+    if state not in ("OPEN", "MERGED"):
         raise MergePreconditionError(
-            f"PR #{pr_number} must be OPEN, found {pr.get('state')!r}"
+            f"PR #{pr_number} must be OPEN or MERGED, found {state!r}"
         )
     if pr.get("isDraft") is not False:
         raise MergePreconditionError(f"PR #{pr_number} must not be a draft")
@@ -226,15 +239,19 @@ def validate_pr(pr, pr_number, branch):
             f"PR #{pr_number} head must be {branch!r}, found "
             f"{pr.get('headRefName')!r}"
         )
-    if pr.get("mergeStateStatus") != "CLEAN":
-        raise MergePreconditionError(
-            f"PR #{pr_number} merge state must be CLEAN, found "
-            f"{pr.get('mergeStateStatus')!r}"
-        )
     head_oid = pr.get("headRefOid")
     if not isinstance(head_oid, str) or not HEAD_OID_RE.fullmatch(head_oid):
         raise MergePreconditionError(
             f"PR #{pr_number} returned invalid head commit {head_oid!r}"
+        )
+    if state == "OPEN" and pr.get("mergeStateStatus") != "CLEAN":
+        raise MergePreconditionError(
+            f"PR #{pr_number} merge state must be CLEAN, found "
+            f"{pr.get('mergeStateStatus')!r}"
+        )
+    if state == "MERGED" and not pr.get("mergedAt"):
+        raise MergePreconditionError(
+            f"PR #{pr_number} reports MERGED without a mergedAt timestamp"
         )
     return head_oid
 
@@ -346,8 +363,17 @@ def validate_required_checks(runner, pr_number, repo):
         )
 
 
-def confirm_merged(runner, pr_number, issue_number, repo):
+def confirm_merged(
+    runner,
+    pr_number,
+    issue_number,
+    repo,
+    confirmation_attempts,
+    sleeper,
+):
     """Confirm GitHub recorded both promised postconditions."""
+    if confirmation_attempts < 1:
+        raise ValueError("confirmation_attempts must be at least 1")
     pr_result = runner(
         [
             "gh",
@@ -376,36 +402,83 @@ def confirm_merged(runner, pr_number, issue_number, repo):
             f"found {pr!r}"
         )
 
-    issue_result = runner(
-        [
-            "gh",
-            "issue",
-            "view",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--json",
-            "number,state",
-        ]
+    issue_command = [
+        "gh",
+        "issue",
+        "view",
+        str(issue_number),
+        "--repo",
+        repo,
+        "--json",
+        "number,state",
+    ]
+    last_issue = None
+    for attempt in range(confirmation_attempts):
+        issue_result = runner(issue_command)
+        issue = read_json_result(
+            issue_result,
+            f"post-merge issue #{issue_number} confirmation",
+            MergeConfirmationError,
+        )
+        last_issue = issue
+        if (
+            isinstance(issue, dict)
+            and issue.get("number") == issue_number
+            and issue.get("state") == "CLOSED"
+        ):
+            return
+        if attempt + 1 < confirmation_attempts:
+            sleeper(CLOSURE_POLL_INTERVAL_SECONDS)
+    raise MergeConfirmationError(
+        f"post-merge issue confirmation failed after "
+        f"{confirmation_attempts} attempts: expected #{issue_number} CLOSED, "
+        f"found {last_issue!r}"
     )
-    issue = read_json_result(
-        issue_result,
-        f"post-merge issue #{issue_number} confirmation",
-        MergeConfirmationError,
-    )
-    if (
-        not isinstance(issue, dict)
-        or issue.get("number") != issue_number
-        or issue.get("state") != "CLOSED"
-    ):
-        raise MergeConfirmationError(
-            f"post-merge issue confirmation failed: expected #{issue_number} "
-            f"CLOSED, found {issue!r}"
+
+
+def validate_active_handoff(runs_dir, run_id):
+    """Reject merging one completed run while a different run is active."""
+    active = Path(runs_dir) / "active"
+    if not active.exists():
+        return
+    try:
+        named = active.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise MergePreconditionError(
+            f"cannot read active run handoff at {active}: {exc}"
+        ) from exc
+    if named != run_id:
+        raise MergePreconditionError(
+            f"active run handoff names {named!r}, not requested run {run_id!r}"
         )
 
 
-def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
+def clear_active_handoff(runs_dir, run_id):
+    """Clear only the active marker for the confirmed merged run."""
+    active = Path(runs_dir) / "active"
+    if not active.exists():
+        return
+    try:
+        named = active.read_text(encoding="utf-8").strip()
+        if named == run_id:
+            active.unlink()
+    except OSError as exc:
+        raise MergeConfirmationError(
+            f"merged successfully but could not clear active handoff "
+            f"{active}: {exc}"
+        ) from exc
+
+
+def merge_completed_run(
+    runs_dir,
+    run_id,
+    runner=run_command,
+    dry_run=False,
+    confirmation_attempts=CLOSURE_CONFIRMATION_ATTEMPTS,
+    sleeper=time.sleep,
+):
     """Validate, squash-merge, delete the branch, and confirm closure."""
+    validate_active_handoff(runs_dir, run_id)
     state = load_state(runs_dir, run_id)
     reviewed_head = load_reviewed_head(runs_dir, run_id)
     issue_number = int(state["issue"])
@@ -436,6 +509,20 @@ def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
     )
     validate_required_checks(runner, pr_number, repo)
 
+    if first_pr.get("state") == "MERGED":
+        if dry_run:
+            return MergeResult(pr_number, issue_number, head_oid, True)
+        confirm_merged(
+            runner,
+            pr_number,
+            issue_number,
+            repo,
+            confirmation_attempts,
+            sleeper,
+        )
+        clear_active_handoff(runs_dir, run_id)
+        return MergeResult(pr_number, issue_number, head_oid, True)
+
     final_pr = load_pr(runner, pr_number, repo)
     final_head = final_pr.get("headRefOid")
     if final_head != head_oid:
@@ -450,6 +537,20 @@ def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
         issue_number,
         repo,
     )
+
+    if final_pr.get("state") == "MERGED":
+        if dry_run:
+            return MergeResult(pr_number, issue_number, head_oid, True)
+        confirm_merged(
+            runner,
+            pr_number,
+            issue_number,
+            repo,
+            confirmation_attempts,
+            sleeper,
+        )
+        clear_active_handoff(runs_dir, run_id)
+        return MergeResult(pr_number, issue_number, head_oid, True)
 
     if dry_run:
         return MergeResult(pr_number, issue_number, head_oid, False)
@@ -477,7 +578,15 @@ def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
             f"squash merge of PR #{pr_number} failed: {detail}"
         )
 
-    confirm_merged(runner, pr_number, issue_number, repo)
+    confirm_merged(
+        runner,
+        pr_number,
+        issue_number,
+        repo,
+        confirmation_attempts,
+        sleeper,
+    )
+    clear_active_handoff(runs_dir, run_id)
     return MergeResult(pr_number, issue_number, head_oid, True)
 
 

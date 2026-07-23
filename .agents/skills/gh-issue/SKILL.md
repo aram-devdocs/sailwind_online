@@ -53,8 +53,10 @@ condition, recorded through the state machine, before the next begins.
 - **wait-ci** Poll checks with `gh_issue_run.py poll-pr`. Fix red CI, same
   three-attempt cap. Exit: CI is green.
 - **cleanup** `gh_issue_run.py cleanup-worktree` removes the worktree, sets
-  `phase=done`, and clears the active marker. Exit: worktree gone, phase done.
-- **done** Terminal. The run reports and stops. It does NOT merge its own PR.
+  `phase=done`, and retains the active marker for `/work`. Exit: worktree gone,
+  phase done, merge handoff remains discoverable.
+- **done** Terminal for `/gh-issue`. The run reports and stops. It does NOT
+  merge its own PR or clear the handoff that `/work` must resume.
 
 ## State transitions
 
@@ -132,6 +134,11 @@ and prints an action list. Resume from the earliest phase whose reality is
 incomplete. Never trust the recorded phase at face value: a phase can say
 `implement` while the worktree is already complete but uncommitted, the classic
 dead-run failure.
+
+When the active run is already at `done`, its missing worktree is expected.
+`validate-resume` routes directly to `/work`'s gated merge. The active marker
+MUST remain until merge and issue-closure confirmation succeed, because clearing
+it earlier would let issue selection skip an unfinished handoff.
 
 ## Boundaries
 

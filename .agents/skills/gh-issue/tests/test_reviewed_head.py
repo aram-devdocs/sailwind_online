@@ -129,6 +129,52 @@ class ReviewedHeadTests(unittest.TestCase):
         self.assertIn("--head requires --no-git", result.stderr)
         self.assertFalse((self.run_dir / "reviewed-head").exists())
 
+    def test_cleanup_keeps_completed_run_active_for_merge_resume(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "cleanup-worktree",
+                "--run-id",
+                self.run_id,
+                "--no-git",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "done")
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            self.run_id + "\n",
+        )
+
+        resume = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "validate-resume",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(resume.returncode, 0, resume.stderr)
+        self.assertIn("resume the /work gated merge", resume.stdout)
+        self.assertNotIn("recreate it", resume.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

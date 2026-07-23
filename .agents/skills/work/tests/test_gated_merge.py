@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "gated_merge.py"
@@ -43,6 +44,10 @@ class GatedMergeTests(unittest.TestCase):
         self.runs_dir = Path(self.temp.name)
         self.write_state()
         self.write_reviewed_head()
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -88,7 +93,7 @@ class GatedMergeTests(unittest.TestCase):
             "--json",
             (
                 "number,state,isDraft,baseRefName,headRefName,headRefOid,"
-                "mergeStateStatus"
+                "mergeStateStatus,mergedAt"
             ),
         ]
 
@@ -136,9 +141,73 @@ class GatedMergeTests(unittest.TestCase):
             "headRefName": "feat/48-gated-self-merge",
             "headRefOid": self.head,
             "mergeStateStatus": "CLEAN",
+            "mergedAt": None,
         }
         data.update(overrides)
         return data
+
+    def merged_pr(self):
+        return self.open_pr(
+            state="MERGED",
+            mergeStateStatus="UNKNOWN",
+            mergedAt="2026-07-23T12:01:00Z",
+        )
+
+    def checks_response(self):
+        return (
+            [
+                "gh",
+                "pr",
+                "checks",
+                "52",
+                "--repo",
+                self.repo,
+                "--required",
+                "--json",
+                "name,state,bucket",
+            ],
+            0,
+            [{"name": "gate", "state": "SUCCESS", "bucket": "pass"}],
+            "",
+        )
+
+    def confirmation_pr_response(self):
+        return (
+            [
+                "gh",
+                "pr",
+                "view",
+                "52",
+                "--repo",
+                self.repo,
+                "--json",
+                "number,state,mergedAt",
+            ],
+            0,
+            {
+                "number": 52,
+                "state": "MERGED",
+                "mergedAt": "2026-07-23T12:01:00Z",
+            },
+            "",
+        )
+
+    def issue_response(self, state):
+        return (
+            [
+                "gh",
+                "issue",
+                "view",
+                "48",
+                "--repo",
+                self.repo,
+                "--json",
+                "number,state",
+            ],
+            0,
+            {"number": 48, "state": state},
+            "",
+        )
 
     def success_responses(self):
         return [
@@ -150,22 +219,7 @@ class GatedMergeTests(unittest.TestCase):
             ),
             (self.pr_view_command(), 0, self.open_pr(), ""),
             (self.closure_command(), 0, self.closure_result(), ""),
-            (
-                [
-                    "gh",
-                    "pr",
-                    "checks",
-                    "52",
-                    "--repo",
-                    self.repo,
-                    "--required",
-                    "--json",
-                    "name,state,bucket",
-                ],
-                0,
-                [{"name": "gate", "state": "SUCCESS", "bucket": "pass"}],
-                "",
-            ),
+            self.checks_response(),
             (self.pr_view_command(), 0, self.open_pr(), ""),
             (self.closure_command(), 0, self.closure_result(), ""),
             (
@@ -185,40 +239,23 @@ class GatedMergeTests(unittest.TestCase):
                 "",
                 "",
             ),
+            self.confirmation_pr_response(),
+            self.issue_response("CLOSED"),
+        ]
+
+    def merged_retry_responses(self, *issue_states):
+        return [
             (
-                [
-                    "gh",
-                    "pr",
-                    "view",
-                    "52",
-                    "--repo",
-                    self.repo,
-                    "--json",
-                    "number,state,mergedAt",
-                ],
+                ["gh", "repo", "view", "--json", "nameWithOwner"],
                 0,
-                {
-                    "number": 52,
-                    "state": "MERGED",
-                    "mergedAt": "2026-07-23T12:01:00Z",
-                },
+                {"nameWithOwner": self.repo},
                 "",
             ),
-            (
-                [
-                    "gh",
-                    "issue",
-                    "view",
-                    "48",
-                    "--repo",
-                    self.repo,
-                    "--json",
-                    "number,state",
-                ],
-                0,
-                {"number": 48, "state": "CLOSED"},
-                "",
-            ),
+            (self.pr_view_command(), 0, self.merged_pr(), ""),
+            (self.closure_command(), 0, self.closure_result(), ""),
+            self.checks_response(),
+            self.confirmation_pr_response(),
+            *(self.issue_response(state) for state in issue_states),
         ]
 
     def test_merges_only_after_all_checks_and_confirms_results(self):
@@ -232,6 +269,7 @@ class GatedMergeTests(unittest.TestCase):
         self.assertEqual(result.issue_number, 48)
         self.assertEqual(result.head_oid, self.head)
         self.assertTrue(result.merged)
+        self.assertFalse((self.runs_dir / "active").exists())
         runner.assert_finished()
 
     def test_dry_run_checks_every_precondition_without_merging(self):
@@ -244,6 +282,7 @@ class GatedMergeTests(unittest.TestCase):
 
         self.assertFalse(result.merged)
         self.assertNotIn(["gh", "pr", "merge"], [call[:3] for call in runner.calls])
+        self.assertTrue((self.runs_dir / "active").exists())
         runner.assert_finished()
 
     def test_pr_view_uses_supported_fields_and_graphql_checks_issue_link(self):
@@ -471,8 +510,109 @@ class GatedMergeTests(unittest.TestCase):
                 runner = FakeRunner(responses)
                 with self.assertRaises(gated_merge.MergeConfirmationError):
                     gated_merge.merge_completed_run(
-                        self.runs_dir, self.run_id, runner=runner
+                        self.runs_dir,
+                        self.run_id,
+                        runner=runner,
+                        confirmation_attempts=1,
+                        sleeper=lambda _: None,
                     )
+                self.assertTrue((self.runs_dir / "active").exists())
+
+    def test_retry_after_transient_confirmation_failure_is_idempotent(self):
+        first_responses = self.success_responses()
+        first_responses[7] = (
+            self.confirmation_pr_response()[0],
+            1,
+            "",
+            "temporary API failure",
+        )
+        first_runner = FakeRunner(first_responses)
+
+        with self.assertRaises(gated_merge.MergeConfirmationError):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=first_runner,
+                confirmation_attempts=2,
+                sleeper=lambda _: None,
+            )
+        self.assertTrue((self.runs_dir / "active").exists())
+
+        sleeps = []
+        retry_runner = FakeRunner(
+            self.merged_retry_responses("OPEN", "CLOSED")
+        )
+        result = gated_merge.merge_completed_run(
+            self.runs_dir,
+            self.run_id,
+            runner=retry_runner,
+            confirmation_attempts=2,
+            sleeper=sleeps.append,
+        )
+
+        self.assertTrue(result.merged)
+        self.assertFalse(
+            any(
+                call[:3] == ["gh", "pr", "merge"]
+                for call in retry_runner.calls
+            )
+        )
+        self.assertEqual(sleeps, [gated_merge.CLOSURE_POLL_INTERVAL_SECONDS])
+        self.assertFalse((self.runs_dir / "active").exists())
+        retry_runner.assert_finished()
+
+    def test_closure_polling_is_bounded_and_keeps_run_resumable(self):
+        runner = FakeRunner(
+            self.merged_retry_responses("OPEN", "OPEN", "OPEN")
+        )
+        sleeps = []
+
+        with self.assertRaisesRegex(
+            gated_merge.MergeConfirmationError,
+            "after 3 attempts",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=runner,
+                confirmation_attempts=3,
+                sleeper=sleeps.append,
+            )
+
+        self.assertEqual(
+            sleeps,
+            [
+                gated_merge.CLOSURE_POLL_INTERVAL_SECONDS,
+                gated_merge.CLOSURE_POLL_INTERVAL_SECONDS,
+            ],
+        )
+        self.assertTrue((self.runs_dir / "active").exists())
+        runner.assert_finished()
+
+    def test_gh_subprocess_timeout_is_explicit_and_actionable(self):
+        command = ["gh", "repo", "view", "--json", "nameWithOwner"]
+        with mock.patch.object(
+            gated_merge.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=command,
+                timeout=gated_merge.GH_TIMEOUT_SECONDS,
+            ),
+        ) as run:
+            result = gated_merge.run_command(command)
+
+        self.assertEqual(result.returncode, 124)
+        self.assertIn(
+            f"timed out after {gated_merge.GH_TIMEOUT_SECONDS} seconds",
+            result.stderr,
+        )
+        run.assert_called_once_with(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=gated_merge.GH_TIMEOUT_SECONDS,
+        )
 
 
 if __name__ == "__main__":
