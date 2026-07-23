@@ -31,8 +31,67 @@ non-string value.
 | `plan_open`         | count of open plan items; `"0"` or `""` means none open     | `3`                        |
 | `updated_at`        | UTC ISO-8601 timestamp of the last write                    | `2026-07-21T14:03:11Z`     |
 
-A freshly initialized run has `phase=investigate`, empty gates, empty `pr`,
-empty `plan_open`, and `branch`/`worktree` derived from `run_id`.
+A freshly initialized run requires a canonical GitHub issue URL and has
+`phase=investigate`, empty gates, empty `pr`, empty `plan_open`, and
+`branch`/`worktree` derived from `run_id`. Repository identity does not add a
+state key. Every state-machine command that reads state checks the persisted
+`run_id`, `issue`, `branch`, and `worktree` as one identity before deriving a
+worktree path.
+`branch` must be `feat/<run_id>`, and `worktree` must be the direct resolved
+child `.worktrees/<run_id>` under the repository. Resume rejects a mismatch
+before it updates state, changes the active marker, or invokes Git.
+
+### Repository identity and legacy migration
+
+`.agents/repository.json` is the tracked bootstrap identity and contains exactly
+one string field: `repository`. Its committed value is
+`aram-devdocs/sailwind_online`. Missing, malformed, extra-field, or mismatched
+configuration fails closed.
+
+Pre-run selection, blocker checks, assignment, and comments supply that
+repository through `--repo`. The selected explicit result supplies the
+canonical issue URL to `init-run`. Every later GitHub operation derives
+owner/repository from the immutable state-machine-owned `issue-url` companion
+marker, checks it against the tracked identity, and supplies it explicitly.
+Checkout remotes are never an identity source. `update-state` cannot change
+the companion marker.
+
+A legacy run without this marker fails closed until `migrate-issue-url`
+atomically records an independently supplied canonical issue URL whose issue
+number matches the run. Migration holds the global and per-run advisory locks
+and refuses replacement of an existing identity. When a prior implementation
+stored `issue_url` in `state.json`, migration removes that key through the
+state machine, backs up the old state, and restores the exact schema above.
+When the run is active and non-`done`, migration also requires the active
+marker, exact recorded worktree and branch, a clean worktree, and the expected
+checked-out branch.
+
+### Issue URL companion
+
+`issue-url` contains exactly one canonical URL line. `init-run` creates it with
+a same-directory temporary file and atomic replacement while holding the
+global and per-run locks. Readers reject missing, malformed, wrong-issue, or
+wrong-repository content. Once present, the marker is immutable.
+
+### Reviewed-head companion
+
+The reviewed commit remains a companion rather than a nested value. The state machine writes it
+to `.agents/runs/<run_id>/reviewed-head` immediately before the fixed review
+sequence:
+
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py record-reviewed-head
+
+The command acquires the run's single-writer lock before reading state or
+inspecting the worktree. It requires the recorded worktree to be clean, on the
+recorded branch, and in `phase=review`, then reads `HEAD` again immediately
+before clearing all four `gate_*` verdicts, updating `state.json`, and
+atomically writing the 40-character commit marker. Clearing verdicts before
+writing the marker is fail-closed: interruption can leave gates empty, but
+cannot make old approvals apply to a new commit.
+
+Any commit after this command requires recording the new head and rerunning all
+four reviewers. `/work` refuses to merge when the marker is missing, malformed,
+or different from the PR head.
 
 ### Load-bearing write invariants
 
@@ -40,8 +99,17 @@ empty `plan_open`, and `branch`/`worktree` derived from `run_id`.
   any modification, so a crashed write leaves a recoverable prior state. The
   new state is written to `state.json.tmp` and atomically renamed into place.
 - **Single-writer lock.** Every write holds `.lock` in the run directory,
-  created with `O_CREAT|O_EXCL`. A lock older than 30 seconds is treated as
-  abandoned and reclaimed, so a dead writer cannot wedge the run.
+  using an operating-system advisory file lock for the full operation. Lock
+  ownership belongs to the open file handle, so age cannot steal a live lock
+  and one owner cannot release another. Acquisition is bounded, and process
+  exit releases a crashed writer's lock safely.
+- **Merge lease.** The gated merge acquires the global lock and that same run
+  lock before reading state or companion markers. It holds both through every
+  GitHub recheck, merge, confirmation, branch cleanup, and the active-marker
+  compare-delete. State updates and reviewed-head replacement therefore cannot
+  invalidate the approved snapshot during the merge. The state machine owns
+  the final compare-delete helper and checks the merge's live global lock
+  handle before changing the marker.
 
 ## Phase transition table
 
@@ -55,11 +123,11 @@ through the state machine.
 | plan          | implement     | plan written; `plan_open` set to the item count                   |
 | implement     | verify        | implementer done; `plan_open` drawn down to `0`                   |
 | verify        | review        | `make validate` passes locally                                    |
-| review        | pr            | `gate_spec`,`gate_quality`,`gate_architecture`,`gate_security` all recorded, none blocking |
+| review        | pr            | `reviewed-head` recorded; all four `gate_*` verdicts recorded for that commit, none blocking |
 | pr            | wait-ci       | PR opened to `dev`; `pr` recorded                                 |
 | wait-ci       | cleanup       | CI green (`poll-pr` reports PASS)                                 |
-| cleanup       | done          | worktree removed; active marker cleared                           |
-| done          | (terminal)    | run reports and stops; does NOT merge its own PR                  |
+| cleanup       | done          | recorded worktree path and its Git registry entry are both absent; active marker retained for `/work` merge resume |
+| done          | (terminal)    | `/gh-issue` stops; `/work` owns merge, confirmation, and active-marker clearing |
 
 The `review` phase runs the four gates in the fixed order spec -> quality ->
 architecture -> security. A REJECT or an unaddressed REQUEST-CHANGES blocks the
@@ -69,7 +137,24 @@ advance; the implementer is re-dispatched and the gate re-run.
 
 Which hook reads which key. All hooks are inert unless a run is active (that is,
 `.agents/runs/active` names a run whose `state.json` exists, or some run's
-`phase` is not `done`).
+`phase` is not `done`). Cleanup intentionally retains the active marker at
+`phase=done`, so a crash before or after merge stays discoverable. `/work`
+clears that marker through the state machine only after it confirms the merged
+PR, closed issue, and remote branch deletion. Active-marker writes and the
+expected-run compare-and-delete share the global run lock, so a replacement
+marker is preserved. The gated merge holds the global and per-run locks from
+its first local read through this compare-delete, so lifecycle writers either
+finish before its snapshot or fail bounded lock acquisition. Cleanup checks
+the Git worktree registry, reconciles a
+stale entry only when its full porcelain record matches the run path, recorded
+branch, and reviewed head. An existing worktree must have no tracked or
+untracked changes immediately before normal removal. Force removal is limited
+to the exact identity-matched registry entry after its path is verified absent.
+A dirty path or replacement entry is never removed. Cleanup holds the global
+lifecycle lock through final registry and filesystem verification and the
+`done` state write; `init-run` uses the same lock while creating worktrees. Any
+cleanup failure leaves the prior phase and active marker unchanged so resume
+retries cleanup.
 
 | hook                          | trigger        | reads                          | effect                                                                 |
 | ----------------------------- | -------------- | ------------------------------ | ---------------------------------------------------------------------- |

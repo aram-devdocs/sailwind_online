@@ -27,6 +27,7 @@
          internal setters and Ready signal. The sync tests drive StateReporter, which
          reads SailwindApi.PlayerBoat, so they arm that same internal setter. -->
     <InternalsVisibleTo Include="Sailwind.API" />
+    <InternalsVisibleTo Include="Sailwind.Api.SurfaceManifest.Tests" />
     <InternalsVisibleTo Include="Sailwind.Online.Sync.Tests" />
   </ItemGroup>
 

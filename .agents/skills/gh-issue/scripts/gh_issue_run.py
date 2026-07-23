@@ -29,20 +29,26 @@ Allowed flat keys (nothing else may be set):
     plan_open         count of open plan items, as a string ("0"/"" = none)
     updated_at        UTC ISO-8601 timestamp of the last write
 
+The immutable companion marker `issue-url` stores the canonical GitHub issue
+URL without extending this flat state schema.
+
 Two invariants are load-bearing and MUST NOT be removed:
     1. Backup-before-write: state.json is copied to state.json.bak before any
        write, so a crashed write leaves a recoverable prior state.
-    2. Single-writer lock: writes hold .lock (O_CREAT|O_EXCL, with a stale-lock
-       timeout) so two processes never interleave a read-modify-write.
+    2. Single-writer lock: writes hold an operating-system advisory lock on
+       .lock for the full operation, so two processes never interleave a
+       read-modify-write and a crashed writer releases ownership safely.
 
 Subcommands
 -----------
-    init-run --issue N --slug SLUG [--resume] [--no-git]
+    init-run --issue N --slug SLUG --issue-url URL [--resume] [--no-git]
+    migrate-issue-url --run-id RUN_ID --issue-url URL
     update-state --key K --value V
     get-state [--key K]
     set-active RUN_ID
-    clear-active
+    clear-active --expected-run-id RUN_ID
     validate-resume
+    record-reviewed-head [--run-id RUN_ID]
     poll-pr
     cleanup-worktree [--no-git]
 
@@ -50,16 +56,24 @@ Runs directory resolution (highest precedence first):
     --runs-dir ARG  >  $SW_RUNS_DIR  >  <repo-root>/.agents/runs
 The override exists so tests exercise the machine without touching a real run.
 
-Stdlib only: json, argparse, os, subprocess, time, pathlib.
+Stdlib only: json, argparse, os, subprocess, time, pathlib, and the platform
+file-lock module.
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 # The four review gates in fixed order (spec first, security last). Mirrors
 # SW_GATE_ORDER in .claude/hooks/_lib.sh; keep the two in sync.
@@ -96,13 +110,15 @@ ALLOWED_KEYS = (
     "updated_at",
 )
 
-# A .lock older than this many seconds is treated as abandoned by a dead
-# process and reclaimed, because a crashed writer must not wedge the run
-# forever.
-STALE_LOCK_SECONDS = 30
-
 # How long to wait for a live lock before giving up.
 LOCK_WAIT_SECONDS = 10
+
+# External probes must not hang a durable run forever.
+COMMAND_TIMEOUT_SECONDS = 30
+PROBE_TIMEOUT_SECONDS = 5
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+RUN_ID_RE = re.compile(r"[1-9][0-9]*-[a-z0-9]+(?:-[a-z0-9]+)*")
+REPOSITORY_CONFIG = Path(__file__).resolve().parents[3] / "repository.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +131,7 @@ def repo_root():
         out = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
         if out.returncode == 0 and out.stdout.strip():
             return Path(out.stdout.strip())
@@ -137,16 +154,105 @@ def runs_dir(args):
     return repo_root() / ".agents" / "runs"
 
 
+def validate_run_id(run_id):
+    """Return one canonical run id or fail before it can become a path."""
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise SystemExit(
+            f"error: invalid run id {run_id!r}; expected "
+            "<positive-issue>-<lowercase-hyphen-slug>"
+        )
+    return run_id
+
+
 def run_dir(args, run_id):
-    return runs_dir(args) / run_id
+    run_id = validate_run_id(run_id)
+    root = runs_dir(args).resolve(strict=False)
+    candidate = (root / run_id).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit(
+            f"error: invalid run id {run_id!r}; resolved path escapes {root}"
+        ) from exc
+    if candidate.parent != root:
+        raise SystemExit(
+            f"error: invalid run id {run_id!r}; run must be a direct child "
+            f"of {root}"
+        )
+    return candidate
+
+
+def validate_run_identity(root, run_id, data):
+    """Validate immutable state identity before deriving a worktree path."""
+    run_id = validate_run_id(run_id)
+    issue = run_id.split("-", 1)[0]
+    expected_branch = f"feat/{run_id}"
+    expected_worktree = f".worktrees/{run_id}"
+    recorded = (
+        data.get("run_id"),
+        data.get("issue"),
+        data.get("branch"),
+        data.get("worktree"),
+    )
+    expected = (
+        run_id,
+        issue,
+        expected_branch,
+        expected_worktree,
+    )
+    if recorded != expected:
+        raise SystemExit(
+            f"error: persisted run identity {recorded!r} does not match "
+            f"{expected!r}"
+        )
+
+    repository = Path(root).resolve(strict=False)
+    worktrees_root = (repository / ".worktrees").resolve(strict=False)
+    worktree = (repository / expected_worktree).resolve(strict=False)
+    if worktrees_root.parent != repository:
+        raise SystemExit(
+            f"error: repository worktree root {worktrees_root} escapes "
+            f"{repository}"
+        )
+    try:
+        worktree.relative_to(worktrees_root)
+    except ValueError as exc:
+        raise SystemExit(
+            f"error: persisted worktree identity {expected_worktree!r} "
+            f"escapes {worktrees_root}"
+        ) from exc
+    if worktree.parent != worktrees_root:
+        raise SystemExit(
+            f"error: persisted worktree identity {expected_worktree!r} is "
+            f"not a direct child of {worktrees_root}"
+        )
+    return expected_branch, worktree
 
 
 def state_path(args, run_id):
     return run_dir(args, run_id) / "state.json"
 
 
+def reviewed_head_path(args, run_id):
+    return run_dir(args, run_id) / "reviewed-head"
+
+
+def issue_url_path(args, run_id):
+    return run_dir(args, run_id) / "issue-url"
+
+
 def active_path(args):
     return runs_dir(args) / "active"
+
+
+def write_active_run_locked(args, run_id):
+    """Atomically replace the active marker while the global lock is held."""
+    run_id = validate_run_id(run_id)
+    marker = active_path(args)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(marker.name + ".tmp")
+    tmp.write_text(run_id + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(marker))
 
 
 # --------------------------------------------------------------------------- #
@@ -157,9 +263,20 @@ def run_cmd(cmd, cwd=None):
     """Run a command, returning (returncode, stdout, stderr). Never raises."""
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, check=False,
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return (
+            124,
+            "",
+            f"command timed out after {COMMAND_TIMEOUT_SECONDS} seconds",
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
 
@@ -168,42 +285,87 @@ def run_cmd(cmd, cwd=None):
 # Locking
 # --------------------------------------------------------------------------- #
 
-def acquire_lock(rundir):
-    """Take the single-writer lock, reclaiming a stale one. Returns lock path."""
+class LockHandle:
+    """One process-owned advisory lock held through its open file."""
+
+    def __init__(self, path, stream):
+        self.path = path
+        self.stream = stream
+        self.released = False
+
+
+def try_lock_file(stream):
+    """Try one nonblocking exclusive lock acquisition."""
+    stream.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def unlock_file(stream):
+    """Release the advisory lock held by this exact open file."""
+    stream.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def acquire_lock(rundir, clock=None, sleeper=None):
+    """Take a bounded process-owned advisory lock."""
+    if clock is None:
+        clock = time.monotonic
+    if sleeper is None:
+        sleeper = time.sleep
     lock = rundir / ".lock"
     rundir.mkdir(parents=True, exist_ok=True)
-    deadline = time.time() + LOCK_WAIT_SECONDS
+    try:
+        stream = lock.open("a+b")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+    except OSError as exc:
+        raise SystemExit(f"error: cannot open lock {lock}: {exc}") from exc
+
+    deadline = clock() + LOCK_WAIT_SECONDS
     while True:
         try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
-            os.close(fd)
-            return lock
-        except FileExistsError:
-            # Reclaim an abandoned lock left by a dead writer.
-            try:
-                age = time.time() - lock.stat().st_mtime
-            except OSError:
-                age = 0
-            if age > STALE_LOCK_SECONDS:
-                try:
-                    lock.unlink()
-                except OSError:
-                    pass
-                continue
-            if time.time() > deadline:
+            try_lock_file(stream)
+            return LockHandle(lock, stream)
+        except OSError:
+            if clock() >= deadline:
+                stream.close()
                 raise SystemExit(
-                    f"error: could not acquire {lock} (held for {age:.0f}s); "
-                    "another writer is active"
+                    f"error: could not acquire {lock}; another writer is active"
                 )
-            time.sleep(0.2)
+            sleeper(0.2)
 
 
 def release_lock(lock):
+    if not isinstance(lock, LockHandle):
+        raise TypeError("release_lock requires the owning LockHandle")
+    if lock.released:
+        return
     try:
-        lock.unlink()
-    except OSError:
-        pass
+        unlock_file(lock.stream)
+    finally:
+        lock.stream.close()
+        lock.released = True
+
+
+def require_owned_lock(lock, rundir):
+    """Reject a locked helper call without the exact live owning handle."""
+    expected = (Path(rundir) / ".lock").resolve(strict=False)
+    if (
+        not isinstance(lock, LockHandle)
+        or lock.released
+        or lock.path.resolve(strict=False) != expected
+    ):
+        raise SystemExit(
+            f"error: lifecycle helper requires the owning lock for {expected}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +374,122 @@ def release_lock(lock):
 
 def now_utc():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def trusted_repository():
+    """Read and strictly validate the tracked GitHub repository identity."""
+    try:
+        data = json.loads(REPOSITORY_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(
+            f"error: cannot read tracked repository identity at "
+            f"{REPOSITORY_CONFIG}: {exc}"
+        ) from exc
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"repository"}
+        or not isinstance(data["repository"], str)
+    ):
+        raise SystemExit(
+            "error: tracked repository identity must be an object containing "
+            "only a string 'repository' field"
+        )
+    repository = data["repository"]
+    if not REPOSITORY_RE.fullmatch(repository) or any(
+        part in (".", "..") for part in repository.split("/")
+    ):
+        raise SystemExit(
+            f"error: tracked repository identity is invalid: {repository!r}"
+        )
+    return repository
+
+
+def parse_issue_url(value, expected_issue):
+    """Validate a canonical GitHub issue URL and return owner/repository."""
+    if not isinstance(value, str):
+        raise SystemExit("error: --issue-url must be a canonical GitHub URL")
+    parsed = urlparse(value)
+    parts = [part for part in parsed.path.split("/") if part]
+    canonical = ""
+    if len(parts) == 4:
+        canonical = (
+            f"https://github.com/{parts[0]}/{parts[1]}/issues/"
+            f"{expected_issue}"
+        )
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 4
+        or parts[2] != "issues"
+        or parts[3] != str(expected_issue)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[0])
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1])
+        or parts[0] in (".", "..")
+        or parts[1] in (".", "..")
+        or value != canonical
+    ):
+        raise SystemExit(
+            f"error: --issue-url must be the canonical GitHub URL for issue "
+            f"#{expected_issue}, found {value!r}"
+        )
+    repository = f"{parts[0]}/{parts[1]}"
+    configured = trusted_repository()
+    if repository != configured:
+        raise SystemExit(
+            f"error: issue URL repository {repository!r} does not match "
+            f"tracked repository {configured!r}"
+        )
+    return repository
+
+
+def write_issue_url_marker(path, issue_url):
+    """Atomically create one immutable issue URL marker."""
+    expected = issue_url + "\n"
+    if path.exists():
+        try:
+            recorded = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(
+                f"error: cannot read issue URL marker at {path}: {exc}"
+            ) from exc
+        if recorded == expected:
+            return False
+        raise SystemExit(
+            f"error: issue URL marker at {path} is immutable and already "
+            "contains a different value"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(expected, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except OSError as exc:
+        raise SystemExit(
+            f"error: cannot atomically write issue URL marker at {path}: {exc}"
+        ) from exc
+    return True
+
+
+def read_issue_url_marker(args, run_id, expected_issue):
+    """Read and validate the immutable companion repository identity."""
+    marker = issue_url_path(args, run_id)
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            f"error: missing or unreadable issue URL marker at {marker}: {exc}; "
+            "use migrate-issue-url with an independently recorded GitHub URL"
+        ) from exc
+    if not raw or raw != raw.strip() + "\n" or "\n" in raw[:-1]:
+        raise SystemExit(
+            f"error: issue URL marker at {marker} must contain exactly one "
+            "canonical URL line"
+        )
+    issue_url = raw[:-1]
+    parse_issue_url(issue_url, expected_issue)
+    return issue_url
 
 
 def blank_state(run_id, issue, slug):
@@ -232,7 +510,7 @@ def blank_state(run_id, issue, slug):
     }
 
 
-def read_state(path):
+def read_state(path, allow_legacy_issue_url=False):
     """Load state.json as a dict. Raises SystemExit with a clear message."""
     if not path.exists():
         raise SystemExit(f"error: no state at {path}")
@@ -242,11 +520,40 @@ def read_state(path):
         raise SystemExit(f"error: cannot read {path}: {exc}")
     if not isinstance(data, dict):
         raise SystemExit(f"error: {path} is not a flat object")
+    if allow_legacy_issue_url:
+        keys = set(data)
+        allowed = set(ALLOWED_KEYS)
+        if keys not in (allowed, allowed | {"issue_url"}):
+            raise SystemExit(
+                f"error: legacy state keys are invalid; "
+                f"missing={sorted(allowed - keys)}, "
+                f"extra={sorted(keys - allowed)}"
+            )
+        for key, value in data.items():
+            if not isinstance(value, str):
+                raise SystemExit(
+                    f"error: legacy key {key!r} has non-string value "
+                    f"{value!r}"
+                )
+    else:
+        validate_flat(data)
     return data
 
 
 def validate_flat(data):
     """Every value MUST be a string (flat contract). Reject nested structures."""
+    if set(data) != set(ALLOWED_KEYS):
+        missing = sorted(set(ALLOWED_KEYS) - set(data))
+        extra = sorted(set(data) - set(ALLOWED_KEYS))
+        if not missing and extra == ["issue_url"]:
+            raise SystemExit(
+                "error: legacy state.json contains issue_url; use "
+                "migrate-issue-url to move it into the companion marker"
+            )
+        raise SystemExit(
+            f"error: state keys must exactly match the flat contract; "
+            f"missing={missing}, extra={extra}"
+        )
     for key, val in data.items():
         if not isinstance(val, str):
             raise SystemExit(
@@ -278,54 +585,92 @@ def write_state(path, data):
 # --------------------------------------------------------------------------- #
 
 def cmd_init_run(args):
-    run_id = f"{args.issue}-{args.slug}"
+    run_id = validate_run_id(f"{args.issue}-{args.slug}")
     rundir = run_dir(args, run_id)
     spath = state_path(args, run_id)
 
-    if spath.exists() and not args.resume:
-        raise SystemExit(
-            f"error: run '{run_id}' already exists at {spath}; pass --resume to "
-            "reattach to it"
-        )
-
-    lock = acquire_lock(rundir)
+    global_lock = acquire_lock(runs_dir(args))
+    lock = None
     try:
+        lock = acquire_lock(rundir)
+        if spath.exists() and not args.resume:
+            raise SystemExit(
+                f"error: run '{run_id}' already exists at {spath}; pass "
+                "--resume to reattach to it"
+        )
         if spath.exists() and args.resume:
-            data = read_state(spath)
+            data = read_state(spath, allow_legacy_issue_url=True)
+            if "issue_url" in data:
+                raise SystemExit(
+                    f"error: legacy run '{run_id}' stores issue_url in "
+                    "state.json; use migrate-issue-url to move it into the "
+                    "companion marker"
+                )
+            validate_flat(data)
+            recorded_url = read_issue_url_marker(
+                args,
+                run_id,
+                args.issue,
+            )
+            if args.issue_url and args.issue_url != recorded_url:
+                raise SystemExit(
+                    f"error: --issue-url {args.issue_url!r} does not match "
+                    f"recorded identity {recorded_url!r}"
+                )
+            root = repo_root()
+            branch, worktree = validate_run_identity(root, run_id, data)
             data["updated_at"] = now_utc()
             write_state(spath, data)
             print(f"resumed existing run '{run_id}' at phase '{data.get('phase')}'")
         else:
-            data = blank_state(run_id, args.issue, args.slug)
+            if not args.issue_url:
+                raise SystemExit(
+                    "error: --issue-url is required when initializing a run"
+                )
+            parse_issue_url(args.issue_url, args.issue)
+            data = blank_state(
+                run_id,
+                args.issue,
+                args.slug,
+            )
+            root = repo_root()
+            branch, worktree = validate_run_identity(root, run_id, data)
+            write_issue_url_marker(
+                issue_url_path(args, run_id),
+                args.issue_url,
+            )
             write_state(spath, data)
             print(f"initialized run '{run_id}' (phase=investigate) at {spath}")
+
+        # Mark this run active for the hooks.
+        write_active_run_locked(args, run_id)
+        print(f"active run set to '{run_id}'")
+
+        # Create the isolated worktree while the lifecycle lock excludes cleanup.
+        if data.get("phase") in ("cleanup", "done"):
+            print(
+                f"run '{run_id}' is at phase {data.get('phase')!r}; "
+                "worktree recreation is not valid during or after cleanup"
+            )
+            return
+        if args.no_git:
+            print("no-git: skipped 'git worktree add' (worktree not created)")
+            return
+        if worktree.exists():
+            print(f"worktree already present at {worktree}; leaving as-is")
+            return
+        rc, out, err = run_cmd(
+            ["git", "worktree", "add", str(worktree), "-b", branch, "dev"],
+            cwd=str(root),
+        )
+        if rc == 0:
+            print(f"created worktree {worktree} on branch {branch}")
+        else:
+            print(f"warning: 'git worktree add' failed (rc={rc}): {err or out}")
     finally:
-        release_lock(lock)
-
-    # Mark this run active for the hooks.
-    active_path(args).parent.mkdir(parents=True, exist_ok=True)
-    active_path(args).write_text(run_id + "\n", encoding="utf-8")
-    print(f"active run set to '{run_id}'")
-
-    # Create the isolated worktree. The script does this at /work time; --no-git
-    # skips it for tests and for the authoring/dry-exercise path.
-    if args.no_git:
-        print("no-git: skipped 'git worktree add' (worktree not created)")
-        return
-    root = repo_root()
-    worktree = root / data["worktree"]
-    branch = data["branch"]
-    if worktree.exists():
-        print(f"worktree already present at {worktree}; leaving as-is")
-        return
-    rc, out, err = run_cmd(
-        ["git", "worktree", "add", str(worktree), "-b", branch, "dev"],
-        cwd=str(root),
-    )
-    if rc == 0:
-        print(f"created worktree {worktree} on branch {branch}")
-    else:
-        print(f"warning: 'git worktree add' failed (rc={rc}): {err or out}")
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
 
 
 def cmd_update_state(args):
@@ -346,7 +691,10 @@ def cmd_update_state(args):
     lock = acquire_lock(rundir)
     try:
         data = read_state(spath)
+        root = repo_root()
+        validate_run_identity(root, run_id, data)
         data[args.key] = args.value
+        validate_run_identity(root, run_id, data)
         data["updated_at"] = now_utc()
         write_state(spath, data)
     finally:
@@ -354,10 +702,108 @@ def cmd_update_state(args):
     print(f"set {args.key}={args.value!r} in run '{run_id}'")
 
 
+def cmd_migrate_issue_url(args):
+    """Move legacy identity into an immutable companion marker."""
+    run_id = resolve_run_id(args)
+    global_lock = acquire_lock(runs_dir(args))
+    lock = None
+    try:
+        rundir = run_dir(args, run_id)
+        lock = acquire_lock(rundir)
+        spath = state_path(args, run_id)
+        data = read_state(spath, allow_legacy_issue_url=True)
+        root = repo_root()
+        recorded_branch, worktree = validate_run_identity(
+            root,
+            run_id,
+            data,
+        )
+        issue = data.get("issue", "")
+        if not issue.isdigit() or int(issue) <= 0:
+            raise SystemExit(
+                f"error: legacy run {run_id!r} has invalid issue {issue!r}"
+            )
+        if not run_id.startswith(issue + "-"):
+            raise SystemExit(
+                f"error: legacy run {run_id!r} does not match issue "
+                f"{issue!r}"
+            )
+        parse_issue_url(args.issue_url, issue)
+        legacy_url = data.get("issue_url", "")
+        if legacy_url:
+            parse_issue_url(legacy_url, issue)
+        if legacy_url and legacy_url != args.issue_url:
+            raise SystemExit(
+                f"error: legacy run already records issue_url {legacy_url!r}; "
+                "repository identity is immutable"
+            )
+        marker = issue_url_path(args, run_id)
+        marker_exists = marker.exists()
+        if marker_exists:
+            recorded = read_issue_url_marker(args, run_id, issue)
+            if recorded != args.issue_url:
+                raise SystemExit(
+                    f"error: issue URL marker already records {recorded!r}; "
+                    "repository identity is immutable"
+                )
+        if data.get("phase") != "done":
+            active = active_path(args)
+            try:
+                active_run = active.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise SystemExit(
+                    f"error: active legacy migration requires readable "
+                    f"{active}: {exc}"
+                ) from exc
+            if active_run != run_id:
+                raise SystemExit(
+                    f"error: active marker names {active_run!r}, not legacy "
+                    f"run {run_id!r}"
+                )
+            if not worktree.is_dir():
+                raise SystemExit(
+                    f"error: active legacy worktree is missing at {worktree}"
+                )
+            rc, dirty, err = run_cmd(
+                ["git", "status", "--porcelain"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or dirty:
+                raise SystemExit(
+                    f"error: active legacy worktree must be clean before "
+                    f"migration: {err or dirty}"
+                )
+            rc, branch, err = run_cmd(
+                ["git", "branch", "--show-current"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or branch != recorded_branch:
+                raise SystemExit(
+                    f"error: active legacy worktree branch must be "
+                    f"{recorded_branch!r}, found {branch!r}: {err}"
+                )
+        marker_created = write_issue_url_marker(marker, args.issue_url)
+        state_migrated = "issue_url" in data
+        if state_migrated:
+            data.pop("issue_url")
+        if marker_created or state_migrated:
+            data["updated_at"] = now_utc()
+            write_state(spath, data)
+        else:
+            print(f"issue URL already recorded for run '{run_id}'")
+            return
+    finally:
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
+    print(f"migrated issue URL for legacy run '{run_id}'")
+
+
 def cmd_get_state(args):
     run_id = resolve_run_id(args)
     spath = state_path(args, run_id)
     data = read_state(spath)
+    validate_run_identity(repo_root(), run_id, data)
     if args.key:
         if args.key not in data:
             raise SystemExit(f"error: run '{run_id}' has no key '{args.key}'")
@@ -366,24 +812,153 @@ def cmd_get_state(args):
         print(json.dumps(data, indent=2))
 
 
-def cmd_set_active(args):
-    run_id = args.run_id
-    if not state_path(args, run_id).exists():
-        raise SystemExit(
-            f"error: run '{run_id}' has no state.json; cannot set it active"
+def cmd_record_reviewed_head(args):
+    """Bind a clean worktree head to a fresh set of review verdicts."""
+    if args.head and not args.no_git:
+        raise SystemExit("error: --head requires --no-git (test seam only)")
+
+    run_id = resolve_run_id(args)
+    spath = state_path(args, run_id)
+    rundir = run_dir(args, run_id)
+    lock = acquire_lock(rundir)
+    try:
+        data = read_state(spath)
+        root = repo_root()
+        expected_branch, worktree = validate_run_identity(
+            root,
+            run_id,
+            data,
         )
-    active_path(args).parent.mkdir(parents=True, exist_ok=True)
-    active_path(args).write_text(run_id + "\n", encoding="utf-8")
+        if data.get("phase") != "review":
+            raise SystemExit(
+                f"error: reviewed head can only be recorded in phase 'review'; "
+                f"run '{run_id}' is at {data.get('phase')!r}"
+            )
+
+        if args.no_git:
+            head = args.head or ""
+        else:
+            rc, dirty, err = run_cmd(
+                ["git", "status", "--porcelain"],
+                cwd=str(worktree),
+            )
+            if rc != 0:
+                raise SystemExit(
+                    f"error: cannot inspect review worktree {worktree}: "
+                    f"{err or dirty}"
+                )
+            if dirty:
+                raise SystemExit(
+                    f"error: review worktree {worktree} is dirty; commit the "
+                    "exact reviewed content first"
+                )
+            rc, branch, err = run_cmd(
+                ["git", "branch", "--show-current"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or branch != expected_branch:
+                raise SystemExit(
+                    f"error: review worktree branch must be "
+                    f"{expected_branch!r}, found {branch!r}: {err}"
+                )
+            rc, head, err = run_cmd(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=str(worktree),
+            )
+            if rc != 0:
+                raise SystemExit(
+                    f"error: cannot resolve review head in {worktree}: {err}"
+                )
+
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            raise SystemExit(
+                "error: reviewed head must be a 40-character hexadecimal commit"
+            )
+        head = head.lower()
+
+        if not args.no_git:
+            rc, locked_head, err = run_cmd(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or locked_head.lower() != head:
+                raise SystemExit(
+                    f"error: review head changed before it could be recorded: "
+                    f"expected {head}, found {locked_head!r}: {err}"
+                )
+
+        for gate in GATE_ORDER:
+            data[f"gate_{gate}"] = ""
+        data["updated_at"] = now_utc()
+        write_state(spath, data)
+
+        marker = reviewed_head_path(args, run_id)
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(head + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(marker))
+    finally:
+        release_lock(lock)
+    print(
+        f"recorded reviewed head {head} for run '{run_id}'; "
+        "cleared all review verdicts"
+    )
+
+
+def cmd_set_active(args):
+    run_id = validate_run_id(args.run_id)
+    root = runs_dir(args)
+    global_lock = acquire_lock(root)
+    lock = None
+    try:
+        lock = acquire_lock(run_dir(args, run_id))
+        spath = state_path(args, run_id)
+        if not spath.exists():
+            raise SystemExit(
+                f"error: run '{run_id}' has no state.json; cannot set it active"
+            )
+        data = read_state(spath)
+        validate_run_identity(repo_root(), run_id, data)
+        write_active_run_locked(args, run_id)
+    finally:
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
     print(f"active run set to '{run_id}'")
 
 
-def cmd_clear_active(args):
+def clear_active_run_locked(args, expected_run_id, global_lock):
+    """Compare-delete the active marker under the exact global lock."""
+    expected_run_id = validate_run_id(expected_run_id)
+    root = runs_dir(args)
+    require_owned_lock(global_lock, root)
     ap = active_path(args)
-    if ap.exists():
-        ap.unlink()
-        print("active run cleared")
-    else:
+    if not ap.exists():
         print("no active run to clear")
+        return
+    try:
+        named = ap.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SystemExit(f"error: cannot read active run marker: {exc}")
+    named = validate_run_id(named)
+    if named != expected_run_id:
+        raise SystemExit(
+            f"error: active run changed to {named!r}; expected "
+            f"{expected_run_id!r}, so the replacement was preserved"
+        )
+    try:
+        ap.unlink()
+    except OSError as exc:
+        raise SystemExit(f"error: cannot clear active run marker: {exc}")
+    print(f"active run '{expected_run_id}' cleared")
+
+
+def cmd_clear_active(args):
+    root = runs_dir(args)
+    lock = acquire_lock(root)
+    try:
+        clear_active_run_locked(args, args.expected_run_id, lock)
+    finally:
+        release_lock(lock)
 
 
 def cmd_validate_resume(args):
@@ -397,12 +972,46 @@ def cmd_validate_resume(args):
     spath = state_path(args, run_id)
     data = read_state(spath)
     root = repo_root()
-    worktree = root / data.get("worktree", "")
-    branch = data.get("branch", "")
+    branch, worktree = validate_run_identity(root, run_id, data)
     pr = data.get("pr", "")
 
     lines = [f"reconciliation for run '{run_id}':",
              f"  recorded phase: {data.get('phase', '?')}"]
+
+    if data.get("phase") == "done":
+        marker = issue_url_path(args, run_id)
+        if not marker.is_file():
+            lines.append(
+                "  repository: MISSING durable issue-url marker for legacy run"
+            )
+            lines.append(
+                "  ACTION: run migrate-issue-url with an independently "
+                "recorded canonical GitHub issue URL before gated merge"
+            )
+            print("\n".join(lines))
+            return
+        read_issue_url_marker(args, run_id, data.get("issue", ""))
+        lines.append(
+            "  worktree: cleanup complete; absence is expected at phase done"
+        )
+        lines.append(
+            f"  pr: {pr or 'none recorded'}"
+        )
+        lines.append(
+            "  ACTION: resume the /work gated merge for this run; do not "
+            "select another issue while its active handoff remains"
+        )
+        print("\n".join(lines))
+        return
+
+    repo = parse_issue_url(
+        read_issue_url_marker(
+            args,
+            run_id,
+            data.get("issue", ""),
+        ),
+        data.get("issue", ""),
+    )
 
     # Worktree present?
     if data.get("worktree") and worktree.exists():
@@ -434,7 +1043,16 @@ def cmd_validate_resume(args):
     # PR reality?
     if pr:
         rc, out, _ = run_cmd(
-            ["gh", "pr", "view", pr, "--json", "state,mergeStateStatus,number"]
+            [
+                "gh",
+                "pr",
+                "view",
+                pr,
+                "--repo",
+                repo,
+                "--json",
+                "state,mergeStateStatus,number",
+            ]
         )
         if rc == 0 and out:
             try:
@@ -464,16 +1082,36 @@ def cmd_validate_resume(args):
 def cmd_poll_pr(args):
     run_id = resolve_run_id(args)
     data = read_state(state_path(args, run_id))
+    validate_run_identity(repo_root(), run_id, data)
     pr = data.get("pr", "")
     if not pr:
         raise SystemExit(f"error: run '{run_id}' has no PR recorded yet")
+    repo = parse_issue_url(
+        read_issue_url_marker(
+            args,
+            run_id,
+            data.get("issue", ""),
+        ),
+        data.get("issue", ""),
+    )
     rc, out, err = run_cmd(
-        ["gh", "pr", "checks", pr, "--json", "name,state,bucket"]
+        [
+            "gh",
+            "pr",
+            "checks",
+            pr,
+            "--repo",
+            repo,
+            "--json",
+            "name,state,bucket",
+        ]
     )
     if rc != 0 or not out:
         # gh pr checks exits non-zero when checks are failing/pending; fall back
         # to the plain text form so we still print something useful.
-        rc2, out2, err2 = run_cmd(["gh", "pr", "checks", pr])
+        rc2, out2, err2 = run_cmd(
+            ["gh", "pr", "checks", pr, "--repo", repo]
+        )
         print(f"pr {pr} checks (raw):")
         print(out2 or err2 or err or "no output")
         return
@@ -497,44 +1135,201 @@ def cmd_poll_pr(args):
         print(f"  {c.get('bucket') or c.get('state'):8} {c.get('name')}")
 
 
+def normalized_path(path):
+    """Return a case-normalized absolute path for exact worktree matching."""
+    return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+
+def registered_worktrees(root):
+    """Parse the stable Git porcelain format into full worktree entries."""
+    rc, out, err = run_cmd(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(root),
+    )
+    if rc != 0:
+        raise SystemExit(
+            f"error: worktree registry inspection failed (rc={rc}): "
+            f"{err or out}"
+        )
+    entries = {}
+    current = None
+    for line in (*out.splitlines(), ""):
+        if not line:
+            if current is not None:
+                key = normalized_path(current["path"])
+                if key in entries:
+                    raise SystemExit(
+                        f"error: worktree registry contains duplicate path "
+                        f"{current['path']!r}"
+                    )
+                entries[key] = current
+                current = None
+            continue
+        if line.startswith("worktree "):
+            if current is not None:
+                raise SystemExit(
+                    "error: malformed worktree registry: missing entry separator"
+                )
+            current = {
+                "path": line.removeprefix("worktree "),
+                "head": "",
+                "branch": "",
+            }
+            continue
+        if current is None:
+            raise SystemExit(
+                f"error: malformed worktree registry line {line!r}"
+            )
+        if line.startswith("HEAD "):
+            current["head"] = line.removeprefix("HEAD ")
+        elif line.startswith("branch "):
+            current["branch"] = line.removeprefix("branch ")
+        elif line == "detached":
+            current["detached"] = True
+        elif line == "bare":
+            current["bare"] = True
+        elif line == "locked" or line.startswith("locked "):
+            current["locked"] = line.removeprefix("locked").strip()
+        elif line == "prunable" or line.startswith("prunable "):
+            current["prunable"] = line.removeprefix("prunable").strip()
+        else:
+            raise SystemExit(
+                f"error: unrecognized worktree registry line {line!r}"
+            )
+    return entries
+
+
+def validate_cleanup_entry(args, run_id, data, entry):
+    """Bind a destructive worktree removal to branch and reviewed commit."""
+    expected_branch = f"refs/heads/{data.get('branch', '')}"
+    marker = reviewed_head_path(args, run_id)
+    try:
+        expected_head = marker.read_text(encoding="utf-8").strip().lower()
+    except OSError as exc:
+        raise SystemExit(
+            f"error: cannot read reviewed head for cleanup: {exc}"
+        ) from exc
+    actual_head = entry.get("head", "").lower()
+    actual_branch = entry.get("branch", "")
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", expected_head)
+        or actual_head != expected_head
+        or actual_branch != expected_branch
+    ):
+        raise SystemExit(
+            f"error: worktree identity mismatch for {entry.get('path')!r}: "
+            f"expected {expected_branch} at {expected_head!r}, found "
+            f"{actual_branch!r} at {actual_head!r}; refusing removal"
+        )
+
+
+def require_clean_worktree(worktree):
+    """Fail unless the exact worktree has no tracked or untracked changes."""
+    rc, out, err = run_cmd(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
+        cwd=str(worktree),
+    )
+    if rc != 0:
+        raise SystemExit(
+            f"error: cannot verify worktree cleanliness (rc={rc}): "
+            f"{err or out}; run remains active and non-done for cleanup retry"
+        )
+    if out:
+        raise SystemExit(
+            f"error: worktree is not clean after review: {out}; "
+            "run remains active and non-done for cleanup retry"
+        )
+
+
 def cmd_cleanup_worktree(args):
     run_id = resolve_run_id(args)
-    spath = state_path(args, run_id)
-    data = read_state(spath)
-    root = repo_root()
-    worktree = root / data.get("worktree", "")
-
-    if args.no_git:
-        print("no-git: skipped 'git worktree remove'")
-    elif data.get("worktree") and worktree.exists():
-        rc, out, err = run_cmd(
-            ["git", "worktree", "remove", str(worktree), "--force"], cwd=str(root)
-        )
-        if rc == 0:
-            print(f"removed worktree {worktree}")
-        else:
-            print(f"warning: worktree remove failed (rc={rc}): {err or out}")
-    else:
-        print(f"worktree {worktree} already absent")
-
     rundir = run_dir(args, run_id)
-    lock = acquire_lock(rundir)
+    spath = state_path(args, run_id)
+    root = repo_root()
+    global_lock = acquire_lock(runs_dir(args))
+    lock = None
     try:
+        lock = acquire_lock(rundir)
         data = read_state(spath)
+        _, worktree = validate_run_identity(root, run_id, data)
+
+        if args.no_git:
+            print("no-git: skipped 'git worktree remove'")
+        else:
+            target = normalized_path(worktree)
+            entries = registered_worktrees(root)
+            entry = entries.get(target)
+            if entry is not None:
+                validate_cleanup_entry(args, run_id, data, entry)
+                worktree_present = worktree.exists()
+                if worktree_present:
+                    require_clean_worktree(worktree)
+                    remove_command = [
+                        "git",
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                    ]
+                else:
+                    remove_command = [
+                        "git",
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                        "--force",
+                    ]
+                rc, out, err = run_cmd(remove_command, cwd=str(root))
+                if rc != 0:
+                    raise SystemExit(
+                        f"error: worktree removal failed (rc={rc}): "
+                        f"{err or out}; run remains active and non-done for "
+                        "cleanup retry"
+                    )
+                if worktree_present:
+                    print(f"removed worktree {worktree}")
+                else:
+                    print(
+                        f"removed stale worktree registration for {worktree}"
+                    )
+            elif worktree.exists():
+                raise SystemExit(
+                    f"error: worktree path {worktree} exists but is not "
+                    "registered; refusing to remove an unowned directory"
+                )
+            else:
+                print(f"worktree {worktree} already absent")
+
+            after_remove = getattr(args, "_after_remove_hook", None)
+            if after_remove is not None:
+                after_remove()
+
+            if target in registered_worktrees(root):
+                raise SystemExit(
+                    f"error: worktree {worktree} remains registered after "
+                    "cleanup; run remains active and non-done for cleanup retry"
+                )
+            if worktree.exists():
+                raise SystemExit(
+                    f"error: worktree path {worktree} remains after cleanup; "
+                    "run remains active and non-done for cleanup retry"
+                )
+
+        data = read_state(spath)
+        validate_run_identity(root, run_id, data)
         data["phase"] = "done"
         data["updated_at"] = now_utc()
         write_state(spath, data)
     finally:
-        release_lock(lock)
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
     print(f"phase set to 'done' for run '{run_id}'")
-
-    # Clear the active marker only if it names this run.
-    ap = active_path(args)
-    if ap.exists():
-        named = ap.read_text(encoding="utf-8").strip()
-        if named == run_id:
-            ap.unlink()
-            print("active run cleared")
+    print("active run retained for the /work merge handoff")
 
 
 # --------------------------------------------------------------------------- #
@@ -543,12 +1338,12 @@ def cmd_cleanup_worktree(args):
 
 def resolve_run_id(args):
     if getattr(args, "run_id", None):
-        return args.run_id
+        return validate_run_id(args.run_id)
     ap = active_path(args)
     if ap.exists():
         named = ap.read_text(encoding="utf-8").strip()
         if named:
-            return named
+            return validate_run_id(named)
     raise SystemExit(
         "error: no run specified and no active run marker; pass --run-id or "
         "set-active first"
@@ -575,11 +1370,27 @@ def build_parser():
     sp = sub.add_parser("init-run", help="create a run and its worktree")
     sp.add_argument("--issue", required=True, help="GitHub issue number N")
     sp.add_argument("--slug", required=True, help="kebab-case slug for the run")
+    sp.add_argument(
+        "--issue-url",
+        help="canonical https://github.com/<owner>/<repo>/issues/<N> URL",
+    )
     sp.add_argument("--resume", action="store_true",
                     help="reattach to an existing run instead of refusing")
     sp.add_argument("--no-git", action="store_true",
                     help="skip 'git worktree add' (tests / authoring)")
     sp.set_defaults(func=cmd_init_run)
+
+    sp = sub.add_parser(
+        "migrate-issue-url",
+        help="bind a legacy run missing identity to an explicit issue URL",
+    )
+    sp.add_argument("--run-id", required=True, help="legacy run id")
+    sp.add_argument(
+        "--issue-url",
+        required=True,
+        help="canonical https://github.com/<owner>/<repo>/issues/<N> URL",
+    )
+    sp.set_defaults(func=cmd_migrate_issue_url)
 
     sp = sub.add_parser("update-state", help="set one flat key (locked, backed up)")
     sp.add_argument("--key", required=True, help="flat key to set")
@@ -596,8 +1407,32 @@ def build_parser():
     sp.add_argument("run_id", help="run id to mark active")
     sp.set_defaults(func=cmd_set_active)
 
-    sp = sub.add_parser("clear-active", help="remove the active marker")
+    sp = sub.add_parser(
+        "clear-active",
+        help="remove the active marker only when it names the expected run",
+    )
+    sp.add_argument(
+        "--expected-run-id",
+        required=True,
+        help="run id that must still own the active marker",
+    )
     sp.set_defaults(func=cmd_clear_active)
+
+    sp = sub.add_parser(
+        "record-reviewed-head",
+        help="bind a clean commit to a fresh set of review verdicts",
+    )
+    sp.add_argument("--run-id", help="target run (default: the active run)")
+    sp.add_argument(
+        "--no-git",
+        action="store_true",
+        help="skip worktree inspection (tests only; requires --head)",
+    )
+    sp.add_argument(
+        "--head",
+        help="reviewed commit override (tests only; requires --no-git)",
+    )
+    sp.set_defaults(func=cmd_record_reviewed_head)
 
     sp = sub.add_parser(
         "validate-resume",
@@ -612,7 +1447,7 @@ def build_parser():
 
     sp = sub.add_parser(
         "cleanup-worktree",
-        help="remove the worktree, set phase=done, clear active",
+        help="remove the worktree, set phase=done, retain active for /work",
     )
     sp.add_argument("--run-id", help="target run (default: the active run)")
     sp.add_argument("--no-git", action="store_true",

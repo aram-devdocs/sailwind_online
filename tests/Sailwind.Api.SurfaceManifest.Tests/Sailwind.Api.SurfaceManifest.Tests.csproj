@@ -6,16 +6,20 @@
     <RootNamespace>Sailwind.Api.SurfaceManifest.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <!-- References NO repo projects and never loads the game assembly. It only
-         reads committed repo files (manifest/api-surface.json + .sha256) and a
-         source literal (SurfaceManifest.g.cs), so it stays game-free and runs in
-         the SailwindOnline.CI.slnf tier with no lib/ present. -->
+    <!-- References only the game-free API abstractions project and never loads the
+         game assembly. It verifies committed manifest files, generated source
+         literals, polled readiness behavior, and the otherwise inaccessible Unity
+         composition-root wiring, so it runs in CI with no lib/ present. -->
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\packages\api-abstractions\Sailwind.Api.Abstractions\Sailwind.Api.Abstractions.csproj" />
   </ItemGroup>
 
 </Project>

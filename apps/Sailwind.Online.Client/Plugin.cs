@@ -28,6 +28,7 @@ namespace Sailwind.Online.Client
         private ConfigEntry<int> _port;
         private ConfigEntry<string> _displayName;
         private ConfigEntry<string> _token;
+        private string _resolvedToken;
 
         private MainThreadDispatcher _dispatcher;
         private NetClient _net;
@@ -40,7 +41,18 @@ namespace Sailwind.Online.Client
             _host = Config.Bind("Server", "Host", "127.0.0.1", "Address of the Sailwind Online server.");
             _port = Config.Bind("Server", "Port", 38455, "UDP port of the Sailwind Online server.");
             _displayName = Config.Bind("Player", "DisplayName", "Sailor", "Name shown to other players.");
-            _token = Config.Bind("Player", "Token", string.Empty, "Identity token presented to the server.");
+            _token = Config.Bind(
+                "Player",
+                "Token",
+                string.Empty,
+                "Private identity token presented to the server. An empty value is generated automatically; keep it private.");
+            _resolvedToken = IdentityToken.GetOrCreate(
+                _token.Value,
+                token =>
+                {
+                    _token.Value = token;
+                    Config.Save();
+                });
 
             _dispatcher = new MainThreadDispatcher();
             _net = new NetClient(new BepInExNetLog(Logger));
@@ -61,7 +73,7 @@ namespace Sailwind.Online.Client
                 Host = _host.Value,
                 Port = _port.Value,
                 DisplayName = _displayName.Value,
-                Token = _token.Value,
+                Token = _resolvedToken,
                 GameBuild = Application.version,
                 ModVersion = PluginVersion,
                 ApiSurfaceHash = SailwindApi.SurfaceHash
