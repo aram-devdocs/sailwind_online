@@ -552,6 +552,8 @@ def merge_completed_run(
         clear_active_handoff(runs_dir, run_id)
         return MergeResult(pr_number, issue_number, head_oid, True)
 
+    validate_required_checks(runner, pr_number, repo)
+
     if dry_run:
         return MergeResult(pr_number, issue_number, head_oid, False)
 

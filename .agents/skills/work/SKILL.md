@@ -160,10 +160,12 @@ review verdict must cover the exact commit merged. The required `gate` check
 proves that same PR head passed the CI mirror of `make validate`.
 
 Immediately before merging, the script reads the PR again and refuses a changed
-head. It passes that exact head to `gh pr merge --match-head-commit`, uses
-squash merge, and requests remote branch deletion. It then confirms the PR is
-`MERGED` and polls the linked issue for bounded closure confirmation. Every
-`gh` call has a fixed timeout and fails closed with the command purpose.
+head, rechecks issue linkage, and reads required checks again. It passes that
+exact head to `gh pr merge --match-head-commit` only when the final check read
+still passes, uses squash merge, and requests remote branch deletion. It then
+confirms the PR is `MERGED` and polls the linked issue for bounded closure
+confirmation. Every `gh` call has a fixed timeout and fails closed with the
+command purpose.
 
 The merge command is retry-safe. If GitHub accepted the squash merge but a
 confirmation call failed or issue closure was delayed, rerun the same command.

@@ -222,6 +222,7 @@ class GatedMergeTests(unittest.TestCase):
             self.checks_response(),
             (self.pr_view_command(), 0, self.open_pr(), ""),
             (self.closure_command(), 0, self.closure_result(), ""),
+            self.checks_response(),
             (
                 [
                     "gh",
@@ -273,7 +274,7 @@ class GatedMergeTests(unittest.TestCase):
         runner.assert_finished()
 
     def test_dry_run_checks_every_precondition_without_merging(self):
-        responses = self.success_responses()[:6]
+        responses = self.success_responses()[:7]
         runner = FakeRunner(responses)
 
         result = gated_merge.merge_completed_run(
@@ -486,17 +487,48 @@ class GatedMergeTests(unittest.TestCase):
             any(call[:3] == ["gh", "pr", "merge"] for call in runner.calls)
         )
 
+    def test_rechecks_required_checks_at_the_final_mutation_boundary(self):
+        responses = self.success_responses()
+        responses[6] = (
+            self.checks_response()[0],
+            1,
+            [{"name": "gate", "state": "FAILURE", "bucket": "fail"}],
+            "",
+        )
+        runner = FakeRunner(responses)
+
+        with self.assertRaisesRegex(
+            gated_merge.MergePreconditionError,
+            "required checks are not all passed",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=runner,
+            )
+
+        self.assertEqual(
+            sum(
+                call == self.checks_response()[0]
+                for call in runner.calls
+            ),
+            2,
+        )
+        self.assertFalse(
+            any(call[:3] == ["gh", "pr", "merge"] for call in runner.calls)
+        )
+
     def test_rejects_failed_merge_or_post_merge_confirmation(self):
         cases = {
-            "merge command": (6, 1, "", "merge refused"),
+            "merge command": (7, 1, "", "merge refused"),
             "pr confirmation": (
-                7,
+                8,
                 0,
                 {"number": 52, "state": "OPEN", "mergedAt": None},
                 "",
             ),
             "issue confirmation": (
-                8,
+                9,
                 0,
                 {"number": 48, "state": "OPEN"},
                 "",
@@ -520,7 +552,7 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_retry_after_transient_confirmation_failure_is_idempotent(self):
         first_responses = self.success_responses()
-        first_responses[7] = (
+        first_responses[8] = (
             self.confirmation_pr_response()[0],
             1,
             "",

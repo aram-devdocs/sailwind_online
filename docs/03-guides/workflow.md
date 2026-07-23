@@ -79,6 +79,7 @@ not memory, so a run that died mid-task recovers cleanly. The full loop is in
    targets `dev`, comes from the recorded branch, links the recorded issue,
    reports a clean merge state, and has no pending or failed required checks.
    It rereads the head before a squash merge guarded by that exact commit,
+   rechecks linkage and required checks at the final mutation boundary,
    requests remote branch deletion, then confirms both `MERGED` and `CLOSED`.
    Cleanup retains the active-run marker until those confirmations succeed, so
    a restart resumes this handoff before selecting another issue.
