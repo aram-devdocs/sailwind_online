@@ -162,6 +162,11 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Begin (or restart) a session with the given options.</summary>
         public void Connect(ConnectOptions options)
         {
+            if (_status == ConnectionStatus.Connecting && ReferenceEquals(_options, options))
+            {
+                return;
+            }
+
             _options = options;
 
             if (!_transport.IsRunning && !_transport.Start())
@@ -300,7 +305,6 @@ namespace Sailwind.Online.Client.Net
         private void OnPeerConnected()
         {
             _status = ConnectionStatus.Handshaking;
-            _reconnectBackoffMs = DefaultReconnectMs;
             SendHello();
             _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
         }

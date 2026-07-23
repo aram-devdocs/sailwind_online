@@ -68,7 +68,7 @@ namespace Sailwind.Online.Client.Net
 
         public void Connect(string host, int port, string key)
         {
-            _peer.Set(_manager.Connect(host, port, key));
+            _peer.SetIfPresent(_manager.Connect(host, port, key));
         }
 
         public void DropPeer()
@@ -151,8 +151,13 @@ namespace Sailwind.Online.Client.Net
             get { return _value; }
         }
 
-        public void Set(TPeer peer)
+        public void SetIfPresent(TPeer peer)
         {
+            if (peer == null)
+            {
+                return;
+            }
+
             _value = peer;
         }
 

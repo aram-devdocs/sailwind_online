@@ -48,6 +48,28 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
+        public void Connect_SameOptionsWhilePending_DoesNotOpenDuplicatePeer()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+
+            net.Connect(Options);
+            net.Connect(Options);
+
+            Assert.Equal(1, transport.StartCalls);
+            Assert.Equal(1, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(
+                accepted: true,
+                playerId: 77,
+                snapshotHz: 8));
+
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+        }
+
+        [Fact]
         public void Connect_WhenTransportStartFails_LogsAndDoesNotOpenPeer()
         {
             var transport = new MockTransport { StartResult = false };
@@ -115,6 +137,67 @@ namespace Sailwind.Online.Net.Tests
             transport.RaisePeerConnected();
             Assert.Equal(ConnectionStatus.Handshaking, net.Status);
             Assert.Equal(2, transport.Sent.Count);
+        }
+
+        [Fact]
+        public void Handshake_ConsecutiveRejections_BackOffUntilAcceptedHandshakeResets()
+        {
+            var transport = new MockTransport();
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+            net.Connect(Options);
+
+            long[] rejectionGaps =
+            {
+                NetClient.DefaultReconnectMs,
+                2 * NetClient.DefaultReconnectMs,
+                4 * NetClient.DefaultReconnectMs,
+                NetClient.MaxReconnectMs,
+                NetClient.MaxReconnectMs
+            };
+            int expectedConnectCalls = 1;
+
+            for (int i = 0; i < rejectionGaps.Length; i++)
+            {
+                transport.RaisePeerConnected();
+                transport.RaiseNetworkReceive(ServerHelloEnvelope(
+                    accepted: false,
+                    playerId: 0,
+                    snapshotHz: 0));
+
+                Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+                Assert.Equal(i + 1, transport.DropPeerCalls);
+
+                now += rejectionGaps[i] - 1;
+                net.Poll();
+                Assert.Equal(expectedConnectCalls, transport.ConnectCalls);
+
+                now++;
+                net.Poll();
+                expectedConnectCalls++;
+                Assert.Equal(expectedConnectCalls, transport.ConnectCalls);
+                Assert.Equal(ConnectionStatus.Connecting, net.Status);
+            }
+
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(
+                accepted: true,
+                playerId: 77,
+                snapshotHz: 8));
+
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+            Assert.Equal(rejectionGaps.Length, transport.DropPeerCalls);
+
+            transport.RaisePeerDisconnected();
+            now += NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(expectedConnectCalls, transport.ConnectCalls);
+
+            now++;
+            net.Poll();
+            expectedConnectCalls++;
+            Assert.Equal(expectedConnectCalls, transport.ConnectCalls);
+            Assert.Equal(rejectionGaps.Length, transport.DropPeerCalls);
         }
 
         [Fact]
