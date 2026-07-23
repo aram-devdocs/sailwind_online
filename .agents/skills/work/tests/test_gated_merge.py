@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -13,6 +14,19 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "gated_merge.py"
 SPEC = importlib.util.spec_from_file_location("gated_merge", SCRIPT)
 gated_merge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gated_merge)
+
+STATE_SCRIPT = (
+    SCRIPT.parents[2]
+    / "gh-issue"
+    / "scripts"
+    / "gh_issue_run.py"
+)
+STATE_SPEC = importlib.util.spec_from_file_location(
+    "competing_gh_issue_run",
+    STATE_SCRIPT,
+)
+competing_state = importlib.util.module_from_spec(STATE_SPEC)
+STATE_SPEC.loader.exec_module(competing_state)
 
 
 class FakeRunner:
@@ -353,6 +367,82 @@ class GatedMergeTests(unittest.TestCase):
         self.assertFalse((self.runs_dir / "active").exists())
         runner.assert_finished()
 
+    def test_merge_lease_excludes_gate_and_pr_state_mutation(self):
+        delegate = FakeRunner(self.success_responses())
+        blocked = []
+
+        def runner(command):
+            if command[:3] == ["gh", "pr", "merge"]:
+                for key, value in (
+                    ("gate_security", ""),
+                    ("pr", "999"),
+                ):
+                    args = SimpleNamespace(
+                        runs_dir=str(self.runs_dir),
+                        run_id=self.run_id,
+                        key=key,
+                        value=value,
+                    )
+                    with (
+                        mock.patch.object(
+                            competing_state,
+                            "LOCK_WAIT_SECONDS",
+                            0,
+                        ),
+                        self.assertRaisesRegex(
+                            SystemExit,
+                            "another writer is active",
+                        ),
+                    ):
+                        competing_state.cmd_update_state(args)
+                    blocked.append(key)
+                review_args = SimpleNamespace(
+                    runs_dir=str(self.runs_dir),
+                    run_id=self.run_id,
+                    head="b" * 40,
+                    no_git=True,
+                )
+                with (
+                    mock.patch.object(
+                        competing_state,
+                        "LOCK_WAIT_SECONDS",
+                        0,
+                    ),
+                    self.assertRaisesRegex(
+                        SystemExit,
+                        "another writer is active",
+                    ),
+                ):
+                    competing_state.cmd_record_reviewed_head(review_args)
+                blocked.append("reviewed-head")
+            return delegate(command)
+
+        result = gated_merge.merge_completed_run(
+            self.runs_dir,
+            self.run_id,
+            runner=runner,
+        )
+
+        self.assertTrue(result.merged)
+        self.assertEqual(
+            blocked,
+            ["gate_security", "pr", "reviewed-head"],
+        )
+        state = json.loads(
+            (
+                self.runs_dir
+                / self.run_id
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["gate_security"], "APPROVE")
+        self.assertEqual(state["pr"], "52")
+        released = competing_state.acquire_lock(
+            self.runs_dir / self.run_id
+        )
+        competing_state.release_lock(released)
+        delegate.assert_finished()
+
     def test_dry_run_checks_every_precondition_without_merging(self):
         responses = self.success_responses()[:6]
         runner = FakeRunner(responses)
@@ -526,6 +616,10 @@ class GatedMergeTests(unittest.TestCase):
             "issue": {"issue": "49"},
             "state schema extension": {"issue_url": self.issue_url},
             "branch": {"branch": "feat/49-other-run"},
+            "worktree traversal": {"worktree": "../other-run"},
+            "worktree absolute": {
+                "worktree": str((self.runs_dir / "other-run").resolve())
+            },
             "wrong PR repository": {
                 "pr": "https://github.com/attacker/unrelated/pull/52"
             },
@@ -1081,15 +1175,17 @@ class GatedMergeTests(unittest.TestCase):
         runner.assert_finished()
 
     def test_replacement_active_marker_is_preserved_during_clear(self):
-        runner = FakeRunner(self.merged_retry_responses("CLOSED"))
+        delegate = FakeRunner(self.merged_retry_responses("CLOSED"))
         replacement = "49-new-active-run"
 
-        def replace_then_clear(command):
-            (self.runs_dir / "active").write_text(
-                replacement + "\n",
-                encoding="utf-8",
-            )
-            return gated_merge.run_command(command)
+        def runner(command):
+            result = delegate(command)
+            if command == self.branch_lookup_command():
+                (self.runs_dir / "active").write_text(
+                    replacement + "\n",
+                    encoding="utf-8",
+                )
+            return result
 
         with self.assertRaisesRegex(
             gated_merge.MergeConfirmationError,
@@ -1099,7 +1195,6 @@ class GatedMergeTests(unittest.TestCase):
                 self.runs_dir,
                 self.run_id,
                 runner=runner,
-                state_runner=replace_then_clear,
                 confirmation_attempts=1,
                 sleeper=lambda _: None,
             )
@@ -1108,7 +1203,7 @@ class GatedMergeTests(unittest.TestCase):
             (self.runs_dir / "active").read_text(encoding="utf-8"),
             replacement + "\n",
         )
-        runner.assert_finished()
+        delegate.assert_finished()
 
     def test_subprocess_timeout_is_explicit_and_actionable(self):
         command = ["gh", "repo", "view", "--json", "nameWithOwner"]

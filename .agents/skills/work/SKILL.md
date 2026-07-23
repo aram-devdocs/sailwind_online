@@ -173,6 +173,14 @@ head MUST equal `reviewed-head`, because every review verdict must cover the
 exact commit merged. The required `gate` check proves that same PR head passed
 the CI mirror of `make validate`.
 
+Before its first state or companion-marker read, the script acquires the state
+machine's global lock and the completed run's advisory lock in that order. It
+holds both through every precondition recheck, the merge, confirmation, remote
+branch cleanup, and the active-marker compare-delete. State updates and
+reviewed-head recording use the same run lock, so they cannot invalidate the
+snapshot during the merge. Lock acquisition is bounded, and process exit
+releases ownership for a safe retry.
+
 Immediately before merging, the script reads the PR again and refuses a changed
 head, rechecks issue linkage, and reads required checks again. It passes that
 exact head to `gh pr merge --match-head-commit` only when the final check read

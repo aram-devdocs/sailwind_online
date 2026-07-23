@@ -182,6 +182,53 @@ def run_dir(args, run_id):
     return candidate
 
 
+def validate_run_identity(root, run_id, data):
+    """Validate immutable state identity before deriving a worktree path."""
+    run_id = validate_run_id(run_id)
+    issue = run_id.split("-", 1)[0]
+    expected_branch = f"feat/{run_id}"
+    expected_worktree = f".worktrees/{run_id}"
+    recorded = (
+        data.get("run_id"),
+        data.get("issue"),
+        data.get("branch"),
+        data.get("worktree"),
+    )
+    expected = (
+        run_id,
+        issue,
+        expected_branch,
+        expected_worktree,
+    )
+    if recorded != expected:
+        raise SystemExit(
+            f"error: persisted run identity {recorded!r} does not match "
+            f"{expected!r}"
+        )
+
+    repository = Path(root).resolve(strict=False)
+    worktrees_root = (repository / ".worktrees").resolve(strict=False)
+    worktree = (repository / expected_worktree).resolve(strict=False)
+    if worktrees_root.parent != repository:
+        raise SystemExit(
+            f"error: repository worktree root {worktrees_root} escapes "
+            f"{repository}"
+        )
+    try:
+        worktree.relative_to(worktrees_root)
+    except ValueError as exc:
+        raise SystemExit(
+            f"error: persisted worktree identity {expected_worktree!r} "
+            f"escapes {worktrees_root}"
+        ) from exc
+    if worktree.parent != worktrees_root:
+        raise SystemExit(
+            f"error: persisted worktree identity {expected_worktree!r} is "
+            f"not a direct child of {worktrees_root}"
+        )
+    return expected_branch, worktree
+
+
 def state_path(args, run_id):
     return run_dir(args, run_id) / "state.json"
 
@@ -206,15 +253,6 @@ def write_active_run_locked(args, run_id):
     tmp = marker.with_name(marker.name + ".tmp")
     tmp.write_text(run_id + "\n", encoding="utf-8")
     os.replace(str(tmp), str(marker))
-
-
-def write_active_run(args, run_id):
-    """Atomically replace the active marker under the global run lock."""
-    lock = acquire_lock(runs_dir(args))
-    try:
-        write_active_run_locked(args, run_id)
-    finally:
-        release_lock(lock)
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +353,19 @@ def release_lock(lock):
     finally:
         lock.stream.close()
         lock.released = True
+
+
+def require_owned_lock(lock, rundir):
+    """Reject a locked helper call without the exact live owning handle."""
+    expected = (Path(rundir) / ".lock").resolve(strict=False)
+    if (
+        not isinstance(lock, LockHandle)
+        or lock.released
+        or lock.path.resolve(strict=False) != expected
+    ):
+        raise SystemExit(
+            f"error: lifecycle helper requires the owning lock for {expected}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -566,6 +617,8 @@ def cmd_init_run(args):
                     f"error: --issue-url {args.issue_url!r} does not match "
                     f"recorded identity {recorded_url!r}"
                 )
+            root = repo_root()
+            branch, worktree = validate_run_identity(root, run_id, data)
             data["updated_at"] = now_utc()
             write_state(spath, data)
             print(f"resumed existing run '{run_id}' at phase '{data.get('phase')}'")
@@ -580,6 +633,8 @@ def cmd_init_run(args):
                 args.issue,
                 args.slug,
             )
+            root = repo_root()
+            branch, worktree = validate_run_identity(root, run_id, data)
             write_issue_url_marker(
                 issue_url_path(args, run_id),
                 args.issue_url,
@@ -601,9 +656,6 @@ def cmd_init_run(args):
         if args.no_git:
             print("no-git: skipped 'git worktree add' (worktree not created)")
             return
-        root = repo_root()
-        worktree = root / data["worktree"]
-        branch = data["branch"]
         if worktree.exists():
             print(f"worktree already present at {worktree}; leaving as-is")
             return
@@ -639,7 +691,10 @@ def cmd_update_state(args):
     lock = acquire_lock(rundir)
     try:
         data = read_state(spath)
+        root = repo_root()
+        validate_run_identity(root, run_id, data)
         data[args.key] = args.value
+        validate_run_identity(root, run_id, data)
         data["updated_at"] = now_utc()
         write_state(spath, data)
     finally:
@@ -657,6 +712,12 @@ def cmd_migrate_issue_url(args):
         lock = acquire_lock(rundir)
         spath = state_path(args, run_id)
         data = read_state(spath, allow_legacy_issue_url=True)
+        root = repo_root()
+        recorded_branch, worktree = validate_run_identity(
+            root,
+            run_id,
+            data,
+        )
         issue = data.get("issue", "")
         if not issue.isdigit() or int(issue) <= 0:
             raise SystemExit(
@@ -699,18 +760,6 @@ def cmd_migrate_issue_url(args):
                     f"error: active marker names {active_run!r}, not legacy "
                     f"run {run_id!r}"
                 )
-            recorded_worktree = data.get("worktree", "")
-            recorded_branch = data.get("branch", "")
-            if (
-                Path(recorded_worktree) != Path(".worktrees") / run_id
-                or recorded_branch != f"feat/{run_id}"
-            ):
-                raise SystemExit(
-                    f"error: active legacy run has mismatched worktree or "
-                    f"branch identity: {recorded_worktree!r}/"
-                    f"{recorded_branch!r}"
-                )
-            worktree = repo_root() / recorded_worktree
             if not worktree.is_dir():
                 raise SystemExit(
                     f"error: active legacy worktree is missing at {worktree}"
@@ -754,6 +803,7 @@ def cmd_get_state(args):
     run_id = resolve_run_id(args)
     spath = state_path(args, run_id)
     data = read_state(spath)
+    validate_run_identity(repo_root(), run_id, data)
     if args.key:
         if args.key not in data:
             raise SystemExit(f"error: run '{run_id}' has no key '{args.key}'")
@@ -769,65 +819,74 @@ def cmd_record_reviewed_head(args):
 
     run_id = resolve_run_id(args)
     spath = state_path(args, run_id)
-    data = read_state(spath)
-    if data.get("phase") != "review":
-        raise SystemExit(
-            f"error: reviewed head can only be recorded in phase 'review'; "
-            f"run '{run_id}' is at {data.get('phase')!r}"
-        )
-
-    if args.no_git:
-        head = args.head or ""
-    else:
-        root = repo_root()
-        worktree = root / data.get("worktree", "")
-        rc, dirty, err = run_cmd(
-            ["git", "status", "--porcelain"],
-            cwd=str(worktree),
-        )
-        if rc != 0:
-            raise SystemExit(
-                f"error: cannot inspect review worktree {worktree}: "
-                f"{err or dirty}"
-            )
-        if dirty:
-            raise SystemExit(
-                f"error: review worktree {worktree} is dirty; commit the exact "
-                "reviewed content first"
-            )
-        rc, branch, err = run_cmd(
-            ["git", "branch", "--show-current"],
-            cwd=str(worktree),
-        )
-        if rc != 0 or branch != data.get("branch"):
-            raise SystemExit(
-                f"error: review worktree branch must be "
-                f"{data.get('branch')!r}, found {branch!r}: {err}"
-            )
-        rc, head, err = run_cmd(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-            cwd=str(worktree),
-        )
-        if rc != 0:
-            raise SystemExit(
-                f"error: cannot resolve review head in {worktree}: {err}"
-            )
-
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
-        raise SystemExit(
-            "error: reviewed head must be a 40-character hexadecimal commit"
-        )
-    head = head.lower()
-
     rundir = run_dir(args, run_id)
     lock = acquire_lock(rundir)
     try:
         data = read_state(spath)
+        root = repo_root()
+        expected_branch, worktree = validate_run_identity(
+            root,
+            run_id,
+            data,
+        )
         if data.get("phase") != "review":
             raise SystemExit(
-                f"error: run '{run_id}' left review phase before the head "
-                "could be recorded"
+                f"error: reviewed head can only be recorded in phase 'review'; "
+                f"run '{run_id}' is at {data.get('phase')!r}"
             )
+
+        if args.no_git:
+            head = args.head or ""
+        else:
+            rc, dirty, err = run_cmd(
+                ["git", "status", "--porcelain"],
+                cwd=str(worktree),
+            )
+            if rc != 0:
+                raise SystemExit(
+                    f"error: cannot inspect review worktree {worktree}: "
+                    f"{err or dirty}"
+                )
+            if dirty:
+                raise SystemExit(
+                    f"error: review worktree {worktree} is dirty; commit the "
+                    "exact reviewed content first"
+                )
+            rc, branch, err = run_cmd(
+                ["git", "branch", "--show-current"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or branch != expected_branch:
+                raise SystemExit(
+                    f"error: review worktree branch must be "
+                    f"{expected_branch!r}, found {branch!r}: {err}"
+                )
+            rc, head, err = run_cmd(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=str(worktree),
+            )
+            if rc != 0:
+                raise SystemExit(
+                    f"error: cannot resolve review head in {worktree}: {err}"
+                )
+
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            raise SystemExit(
+                "error: reviewed head must be a 40-character hexadecimal commit"
+            )
+        head = head.lower()
+
+        if not args.no_git:
+            rc, locked_head, err = run_cmd(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=str(worktree),
+            )
+            if rc != 0 or locked_head.lower() != head:
+                raise SystemExit(
+                    f"error: review head changed before it could be recorded: "
+                    f"expected {head}, found {locked_head!r}: {err}"
+                )
+
         for gate in GATE_ORDER:
             data[f"gate_{gate}"] = ""
         data["updated_at"] = now_utc()
@@ -847,38 +906,57 @@ def cmd_record_reviewed_head(args):
 
 def cmd_set_active(args):
     run_id = validate_run_id(args.run_id)
-    if not state_path(args, run_id).exists():
-        raise SystemExit(
-            f"error: run '{run_id}' has no state.json; cannot set it active"
-        )
-    write_active_run(args, run_id)
+    root = runs_dir(args)
+    global_lock = acquire_lock(root)
+    lock = None
+    try:
+        lock = acquire_lock(run_dir(args, run_id))
+        spath = state_path(args, run_id)
+        if not spath.exists():
+            raise SystemExit(
+                f"error: run '{run_id}' has no state.json; cannot set it active"
+            )
+        data = read_state(spath)
+        validate_run_identity(repo_root(), run_id, data)
+        write_active_run_locked(args, run_id)
+    finally:
+        if lock is not None:
+            release_lock(lock)
+        release_lock(global_lock)
     print(f"active run set to '{run_id}'")
 
 
+def clear_active_run_locked(args, expected_run_id, global_lock):
+    """Compare-delete the active marker under the exact global lock."""
+    expected_run_id = validate_run_id(expected_run_id)
+    root = runs_dir(args)
+    require_owned_lock(global_lock, root)
+    ap = active_path(args)
+    if not ap.exists():
+        print("no active run to clear")
+        return
+    try:
+        named = ap.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SystemExit(f"error: cannot read active run marker: {exc}")
+    named = validate_run_id(named)
+    if named != expected_run_id:
+        raise SystemExit(
+            f"error: active run changed to {named!r}; expected "
+            f"{expected_run_id!r}, so the replacement was preserved"
+        )
+    try:
+        ap.unlink()
+    except OSError as exc:
+        raise SystemExit(f"error: cannot clear active run marker: {exc}")
+    print(f"active run '{expected_run_id}' cleared")
+
+
 def cmd_clear_active(args):
-    expected_run_id = validate_run_id(args.expected_run_id)
     root = runs_dir(args)
     lock = acquire_lock(root)
     try:
-        ap = active_path(args)
-        if not ap.exists():
-            print("no active run to clear")
-            return
-        try:
-            named = ap.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise SystemExit(f"error: cannot read active run marker: {exc}")
-        named = validate_run_id(named)
-        if named != expected_run_id:
-            raise SystemExit(
-                f"error: active run changed to {named!r}; expected "
-                f"{expected_run_id!r}, so the replacement was preserved"
-            )
-        try:
-            ap.unlink()
-        except OSError as exc:
-            raise SystemExit(f"error: cannot clear active run marker: {exc}")
-        print(f"active run '{expected_run_id}' cleared")
+        clear_active_run_locked(args, args.expected_run_id, lock)
     finally:
         release_lock(lock)
 
@@ -894,8 +972,7 @@ def cmd_validate_resume(args):
     spath = state_path(args, run_id)
     data = read_state(spath)
     root = repo_root()
-    worktree = root / data.get("worktree", "")
-    branch = data.get("branch", "")
+    branch, worktree = validate_run_identity(root, run_id, data)
     pr = data.get("pr", "")
 
     lines = [f"reconciliation for run '{run_id}':",
@@ -1005,6 +1082,7 @@ def cmd_validate_resume(args):
 def cmd_poll_pr(args):
     run_id = resolve_run_id(args)
     data = read_state(state_path(args, run_id))
+    validate_run_identity(repo_root(), run_id, data)
     pr = data.get("pr", "")
     if not pr:
         raise SystemExit(f"error: run '{run_id}' has no PR recorded yet")
@@ -1178,20 +1256,7 @@ def cmd_cleanup_worktree(args):
     try:
         lock = acquire_lock(rundir)
         data = read_state(spath)
-        recorded_worktree = data.get("worktree", "")
-        expected_worktree = Path(".worktrees") / run_id
-        if (
-            not recorded_worktree
-            or Path(recorded_worktree).is_absolute()
-            or Path(recorded_worktree) != expected_worktree
-            or data.get("branch") != f"feat/{run_id}"
-        ):
-            raise SystemExit(
-                f"error: recorded worktree identity "
-                f"{recorded_worktree!r}/{data.get('branch')!r} does not match "
-                f"the exact run {run_id!r}"
-            )
-        worktree = root / recorded_worktree
+        _, worktree = validate_run_identity(root, run_id, data)
 
         if args.no_git:
             print("no-git: skipped 'git worktree remove'")
@@ -1255,6 +1320,7 @@ def cmd_cleanup_worktree(args):
                 )
 
         data = read_state(spath)
+        validate_run_identity(root, run_id, data)
         data["phase"] = "done"
         data["updated_at"] = now_utc()
         write_state(spath, data)

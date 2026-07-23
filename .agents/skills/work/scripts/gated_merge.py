@@ -6,12 +6,14 @@ GitHub access is isolated behind a command runner so unit tests never call gh.
 """
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple
 from urllib.parse import urlparse
 
@@ -59,6 +61,7 @@ STATE_MACHINE_SCRIPT = (
     / "scripts"
     / "gh_issue_run.py"
 )
+_STATE_MACHINE = None
 
 
 class MergePreconditionError(RuntimeError):
@@ -95,6 +98,25 @@ def run_directory(runs_dir, run_id):
             f"recorded run id is not a direct child: {run_id!r}"
         )
     return candidate
+
+
+def lifecycle_state_machine():
+    """Load the state machine that owns lifecycle locks and finalization."""
+    global _STATE_MACHINE
+    if _STATE_MACHINE is None:
+        spec = importlib.util.spec_from_file_location(
+            "gated_merge_state_machine",
+            STATE_MACHINE_SCRIPT,
+        )
+        if spec is None or spec.loader is None:
+            raise MergePreconditionError(
+                f"cannot load lifecycle state machine at "
+                f"{STATE_MACHINE_SCRIPT}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _STATE_MACHINE = module
+    return _STATE_MACHINE
 
 
 def trusted_repository():
@@ -198,6 +220,11 @@ def load_state(runs_dir, run_id):
     if state.get("branch") != f"feat/{run_id}":
         raise MergePreconditionError(
             f"recorded branch {state.get('branch')!r} does not match run "
+            f"{run_id!r}"
+        )
+    if state.get("worktree") != f".worktrees/{run_id}":
+        raise MergePreconditionError(
+            f"recorded worktree {state.get('worktree')!r} does not match run "
             f"{run_id!r}"
         )
     if state.get("phase") != "done":
@@ -674,33 +701,30 @@ def validate_active_handoff(runs_dir, run_id):
         )
 
 
-def clear_active_handoff(runs_dir, run_id, runner):
-    """Ask the state machine to compare-and-delete the active marker."""
-    command = [
-        sys.executable,
-        str(STATE_MACHINE_SCRIPT),
-        "--runs-dir",
-        str(Path(runs_dir)),
-        "clear-active",
-        "--expected-run-id",
-        run_id,
-    ]
-    result = runner(command)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        raise MergeConfirmationError(
-            f"active handoff clear failed for {run_id!r}: {detail}"
+def clear_active_handoff(runs_dir, run_id, state_machine, global_lock):
+    """Use the state-machine helper under the merge-owned global lock."""
+    args = SimpleNamespace(runs_dir=str(Path(runs_dir)))
+    try:
+        state_machine.clear_active_run_locked(
+            args,
+            run_id,
+            global_lock,
         )
+    except SystemExit as exc:
+        raise MergeConfirmationError(
+            f"active handoff clear failed for {run_id!r}: {exc}"
+        ) from exc
 
 
-def merge_completed_run(
+def _merge_completed_run_locked(
     runs_dir,
     run_id,
     runner=run_command,
-    state_runner=run_command,
     dry_run=False,
     confirmation_attempts=CLOSURE_CONFIRMATION_ATTEMPTS,
     sleeper=time.sleep,
+    state_machine=None,
+    global_lock=None,
 ):
     """Validate, squash-merge, delete the branch, and confirm closure."""
     run_directory(runs_dir, run_id)
@@ -755,7 +779,12 @@ def merge_completed_run(
             state["branch"],
             head_oid,
         )
-        clear_active_handoff(runs_dir, run_id, state_runner)
+        clear_active_handoff(
+            runs_dir,
+            run_id,
+            state_machine,
+            global_lock,
+        )
         return MergeResult(pr_number, issue_number, head_oid, True)
 
     final_pr = load_pr(runner, pr_number, repo)
@@ -790,7 +819,12 @@ def merge_completed_run(
             state["branch"],
             head_oid,
         )
-        clear_active_handoff(runs_dir, run_id, state_runner)
+        clear_active_handoff(
+            runs_dir,
+            run_id,
+            state_machine,
+            global_lock,
+        )
         return MergeResult(pr_number, issue_number, head_oid, True)
 
     validate_required_checks(runner, pr_number, repo)
@@ -834,8 +868,45 @@ def merge_completed_run(
         state["branch"],
         head_oid,
     )
-    clear_active_handoff(runs_dir, run_id, state_runner)
+    clear_active_handoff(
+        runs_dir,
+        run_id,
+        state_machine,
+        global_lock,
+    )
     return MergeResult(pr_number, issue_number, head_oid, True)
+
+
+def merge_completed_run(
+    runs_dir,
+    run_id,
+    runner=run_command,
+    dry_run=False,
+    confirmation_attempts=CLOSURE_CONFIRMATION_ATTEMPTS,
+    sleeper=time.sleep,
+):
+    """Hold one lifecycle lease across validation, merge, and handoff."""
+    rundir = run_directory(runs_dir, run_id)
+    root = Path(runs_dir).resolve(strict=False)
+    state_machine = lifecycle_state_machine()
+    global_lock = state_machine.acquire_lock(root)
+    run_lock = None
+    try:
+        run_lock = state_machine.acquire_lock(rundir)
+        return _merge_completed_run_locked(
+            root,
+            run_id,
+            runner=runner,
+            dry_run=dry_run,
+            confirmation_attempts=confirmation_attempts,
+            sleeper=sleeper,
+            state_machine=state_machine,
+            global_lock=global_lock,
+        )
+    finally:
+        if run_lock is not None:
+            state_machine.release_lock(run_lock)
+        state_machine.release_lock(global_lock)
 
 
 def build_parser():

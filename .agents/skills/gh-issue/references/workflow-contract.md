@@ -34,7 +34,12 @@ non-string value.
 A freshly initialized run requires a canonical GitHub issue URL and has
 `phase=investigate`, empty gates, empty `pr`, empty `plan_open`, and
 `branch`/`worktree` derived from `run_id`. Repository identity does not add a
-state key.
+state key. Every state-machine command that reads state checks the persisted
+`run_id`, `issue`, `branch`, and `worktree` as one identity before deriving a
+worktree path.
+`branch` must be `feat/<run_id>`, and `worktree` must be the direct resolved
+child `.worktrees/<run_id>` under the repository. Resume rejects a mismatch
+before it updates state, changes the active marker, or invokes Git.
 
 ### Repository identity and legacy migration
 
@@ -76,12 +81,13 @@ sequence:
 
     python .agents/skills/gh-issue/scripts/gh_issue_run.py record-reviewed-head
 
-The command requires the recorded worktree to be clean, on the recorded branch,
-and in `phase=review`. Under the run's single-writer lock it clears all four
-`gate_*` verdicts, updates `state.json`, and atomically writes the 40-character
-commit marker. Clearing verdicts before writing the marker is fail-closed:
-interruption can leave gates empty, but cannot make old approvals apply to a
-new commit.
+The command acquires the run's single-writer lock before reading state or
+inspecting the worktree. It requires the recorded worktree to be clean, on the
+recorded branch, and in `phase=review`, then reads `HEAD` again immediately
+before clearing all four `gate_*` verdicts, updating `state.json`, and
+atomically writing the 40-character commit marker. Clearing verdicts before
+writing the marker is fail-closed: interruption can leave gates empty, but
+cannot make old approvals apply to a new commit.
 
 Any commit after this command requires recording the new head and rerunning all
 four reviewers. `/work` refuses to merge when the marker is missing, malformed,
@@ -97,6 +103,13 @@ or different from the PR head.
   ownership belongs to the open file handle, so age cannot steal a live lock
   and one owner cannot release another. Acquisition is bounded, and process
   exit releases a crashed writer's lock safely.
+- **Merge lease.** The gated merge acquires the global lock and that same run
+  lock before reading state or companion markers. It holds both through every
+  GitHub recheck, merge, confirmation, branch cleanup, and the active-marker
+  compare-delete. State updates and reviewed-head replacement therefore cannot
+  invalidate the approved snapshot during the merge. The state machine owns
+  the final compare-delete helper and checks the merge's live global lock
+  handle before changing the marker.
 
 ## Phase transition table
 
@@ -129,7 +142,10 @@ Which hook reads which key. All hooks are inert unless a run is active (that is,
 clears that marker through the state machine only after it confirms the merged
 PR, closed issue, and remote branch deletion. Active-marker writes and the
 expected-run compare-and-delete share the global run lock, so a replacement
-marker is preserved. Cleanup checks the Git worktree registry, reconciles a
+marker is preserved. The gated merge holds the global and per-run locks from
+its first local read through this compare-delete, so lifecycle writers either
+finish before its snapshot or fail bounded lock acquisition. Cleanup checks
+the Git worktree registry, reconciles a
 stale entry only when its full porcelain record matches the run path, recorded
 branch, and reviewed head. An existing worktree must have no tracked or
 untracked changes immediately before normal removal. Force removal is limited

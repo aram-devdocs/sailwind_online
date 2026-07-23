@@ -144,6 +144,42 @@ class ReviewedHeadTests(unittest.TestCase):
             )
         )
 
+    def test_reviewed_head_rechecks_head_before_marker_write(self):
+        before = self.state_path.read_text(encoding="utf-8")
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            head=None,
+            no_git=False,
+        )
+        responses = (
+            (0, "", ""),
+            (0, f"feat/{self.run_id}", ""),
+            (0, self.head, ""),
+            (0, "b" * 40, ""),
+        )
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                side_effect=responses,
+            ) as run,
+            self.assertRaisesRegex(SystemExit, "review head changed"),
+        ):
+            gh_issue_run.cmd_record_reviewed_head(args)
+
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(
+            self.state_path.read_text(encoding="utf-8"),
+            before,
+        )
+        self.assertFalse((self.run_dir / "reviewed-head").exists())
+
     def test_init_run_preserves_exact_state_schema_and_records_marker(self):
         run_id = "16-explicit-repository"
         issue_url = (
@@ -209,6 +245,78 @@ class ReviewedHeadTests(unittest.TestCase):
         self.assertFalse(
             (self.runs_dir / "16-missing-repository" / "state.json").exists()
         )
+
+    def test_resume_rejects_corrupt_identity_before_git_or_path_mutation(self):
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            issue="15",
+            slug="ingame-handshake",
+            issue_url=self.issue_url,
+            resume=True,
+            no_git=False,
+        )
+        outside = self.runs_dir.parent / "outside-worktree"
+        corruptions = (
+            ("branch", "feat/99-unrelated"),
+            ("worktree", "../outside-worktree"),
+            ("worktree", str(outside.resolve())),
+            ("worktree", ".worktrees/../outside-worktree"),
+        )
+        for key, value in corruptions:
+            with self.subTest(key=key, value=value):
+                self.write_state()
+                state = json.loads(self.state_path.read_text(encoding="utf-8"))
+                state[key] = value
+                corrupted = json.dumps(state)
+                self.state_path.write_text(corrupted, encoding="utf-8")
+                (self.runs_dir / "active").unlink(missing_ok=True)
+
+                with (
+                    mock.patch.object(
+                        gh_issue_run,
+                        "repo_root",
+                        return_value=self.runs_dir,
+                    ),
+                    mock.patch.object(gh_issue_run, "run_cmd") as run,
+                    self.assertRaisesRegex(SystemExit, "identity"),
+                ):
+                    gh_issue_run.cmd_init_run(args)
+
+                run.assert_not_called()
+                self.assertEqual(
+                    self.state_path.read_text(encoding="utf-8"),
+                    corrupted,
+                )
+                self.assertFalse((self.runs_dir / "active").exists())
+                self.assertFalse(outside.exists())
+
+    def test_update_state_cannot_corrupt_persisted_run_identity(self):
+        before = self.state_path.read_text(encoding="utf-8")
+        for key, value in (
+            ("branch", "feat/99-unrelated"),
+            ("worktree", "../outside-worktree"),
+            ("run_id", "99-unrelated"),
+        ):
+            args = SimpleNamespace(
+                runs_dir=str(self.runs_dir),
+                run_id=self.run_id,
+                key=key,
+                value=value,
+            )
+            with (
+                self.subTest(key=key),
+                mock.patch.object(
+                    gh_issue_run,
+                    "repo_root",
+                    return_value=self.runs_dir,
+                ),
+                self.assertRaisesRegex(SystemExit, "identity"),
+            ):
+                gh_issue_run.cmd_update_state(args)
+            self.assertEqual(
+                self.state_path.read_text(encoding="utf-8"),
+                before,
+            )
 
     def test_issue_url_must_match_tracked_repository(self):
         with self.assertRaisesRegex(SystemExit, "tracked repository"):
