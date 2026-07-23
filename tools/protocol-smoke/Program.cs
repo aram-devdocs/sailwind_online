@@ -112,7 +112,10 @@ namespace Sailwind.ProtocolSmoke
                 $"db = \"{db}\"\n" +
                 "server_name = \"protocol-smoke\"\n" +
                 "tick_hz = 30\n" +
-                "snapshot_hz = 4\n";
+                "snapshot_hz = 4\n" +
+                // Force consecutive fresh identities through the retryable
+                // admission response so check 3 cannot pass by timing luck.
+                "new_session_min_interval_ms = 250\n";
             File.WriteAllText(configPath, contents);
             return configPath;
         }

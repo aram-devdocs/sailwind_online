@@ -18,6 +18,7 @@ namespace Sailwind.ProtocolSmoke
     {
         private const string TokenA = "smoke-token-A";
         private const string TokenB = "smoke-token-B";
+        private const string RetryableHelloReason = "server busy; retry";
 
         private readonly string _serverPath;
         private readonly string _configPath;
@@ -437,7 +438,22 @@ namespace Sailwind.ProtocolSmoke
         {
             const string apiSurfaceHashSentinel = "protocol-smoke-surface-hash";
             var hello = Codec.EncodeClientHello(_seq++, name, token, "smoke", "0.0.0", apiSurfaceHashSentinel);
-            var env = SendAndWait(c, hello, e => e.PayloadType == Payload.ServerHello, 6000, 250);
+            var env = SendAndWait(
+                c,
+                hello,
+                e =>
+                {
+                    if (e.PayloadType != Payload.ServerHello)
+                    {
+                        return false;
+                    }
+
+                    var response = e.PayloadAsServerHello();
+                    return response.Accepted
+                           || !string.Equals(response.Reason, RetryableHelloReason, StringComparison.Ordinal);
+                },
+                6000,
+                250);
             return env.HasValue ? env.Value.PayloadAsServerHello() : (ServerHello?)null;
         }
 
