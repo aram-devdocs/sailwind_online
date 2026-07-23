@@ -1,5 +1,7 @@
 import importlib.util
+import ast
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -415,6 +417,81 @@ class GatedMergeTests(unittest.TestCase):
                 self.assertIn("--repo", call)
                 self.assertEqual(call[call.index("--repo") + 1], self.repo)
         runner.assert_finished()
+
+    def test_repository_config_failures_stop_before_commands(self):
+        cases = {
+            "missing": None,
+            "malformed": {
+                "repository": "attacker/unrelated/extra"
+            },
+            "extra field": {
+                "repository": self.repo,
+                "fallback": "attacker/unrelated",
+            },
+        }
+        for label, contents in cases.items():
+            with self.subTest(label=label):
+                config = self.runs_dir / f"{label}.json"
+                if contents is not None:
+                    config.write_text(json.dumps(contents), encoding="utf-8")
+                runner = FakeRunner([])
+                with (
+                    mock.patch.object(
+                        gated_merge,
+                        "REPOSITORY_CONFIG",
+                        config,
+                    ),
+                    self.assertRaises(gated_merge.MergePreconditionError),
+                ):
+                    gated_merge.merge_completed_run(
+                        self.runs_dir,
+                        self.run_id,
+                        runner=runner,
+                    )
+                self.assertEqual(runner.calls, [])
+
+    def test_runtime_and_workflow_have_no_implicit_github_commands(self):
+        scripts = [
+            SCRIPT,
+            (
+                SCRIPT.parents[2]
+                / "gh-issue"
+                / "scripts"
+                / "gh_issue_run.py"
+            ),
+        ]
+        for script in scripts:
+            tree = ast.parse(script.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)):
+                    continue
+                values = [
+                    item.value
+                    for item in node.elts
+                    if isinstance(item, ast.Constant)
+                    and isinstance(item.value, str)
+                ]
+                if len(values) >= 2 and values[:2] in (
+                    ["gh", "pr"],
+                    ["gh", "issue"],
+                ):
+                    self.assertIn("--repo", values, f"implicit gh call in {script}")
+                self.assertNotEqual(
+                    values[:3],
+                    ["gh", "repo", "view"],
+                    f"cwd repository discovery in {script}",
+                )
+
+        work_skill = SCRIPT.parents[1] / "SKILL.md"
+        for line in work_skill.read_text(encoding="utf-8").splitlines():
+            if re.search(r"\bgh (?:issue|pr)\b", line) and line.startswith(
+                "    gh "
+            ):
+                self.assertIn(
+                    f"--repo {self.repo}",
+                    line,
+                    f"implicit workflow command: {line}",
+                )
 
     def test_rejects_incomplete_or_inconsistent_run_state_before_gh(self):
         cases = {

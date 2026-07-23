@@ -76,11 +76,12 @@ not memory, so a run that died mid-task recovers cleanly. The full loop is in
 5. Recheck and merge. After `/gh-issue` reaches `done`, `/work` reads that
    completed run and requires `plan_open=0` plus four `APPROVE` verdicts. Its
    deterministic merge script derives owner/repository only from the immutable
-   canonical `issue_url` recorded at run creation. It never discovers identity
-   from checkout remotes. Using that explicit repository, it verifies the
-   recorded PR is open, not a draft, targets `dev`, comes from the recorded
-   branch, links the recorded issue, reports a clean merge state, and has no
-   pending or failed required checks.
+   canonical `issue_url` recorded at run creation and checks it against the
+   strictly parsed `.agents/repository.json` bootstrap identity. It never
+   discovers identity from checkout remotes. Using that explicit repository,
+   it verifies the recorded PR is open, not a draft, targets `dev`, comes from
+   the recorded branch, links the recorded issue, reports a clean merge state,
+   and has no pending or failed required checks.
    It rereads the head before a squash merge guarded by that exact commit,
    rechecks linkage and required checks at the final mutation boundary,
    omits GitHub's unguarded branch-delete flag, then confirms `MERGED`, `CLOSED`,
@@ -173,6 +174,13 @@ global lifecycle lock through the final registry/path absence check and `done`
 write, while `init-run` holds the same lock for creation. A removal, prune,
 identity, or verification error keeps the prior phase and active marker so
 cleanup can be retried.
+
+Before a run exists, `/work` reads the one-field tracked
+`.agents/repository.json` file and passes its
+`aram-devdocs/sailwind_online` value to issue selection, blocker lookup,
+assignment, and comment commands with `--repo`. The selected explicit result
+supplies the canonical URL to `init-run`. Missing, malformed, extra-field, or
+mismatched configuration stops the run before GitHub mutation.
 
 Any mismatch prints the exact failure and stops. `/work` does not merge a
 different PR, repair state by hand, or select another issue in that invocation.

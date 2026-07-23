@@ -32,8 +32,13 @@ guidance (the orchestrator delegates, never implements).
 Stop and report instead of proceeding when any of these fail:
 
 - `gh auth status` shows the aram-devdocs account.
+- `.agents/repository.json` is exactly
+  `{"repository":"aram-devdocs/sailwind_online"}` after JSON parsing.
 - `AGENTS.md` and the applicable `.agents/rules/` have been read this session.
 - The orient step below has reconciled any prior run.
+
+Every GitHub command MUST pass `--repo aram-devdocs/sailwind_online`, because
+checkout remotes are not trusted repository identity.
 
 ## Process
 
@@ -75,7 +80,12 @@ If no run is active and the tree is clean:
 
 Only when no run is active.
 
-    gh issue list --state open --limit 100 --json number,url,title,labels,milestone,assignees
+    gh issue list --repo aram-devdocs/sailwind_online --state open --limit 100 --json number,url,title,labels,milestone,assignees
+
+Treat the returned `url` as the selected issue identity. It MUST equal
+`https://github.com/aram-devdocs/sailwind_online/issues/<N>`, because
+`init-run` records that canonical URL before later operations can derive the
+same repository and issue.
 
 Selection order, applied in sequence:
 
@@ -87,7 +97,7 @@ Skip an issue when any of these hold:
 
 - It carries the `blocked` label.
 - Its body says `Blocked by #N` and issue N is still open
-  (`gh issue view N --json state`).
+  (`gh issue view N --repo aram-devdocs/sailwind_online --json state`).
 - It is assigned and shows activity newer than 24 hours (claimed).
 - An open PR already references it.
 
@@ -95,8 +105,8 @@ If nothing is selectable, report that and stop.
 
 ### 3. Claim
 
-    gh issue edit <N> --add-assignee @me
-    gh issue comment <N> --body "Picking this up. Branch: feat/<N>-<slug>"
+    gh issue edit <N> --repo aram-devdocs/sailwind_online --add-assignee @me
+    gh issue comment <N> --repo aram-devdocs/sailwind_online --body "Picking this up. Branch: feat/<N>-<slug>"
 
 `<slug>` is 2-4 kebab-case words from the issue title.
 

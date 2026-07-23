@@ -112,6 +112,8 @@ LOCK_WAIT_SECONDS = 10
 
 # External probes must not hang a durable run forever.
 COMMAND_TIMEOUT_SECONDS = 30
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+REPOSITORY_CONFIG = Path(__file__).resolve().parents[3] / "repository.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +258,34 @@ def now_utc():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def trusted_repository():
+    """Read and strictly validate the tracked GitHub repository identity."""
+    try:
+        data = json.loads(REPOSITORY_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(
+            f"error: cannot read tracked repository identity at "
+            f"{REPOSITORY_CONFIG}: {exc}"
+        ) from exc
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"repository"}
+        or not isinstance(data["repository"], str)
+    ):
+        raise SystemExit(
+            "error: tracked repository identity must be an object containing "
+            "only a string 'repository' field"
+        )
+    repository = data["repository"]
+    if not REPOSITORY_RE.fullmatch(repository) or any(
+        part in (".", "..") for part in repository.split("/")
+    ):
+        raise SystemExit(
+            f"error: tracked repository identity is invalid: {repository!r}"
+        )
+    return repository
+
+
 def parse_issue_url(value, expected_issue):
     """Validate a canonical GitHub issue URL and return owner/repository."""
     if not isinstance(value, str):
@@ -286,7 +316,14 @@ def parse_issue_url(value, expected_issue):
             f"error: --issue-url must be the canonical GitHub URL for issue "
             f"#{expected_issue}, found {value!r}"
         )
-    return f"{parts[0]}/{parts[1]}"
+    repository = f"{parts[0]}/{parts[1]}"
+    configured = trusted_repository()
+    if repository != configured:
+        raise SystemExit(
+            f"error: issue URL repository {repository!r} does not match "
+            f"tracked repository {configured!r}"
+        )
+    return repository
 
 
 def blank_state(run_id, issue, slug, issue_url):

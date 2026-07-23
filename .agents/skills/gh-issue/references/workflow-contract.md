@@ -38,9 +38,17 @@ A freshly initialized run requires a canonical GitHub issue URL and has
 
 ### Repository identity and legacy migration
 
-Every GitHub operation derives owner/repository from `issue_url` and supplies it
-explicitly. Checkout remotes are never an identity source. `update-state`
-cannot change `issue_url`.
+`.agents/repository.json` is the tracked bootstrap identity and contains exactly
+one string field: `repository`. Its committed value is
+`aram-devdocs/sailwind_online`. Missing, malformed, extra-field, or mismatched
+configuration fails closed.
+
+Pre-run selection, blocker checks, assignment, and comments supply that
+repository through `--repo`. The selected explicit result supplies the
+canonical issue URL to `init-run`. Every later GitHub operation derives
+owner/repository from immutable `issue_url`, checks it against the tracked
+identity, and supplies it explicitly. Checkout remotes are never an identity
+source. `update-state` cannot change `issue_url`.
 
 A legacy run without this key fails closed until `migrate-issue-url` records an
 independently supplied canonical issue URL whose issue number matches the run.

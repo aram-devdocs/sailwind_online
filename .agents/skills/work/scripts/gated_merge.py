@@ -35,6 +35,7 @@ BRANCH_QUERY = (
 RUN_ID_RE = re.compile(r"(?P<issue>[1-9][0-9]*)-[a-z0-9]+(?:-[a-z0-9]+)*")
 HEAD_OID_RE = re.compile(r"[0-9a-fA-F]{40}")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+REPOSITORY_CONFIG = Path(__file__).resolve().parents[3] / "repository.json"
 GH_TIMEOUT_SECONDS = 30
 CLOSURE_CONFIRMATION_ATTEMPTS = 5
 CLOSURE_POLL_INTERVAL_SECONDS = 2
@@ -59,6 +60,34 @@ class MergeResult(NamedTuple):
     issue_number: int
     head_oid: str
     merged: bool
+
+
+def trusted_repository():
+    """Read the one tracked GitHub repository identity, failing closed."""
+    try:
+        data = json.loads(REPOSITORY_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise MergePreconditionError(
+            f"cannot read tracked repository identity at "
+            f"{REPOSITORY_CONFIG}: {exc}"
+        ) from exc
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"repository"}
+        or not isinstance(data["repository"], str)
+    ):
+        raise MergePreconditionError(
+            "tracked repository identity must be an object containing only "
+            "a string 'repository' field"
+        )
+    repository = data["repository"]
+    if not REPOSITORY_RE.fullmatch(repository) or any(
+        part in (".", "..") for part in repository.split("/")
+    ):
+        raise MergePreconditionError(
+            f"tracked repository identity is invalid: {repository!r}"
+        )
+    return repository
 
 
 def run_command(command):
@@ -210,6 +239,12 @@ def repository_from_issue_url(value, expected_issue):
         raise MergePreconditionError(
             f"recorded issue_url contains invalid repository identity: "
             f"{value!r}"
+        )
+    configured = trusted_repository()
+    if repo != configured:
+        raise MergePreconditionError(
+            f"recorded issue_url repository {repo!r} does not match tracked "
+            f"repository {configured!r}"
         )
     return repo
 

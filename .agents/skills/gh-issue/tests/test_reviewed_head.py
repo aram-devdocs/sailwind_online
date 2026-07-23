@@ -174,6 +174,43 @@ class ReviewedHeadTests(unittest.TestCase):
             (self.runs_dir / "16-missing-repository" / "state.json").exists()
         )
 
+    def test_issue_url_must_match_tracked_repository(self):
+        with self.assertRaisesRegex(SystemExit, "tracked repository"):
+            gh_issue_run.parse_issue_url(
+                "https://github.com/attacker/unrelated/issues/15",
+                "15",
+            )
+
+    def test_repository_config_missing_or_malformed_fails_closed(self):
+        issue_url = (
+            "https://github.com/aram-devdocs/sailwind_online/issues/15"
+        )
+        for label, contents in (
+            ("missing", None),
+            ("invalid JSON", "{"),
+            ("invalid shape", '{"repository": 3}'),
+            (
+                "extra field",
+                '{"repository":"aram-devdocs/sailwind_online","other":"x"}',
+            ),
+        ):
+            with self.subTest(label=label):
+                config = self.runs_dir / f"{label}.json"
+                if contents is not None:
+                    config.write_text(contents, encoding="utf-8")
+                with (
+                    mock.patch.object(
+                        gh_issue_run,
+                        "REPOSITORY_CONFIG",
+                        config,
+                    ),
+                    self.assertRaisesRegex(
+                        SystemExit,
+                        "tracked repository identity",
+                    ),
+                ):
+                    gh_issue_run.parse_issue_url(issue_url, "15")
+
     def test_migrates_completed_legacy_run_from_explicit_issue_url(self):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         state.pop("issue_url")

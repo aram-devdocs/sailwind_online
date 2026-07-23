@@ -74,7 +74,7 @@ Every transition goes THROUGH `scripts/gh_issue_run.py`. Never hand-edit
 depends on the exact flat-key shape, and a hand edit silently breaks them.
 
     # start a run (also creates the worktree)
-    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue 42 --issue-url https://github.com/owner/repo/issues/42 --slug fix-login
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py init-run --issue 42 --issue-url https://github.com/aram-devdocs/sailwind_online/issues/42 --slug fix-login
 
     # advance a phase
     python .agents/skills/gh-issue/scripts/gh_issue_run.py update-state --key phase --value implement
@@ -88,13 +88,15 @@ depends on the exact flat-key shape, and a hand edit silently breaks them.
     # read state on resume
     python .agents/skills/gh-issue/scripts/gh_issue_run.py get-state
 
-`init-run` requires the canonical issue URL selected from GitHub and records it
-as immutable `issue_url`, so repository identity never depends on local Git
-configuration. A legacy run created before this key existed fails closed.
-Migrate the missing marker only from an independently recorded canonical issue
-URL:
+`init-run` requires the canonical issue URL selected from an explicit
+`--repo aram-devdocs/sailwind_online` GitHub result. It checks that URL against
+the strictly parsed `.agents/repository.json` identity and records it as
+immutable `issue_url`, so repository identity never depends on local Git
+configuration. A missing, malformed, or mismatched configuration fails closed.
+A legacy run created before this key existed also fails closed. Migrate the
+missing marker only from an independently recorded canonical issue URL:
 
-    python .agents/skills/gh-issue/scripts/gh_issue_run.py migrate-issue-url --run-id 42-fix-login --issue-url https://github.com/owner/repo/issues/42
+    python .agents/skills/gh-issue/scripts/gh_issue_run.py migrate-issue-url --run-id 42-fix-login --issue-url https://github.com/aram-devdocs/sailwind_online/issues/42
 
 The migration command requires the URL issue number to match, writes through
 the state-machine locks, and refuses to replace an existing repository
