@@ -103,7 +103,7 @@ impl Server {
         let world = World::new(sw_world::Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let source_session_limiter = BoundedRateLimiter::new(
-            cfg.hello_min_interval_ms_i64(),
+            cfg.source_session_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
         let reconnect_limiter = BoundedRateLimiter::new(
@@ -1109,11 +1109,18 @@ mod handshake_tests {
     use sw_world::Grid;
 
     fn make_server() -> Server {
-        make_server_with_db(Db::open_in_memory().unwrap())
+        make_server_with_config_and_db(Config::default(), Db::open_in_memory().unwrap())
     }
 
     fn make_server_with_db(db: Db) -> Server {
-        let cfg = Config::default();
+        make_server_with_config_and_db(Config::default(), db)
+    }
+
+    fn make_server_with_config(cfg: Config) -> Server {
+        make_server_with_config_and_db(cfg, Db::open_in_memory().unwrap())
+    }
+
+    fn make_server_with_config_and_db(cfg: Config, db: Db) -> Server {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let identity_players = load_identity_players(&db).unwrap();
         let reconnect_key_budget = identity_players
@@ -1139,7 +1146,7 @@ mod handshake_tests {
             weather_epoch_day: 0,
             hello_limiter: RateLimiter::new(cfg.hello_min_interval_ms_i64()),
             source_session_limiter: BoundedRateLimiter::new(
-                cfg.hello_min_interval_ms_i64(),
+                cfg.source_session_min_interval_ms_i64(),
                 cfg.max_transport_peers_usize(),
             ),
             reconnect_limiter: BoundedRateLimiter::new(
@@ -2072,6 +2079,56 @@ mod handshake_tests {
     }
 
     #[test]
+    fn slow_global_gate_still_reserves_its_next_slot_for_another_source() {
+        let mut server = make_server_with_config(Config {
+            hello_min_interval_ms: 250,
+            new_session_min_interval_ms: 1_000,
+            ..Config::default()
+        });
+        let first_admission_ms = 1_000;
+
+        let (attacker_client, attacker_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let attacker = hello_envelope(
+            "first-attacker-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, attacker_peer, &attacker, first_admission_ms);
+        assert_eq!(
+            receive_server_hello(&attacker_client),
+            (true, String::new())
+        );
+
+        let (rotated_client, rotated_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let rotated = hello_envelope(
+            "rotated-attacker-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let (legitimate_client, legitimate_peer) = connect_peer_from(&mut server, "127.0.0.2");
+        let next_global_ms = first_admission_ms + 1_000;
+
+        deliver_hello_at(&mut server, rotated_peer, &rotated, next_global_ms);
+        assert_eq!(
+            receive_server_hello(&rotated_client),
+            (false, "server busy; retry".to_string()),
+            "the source that consumed the prior global slot must not consume the next one"
+        );
+
+        let legitimate = hello_envelope(
+            "legitimate-other-source-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, legitimate_peer, &legitimate, next_global_ms);
+        assert_eq!(
+            receive_server_hello(&legitimate_client),
+            (true, String::new()),
+            "another source must be able to take the next global admission slot"
+        );
+    }
+
+    #[test]
     fn duplicate_hello_burst_is_dropped_before_response_or_session_work() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
@@ -2373,7 +2430,7 @@ mod aoi_harden_tests {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let source_session_limiter = BoundedRateLimiter::new(
-            cfg.hello_min_interval_ms_i64(),
+            cfg.source_session_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
         let reconnect_limiter = BoundedRateLimiter::new(
@@ -2590,7 +2647,7 @@ mod market_dispatch_tests {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let source_session_limiter = BoundedRateLimiter::new(
-            cfg.hello_min_interval_ms_i64(),
+            cfg.source_session_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
         let reconnect_limiter = BoundedRateLimiter::new(
@@ -2840,7 +2897,7 @@ mod input_hardening_tests {
         let world = World::new(Grid::new(cfg.cell_size_m));
         let hello_limiter = RateLimiter::new(cfg.hello_min_interval_ms_i64());
         let source_session_limiter = BoundedRateLimiter::new(
-            cfg.hello_min_interval_ms_i64(),
+            cfg.source_session_min_interval_ms_i64(),
             cfg.max_transport_peers_usize(),
         );
         let reconnect_limiter = BoundedRateLimiter::new(

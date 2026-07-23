@@ -23,10 +23,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Opaque, stable identifier for a connected peer, assigned by the host.
 pub type PeerId = u32;
 
-/// Largest datagram the host will read. Above the fixed MTU so oversized or
-/// hostile packets are received (and then rejected) rather than silently
-/// truncated at the socket layer.
-const RECV_BUFFER: usize = 2048;
+/// Largest possible UDP payload. Receiving the complete datagram lets the host
+/// reject every packet above the fixed LiteNetLib MTU without truncation.
+const RECV_BUFFER: usize = 65_535;
+
+/// Hard ceiling on socket datagrams consumed by one fixed-tick poll.
+const MAX_POLL_PACKETS: usize = 128;
+
+/// Hard ceiling on socket bytes consumed by one fixed-tick poll. Four maximum
+/// UDP datagrams fit, while normal MTU-sized traffic reaches the packet ceiling
+/// first.
+const MAX_POLL_BYTES: usize = 256 * 1024;
+
+/// One datagram can emit at most a disconnect plus a replacement connect.
+const MAX_POLL_SOCKET_EVENTS: usize = MAX_POLL_PACKETS * 2;
+
+/// Timeout cleanup gets a reserved slice of every poll's event budget, so a
+/// socket flood cannot indefinitely retain expired peers.
+const MAX_POLL_TIMEOUT_EVENTS: usize = 64;
+
+/// Hard ceiling on the event vector returned by one poll.
+const MAX_POLL_EVENTS: usize = MAX_POLL_SOCKET_EVENTS + MAX_POLL_TIMEOUT_EVENTS;
 
 /// Idle timeout: a peer that sends nothing for this long is dropped
 /// (`Timeout`). Mirrors LiteNetLib's default 5 s disconnect timeout.
@@ -65,6 +82,14 @@ pub enum Event {
     Data(PeerId, Vec<u8>),
     /// A peer was disconnected.
     Disconnected(PeerId, DisconnectReason),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PollWork {
+    packets: usize,
+    bytes: usize,
+    socket_events: usize,
+    timeout_events: usize,
 }
 
 struct Peer {
@@ -168,27 +193,59 @@ impl Host {
     /// `now` is the caller's tick timestamp; timeouts and ping scheduling are
     /// measured against it.
     pub fn poll(&mut self, now: Instant) -> Vec<Event> {
-        let mut events = Vec::new();
-        self.drain_socket(now, &mut events);
-        self.process_timeouts(now, &mut events);
-        self.send_keepalive_pings(now);
-        events
+        self.poll_with_work(now).0
     }
 
-    fn drain_socket(&mut self, now: Instant, events: &mut Vec<Event>) {
-        loop {
+    fn poll_with_work(&mut self, now: Instant) -> (Vec<Event>, PollWork) {
+        let mut events = Vec::with_capacity(MAX_POLL_EVENTS);
+        let mut work = PollWork::default();
+        self.drain_socket(now, &mut events, &mut work);
+        work.socket_events = events.len();
+        work.timeout_events = self.process_timeouts(now, &mut events, MAX_POLL_TIMEOUT_EVENTS);
+        self.send_keepalive_pings(now);
+        debug_assert!(work.packets <= MAX_POLL_PACKETS);
+        debug_assert!(work.bytes <= MAX_POLL_BYTES);
+        debug_assert!(work.socket_events <= MAX_POLL_SOCKET_EVENTS);
+        debug_assert!(work.timeout_events <= MAX_POLL_TIMEOUT_EVENTS);
+        debug_assert!(events.len() <= MAX_POLL_EVENTS);
+        (events, work)
+    }
+
+    fn drain_socket(&mut self, now: Instant, events: &mut Vec<Event>, work: &mut PollWork) {
+        while work.packets < MAX_POLL_PACKETS && work.bytes < MAX_POLL_BYTES {
+            let remaining_bytes = MAX_POLL_BYTES - work.bytes;
+            match self.socket.peek_from(&mut self.recv_buf[..]) {
+                Ok((n, _)) if n > remaining_bytes => break,
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    work.packets += 1;
+                    continue;
+                }
+                Err(_) => break,
+            }
+
             match self.socket.recv_from(&mut self.recv_buf[..]) {
                 Ok((n, addr)) => {
+                    work.packets += 1;
+                    work.bytes += n;
+                    if n > protocol::MTU {
+                        continue;
+                    }
                     // Copy out of the shared buffer so packet handling can take
                     // `&mut self` freely.
                     let datagram = self.recv_buf[..n].to_vec();
+                    let events_before = events.len();
                     self.handle_datagram(&datagram, addr, now, events);
+                    debug_assert!(events.len().saturating_sub(events_before) <= 2);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 // Windows raises WSAECONNRESET on the *next* recv after a send
                 // to an unreachable port produced an ICMP message. It is not a
                 // real error for a connectionless socket — keep draining.
-                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    work.packets += 1;
+                }
                 Err(_) => break,
             }
         }
@@ -371,19 +428,27 @@ impl Host {
         events.push(Event::Disconnected(id, DisconnectReason::Remote));
     }
 
-    fn process_timeouts(&mut self, now: Instant, events: &mut Vec<Event>) {
+    fn process_timeouts(
+        &mut self,
+        now: Instant,
+        events: &mut Vec<Event>,
+        max_events: usize,
+    ) -> usize {
         let timeout = self.timeout;
         let expired: Vec<SocketAddr> = self
             .peers
             .iter()
             .filter(|(_, p)| now.saturating_duration_since(p.last_recv) > timeout)
             .map(|(addr, _)| *addr)
+            .take(max_events)
             .collect();
+        let before = events.len();
         for addr in expired {
             if let Some(peer) = self.remove_peer_at(addr) {
                 events.push(Event::Disconnected(peer.id, DisconnectReason::Timeout));
             }
         }
+        events.len() - before
     }
 
     fn send_keepalive_pings(&mut self, now: Instant) {
@@ -477,6 +542,183 @@ mod tests {
         client.set_nonblocking(true).unwrap();
         client.connect(server_addr).unwrap();
         client
+    }
+
+    fn assert_bounded_poll(work: PollWork, events: &[Event]) {
+        assert!(work.packets <= MAX_POLL_PACKETS);
+        assert!(work.bytes <= MAX_POLL_BYTES);
+        assert!(work.socket_events <= MAX_POLL_SOCKET_EVENTS);
+        assert!(work.timeout_events <= MAX_POLL_TIMEOUT_EVENTS);
+        assert!(events.len() <= MAX_POLL_EVENTS);
+    }
+
+    #[test]
+    fn preauth_data_flood_is_bounded_and_a_queued_payload_progresses() {
+        let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+
+        client
+            .send(&connect_datagram(1, "sailwind-online"))
+            .unwrap();
+        let (events, work) = server.poll_with_work(Instant::now());
+        assert_bounded_poll(work, &events);
+        assert_eq!(events, vec![Event::Connected(1)]);
+
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        client.recv(&mut accept).unwrap();
+
+        let flood = protocol::build_unreliable(b"flood");
+        for _ in 0..MAX_POLL_PACKETS + 32 {
+            client.send(&flood).unwrap();
+        }
+        let marker = protocol::build_unreliable(b"legitimate-marker");
+        client.send(&marker).unwrap();
+
+        let mut saw_marker = false;
+        for _ in 0..8 {
+            for _ in 0..MAX_POLL_PACKETS / 4 {
+                client.send(&flood).unwrap();
+            }
+            let (events, work) = server.poll_with_work(Instant::now());
+            assert_bounded_poll(work, &events);
+            saw_marker |= events.iter().any(
+                |event| matches!(event, Event::Data(_, bytes) if bytes == b"legitimate-marker"),
+            );
+            if saw_marker {
+                break;
+            }
+        }
+        assert!(
+            saw_marker,
+            "bounded polling must leave queued traffic for a later tick instead of starving it"
+        );
+    }
+
+    #[test]
+    fn preauth_garbage_and_replacement_churn_are_bounded_across_ticks() {
+        let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+
+        for _ in 0..MAX_POLL_PACKETS + 32 {
+            client.send(&[protocol::property::UNRELIABLE]).unwrap();
+        }
+        client
+            .send(&connect_datagram(1, "sailwind-online"))
+            .unwrap();
+
+        let mut connected = false;
+        for _ in 0..8 {
+            for _ in 0..MAX_POLL_PACKETS / 4 {
+                client.send(&[protocol::property::UNRELIABLE]).unwrap();
+            }
+            let (events, work) = server.poll_with_work(Instant::now());
+            assert_bounded_poll(work, &events);
+            connected |= events
+                .iter()
+                .any(|event| matches!(event, Event::Connected(_)));
+            if connected {
+                break;
+            }
+        }
+        assert!(
+            connected,
+            "a valid request queued behind a pre-auth flood must progress"
+        );
+
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        client.recv(&mut accept).unwrap();
+        let mut next_connect_time = 2;
+        for _ in 0..MAX_POLL_PACKETS + 32 {
+            client
+                .send(&connect_datagram(next_connect_time, "sailwind-online"))
+                .unwrap();
+            next_connect_time += 1;
+        }
+        client
+            .send(&protocol::build_unreliable(b"replacement-marker"))
+            .unwrap();
+
+        let mut saw_marker = false;
+        for _ in 0..8 {
+            for _ in 0..MAX_POLL_PACKETS / 4 {
+                client
+                    .send(&connect_datagram(next_connect_time, "sailwind-online"))
+                    .unwrap();
+                next_connect_time += 1;
+            }
+            let (events, work) = server.poll_with_work(Instant::now());
+            assert_bounded_poll(work, &events);
+            saw_marker |= events.iter().any(
+                |event| matches!(event, Event::Data(_, bytes) if bytes == b"replacement-marker"),
+            );
+            if saw_marker {
+                break;
+            }
+        }
+        assert!(
+            saw_marker,
+            "replacement churn must not prevent later queued data from progressing"
+        );
+        assert_eq!(server.peer_count(), 1);
+    }
+
+    #[test]
+    fn inbound_datagrams_over_the_fixed_mtu_are_dropped_before_payload_events() {
+        let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+
+        client
+            .send(&connect_datagram(1, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(Instant::now()), vec![Event::Connected(1)]);
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        client.recv(&mut accept).unwrap();
+
+        let oversized = vec![protocol::property::UNRELIABLE; protocol::MTU + 1];
+        client.send(&oversized).unwrap();
+        client
+            .send(&protocol::build_unreliable(b"after-oversized"))
+            .unwrap();
+
+        let (events, work) = server.poll_with_work(Instant::now());
+        assert_bounded_poll(work, &events);
+        assert_eq!(events, vec![Event::Data(1, b"after-oversized".to_vec())]);
+    }
+
+    #[test]
+    fn timeout_burst_uses_its_reserved_event_budget_and_finishes_on_later_ticks() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 80, 80).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let t0 = Instant::now();
+        let mut clients = Vec::new();
+
+        for connect_time in 1..=70 {
+            let client = client_from("127.0.0.1", server_addr);
+            client
+                .send(&connect_datagram(connect_time, "sailwind-online"))
+                .unwrap();
+            clients.push(client);
+        }
+        let (events, work) = server.poll_with_work(t0);
+        assert_bounded_poll(work, &events);
+        assert_eq!(events.len(), 70);
+        assert_eq!(server.peer_count(), 70);
+
+        let expired_at = t0 + DEFAULT_TIMEOUT + Duration::from_secs(1);
+        let (events, work) = server.poll_with_work(expired_at);
+        assert_bounded_poll(work, &events);
+        assert_eq!(work.timeout_events, MAX_POLL_TIMEOUT_EVENTS);
+        assert_eq!(events.len(), MAX_POLL_TIMEOUT_EVENTS);
+        assert_eq!(server.peer_count(), 70 - MAX_POLL_TIMEOUT_EVENTS);
+
+        let (events, work) = server.poll_with_work(expired_at);
+        assert_bounded_poll(work, &events);
+        assert_eq!(events.len(), 70 - MAX_POLL_TIMEOUT_EVENTS);
+        assert_eq!(server.peer_count(), 0);
+        drop(clients);
     }
 
     #[test]
