@@ -2456,7 +2456,13 @@ mod input_hardening_tests {
         }
     }
 
-    fn join(server: &mut Server, peer: PeerId, token: &str) -> u64 {
+    fn join_at(
+        server: &mut Server,
+        peer: PeerId,
+        token: &str,
+        admission_ms: i64,
+        persistence_ms: i64,
+    ) -> u64 {
         let mut fbb = FlatBufferBuilder::new();
         let token_off = fbb.create_string(token);
         let name_off = fbb.create_string("Sailor");
@@ -2474,9 +2480,19 @@ mod input_hardening_tests {
         let bytes = finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value());
         let env = decode_envelope(&bytes).unwrap();
         server
-            .on_hello(peer, env.payload_as_client_hello().unwrap())
+            .on_hello_at(
+                peer,
+                env.payload_as_client_hello().unwrap(),
+                admission_ms,
+                persistence_ms,
+            )
             .unwrap();
         server.sessions[&peer].player_id
+    }
+
+    fn join(server: &mut Server, peer: PeerId, token: &str) -> u64 {
+        let admission_ms = server.admission_ms();
+        join_at(server, peer, token, admission_ms, now_ms())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3000,18 +3016,27 @@ mod input_hardening_tests {
         // skips it) and run only by the non-blocking load job / `make load-test`.
         const N: u32 = 200;
         const TICKS: u32 = 60;
+        const LOAD_EPOCH_MS: i64 = 1_700_000_000_000;
 
         let cfg = Config::default();
         let tick_dt = Duration::from_secs_f64(1.0 / cfg.tick_hz as f64);
         let cell = cfg.cell_size_m;
         let mut server = make_server(cfg);
+        let session_step_ms = server.cfg.new_session_min_interval_ms_i64();
 
         // Join N clients, each seeded into a distinct cell on a roughly square
         // grid so AoI density is realistic and bounded, not all stacked together.
         let side = (N as f64).sqrt().ceil() as u32;
         for i in 0..N {
             let peer = (i + 1) as PeerId;
-            join(&mut server, peer, &format!("tok-load-{i}"));
+            let session_offset_ms = i64::from(i) * session_step_ms;
+            join_at(
+                &mut server,
+                peer,
+                &format!("tok-load-{i}"),
+                1_000 + session_offset_ms,
+                LOAD_EPOCH_MS + session_offset_ms,
+            );
             let cx = (i % side) as f32;
             let cz = (i / side) as f32;
             // The seed time advances per client so the client-state throttle never
@@ -3023,6 +3048,7 @@ mod input_hardening_tests {
                 1_000 + i as i64,
             );
         }
+        assert_eq!(server.sessions.len(), N as usize);
         assert_eq!(server.world.len(), N as usize);
 
         // Drive TICKS simulated ticks and measure the wall-clock server work. The
