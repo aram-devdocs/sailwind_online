@@ -486,6 +486,45 @@ fn mooring_from_row(r: &Row<'_>) -> Result<MooringRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    struct TestDatabase {
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new(stem: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("sw-persist-{stem}-{}-{id}.db", std::process::id()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let path = path.canonicalize().unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for suffix in ["-wal", "-shm", ""] {
+                let path = format!("{}{suffix}", self.path.display());
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 
     fn sample_mooring(boat_id: i64, owner: i64) -> MooringRow {
         MooringRow {
@@ -643,6 +682,80 @@ mod tests {
         assert_eq!(reconnected.name, "Renamed");
         assert_eq!(reconnected.created_at, first.created_at);
         assert_eq!(reconnected.last_seen, 300);
+    }
+
+    #[test]
+    fn concurrent_player_admission_enforces_capacity_across_connections() {
+        const CONTENDERS: usize = 8;
+        const RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let database = TestDatabase::new("admission");
+        let path = database.path().to_str().unwrap();
+
+        // Finish migrations before opening the independent connections that
+        // will contend on the same real SQLite file.
+        drop(Db::open(path).unwrap());
+        let connections = (0..CONTENDERS)
+            .map(|_| Db::open(path).unwrap())
+            .collect::<Vec<_>>();
+
+        let start = Arc::new(Barrier::new(CONTENDERS));
+        let (result_tx, result_rx) = mpsc::channel();
+        let handles = connections
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut db)| {
+                let start = Arc::clone(&start);
+                let result_tx = result_tx.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let result = db.admit_player_by_token(
+                        &format!("token-{index}"),
+                        &format!("Player {index}"),
+                        index as i64,
+                        1,
+                    );
+                    result_tx.send((index, result)).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(result_tx);
+
+        let mut admissions = Vec::with_capacity(CONTENDERS);
+        for _ in 0..CONTENDERS {
+            admissions.push(
+                result_rx
+                    .recv_timeout(RESULT_TIMEOUT)
+                    .expect("all admission attempts must finish within the SQLite busy timeout"),
+            );
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut admitted = 0;
+        let mut capacity_reached = 0;
+        for (index, result) in admissions {
+            match result.unwrap_or_else(|error| {
+                panic!(
+                    "contender {index} returned a database error instead of an admission: {error}"
+                )
+            }) {
+                PlayerAdmission::Admitted(_) => admitted += 1,
+                PlayerAdmission::CapacityReached => capacity_reached += 1,
+            }
+        }
+        assert_eq!(admitted, 1);
+        assert_eq!(capacity_reached, CONTENDERS - 1);
+
+        let verifier = Db::open(path).unwrap();
+        let player_count = verifier
+            .conn
+            .query_row("SELECT COUNT(*) FROM players", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(player_count, 1);
     }
 
     #[test]
