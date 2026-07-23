@@ -83,8 +83,9 @@ pub struct Config {
     /// messages from the same peer. A flood beyond this rate is dropped before
     /// validation, persistence, or response generation. The 250 ms default
     /// matches the client's handshake retry cadence. Source-IP session
-    /// admission uses a derived interval strictly longer than the global
-    /// new-session interval. Bounded to `1..=`[`MAX_HELLO_MIN_INTERVAL_MS`].
+    /// admission uses a derived interval longer than two complete global
+    /// new-session intervals. Bounded to
+    /// `1..=`[`MAX_HELLO_MIN_INTERVAL_MS`].
     pub hello_min_interval_ms: u32,
     /// Process-wide minimum interval, in milliseconds, between database
     /// admissions for identities without an active session. Active-identity
@@ -328,13 +329,16 @@ impl Config {
 
     /// Per-source session-admission interval in bounded milliseconds.
     ///
-    /// It is strictly greater than the global new-session interval, so the
-    /// source that consumed one global slot is ineligible at the next slot.
-    /// Another source therefore gets an uncontested admission opportunity for
-    /// every accepted configuration, including a 250/1000 hello/global pair.
+    /// It is strictly greater than two global new-session intervals, so after
+    /// one source consumes a slot, every instant of the next complete global
+    /// window is uncontested by that source. This holds for every accepted
+    /// configuration, including a 250/1000 hello/global pair.
     pub fn source_session_min_interval_ms_i64(&self) -> i64 {
-        self.hello_min_interval_ms_i64()
-            .max(self.new_session_min_interval_ms_i64().saturating_add(1))
+        self.hello_min_interval_ms_i64().max(
+            self.new_session_min_interval_ms_i64()
+                .saturating_mul(2)
+                .saturating_add(1),
+        )
     }
 
     /// Global live-peer ceiling with a defense-in-depth clamp.
@@ -853,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn source_admission_window_is_strictly_longer_than_every_global_window() {
+    fn source_admission_reserves_a_complete_global_window_for_other_sources() {
         for hello_ms in MIN_HELLO_MIN_INTERVAL_MS..=MAX_HELLO_MIN_INTERVAL_MS {
             for new_session_ms in MIN_HELLO_MIN_INTERVAL_MS..=MAX_NEW_SESSION_MIN_INTERVAL_MS {
                 let cfg = Config {
@@ -862,11 +866,18 @@ mod tests {
                     ..Config::default()
                 };
                 cfg.validate().unwrap();
+                let global_ms = cfg.new_session_min_interval_ms_i64();
+                let source_ms = cfg.source_session_min_interval_ms_i64();
                 assert!(
-                    cfg.source_session_min_interval_ms_i64()
-                        > cfg.new_session_min_interval_ms_i64(),
-                    "one source must never be eligible for two consecutive global slots"
+                    source_ms > global_ms.saturating_mul(2),
+                    "the winning source must remain ineligible throughout the next complete global window"
                 );
+                for other_source_offset_ms in 0..=global_ms {
+                    assert!(
+                        global_ms.saturating_add(other_source_offset_ms) < source_ms,
+                        "another source must have every instant in the reserved global window"
+                    );
+                }
             }
         }
     }

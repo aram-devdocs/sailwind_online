@@ -39,10 +39,11 @@ trade_min_interval_ms = 250
 # ClientHello throttle in milliseconds. Per-peer throttling runs before
 # protocol/hash validation, database access, and ServerHello generation. Source
 # IP session admission uses max(hello_min_interval_ms,
-# new_session_min_interval_ms + 1), which prevents one source from consuming
-# consecutive global new-session slots. Keep the hello interval at or below the
-# client's 250 ms retry cadence so a lost ServerHello can be retried on the next
-# attempt. Must be in 1..=250; zero would disable pre-authentication protection.
+# 2 * new_session_min_interval_ms + 1), which reserves one complete global
+# admission window for other source IPs after a source wins a slot. Keep the
+# hello interval at or below the client's 250 ms retry cadence so a lost
+# ServerHello can be retried on the next attempt. Must be in 1..=250; zero would
+# disable pre-authentication protection.
 hello_min_interval_ms = 250
 
 # Process-wide minimum interval between database admissions for identities

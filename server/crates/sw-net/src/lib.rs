@@ -42,6 +42,14 @@ const MAX_POLL_SOCKET_EVENTS: usize = MAX_POLL_PACKETS * 2;
 /// socket flood cannot indefinitely retain expired peers.
 const MAX_POLL_TIMEOUT_EVENTS: usize = 64;
 
+/// Hard ceiling on live-peer slots inspected by one fixed-tick poll. At the
+/// maximum supported 65,535 peers, the round-robin cursor covers every slot in
+/// fewer than 128 ticks.
+const MAX_POLL_MAINTENANCE_SCANS: usize = 512;
+
+/// Hard ceiling on host keepalive datagrams sent by one fixed-tick poll.
+const MAX_POLL_KEEPALIVE_SENDS: usize = MAX_POLL_MAINTENANCE_SCANS;
+
 /// Hard ceiling on the event vector returned by one poll.
 const MAX_POLL_EVENTS: usize = MAX_POLL_SOCKET_EVENTS + MAX_POLL_TIMEOUT_EVENTS;
 
@@ -90,10 +98,13 @@ struct PollWork {
     bytes: usize,
     socket_events: usize,
     timeout_events: usize,
+    maintenance_scans: usize,
+    keepalive_sends: usize,
 }
 
 struct Peer {
     id: PeerId,
+    slot: usize,
     addr: SocketAddr,
     connect_time: i64,
     connection_number: u8,
@@ -109,10 +120,10 @@ struct Peer {
 pub struct Host {
     socket: UdpSocket,
     peers: HashMap<SocketAddr, Peer>,
-    by_id: HashMap<PeerId, SocketAddr>,
+    peer_slots: Vec<Option<SocketAddr>>,
+    free_peer_slots: Vec<usize>,
     peers_per_ip: HashMap<IpAddr, usize>,
-    next_id: PeerId,
-    next_local_peer_id: i32,
+    maintenance_cursor: usize,
     connect_key: String,
     timeout: Duration,
     max_peers: usize,
@@ -138,10 +149,14 @@ impl Host {
         max_peers: usize,
         max_peers_per_ip: usize,
     ) -> io::Result<Host> {
-        if max_peers == 0 || max_peers_per_ip == 0 || max_peers_per_ip > max_peers {
+        if max_peers == 0
+            || max_peers > u16::MAX as usize
+            || max_peers_per_ip == 0
+            || max_peers_per_ip > max_peers
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "peer limits must be nonzero and per-IP must not exceed global",
+                "peer limits must be nonzero, global must not exceed 65535, and per-IP must not exceed global",
             ));
         }
 
@@ -150,10 +165,10 @@ impl Host {
         Ok(Host {
             socket,
             peers: HashMap::new(),
-            by_id: HashMap::new(),
+            peer_slots: Vec::new(),
+            free_peer_slots: Vec::new(),
             peers_per_ip: HashMap::new(),
-            next_id: 1,
-            next_local_peer_id: 0,
+            maintenance_cursor: 0,
             connect_key: connect_key.to_string(),
             timeout: DEFAULT_TIMEOUT,
             max_peers,
@@ -169,7 +184,12 @@ impl Host {
 
     /// Return the remote address for a live peer.
     pub fn peer_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        self.by_id.get(&peer).copied()
+        let slot = usize::try_from(peer).ok()?.checked_sub(1)?;
+        let addr = self.peer_slots.get(slot)?.as_ref().copied()?;
+        self.peers
+            .get(&addr)
+            .filter(|connected| connected.id == peer)
+            .map(|_| addr)
     }
 
     /// Number of currently connected peers.
@@ -184,8 +204,8 @@ impl Host {
 
     /// Last measured round-trip time to `peer`, if a Pong has come back.
     pub fn rtt(&self, peer: PeerId) -> Option<Duration> {
-        let addr = self.by_id.get(&peer)?;
-        self.peers.get(addr)?.rtt
+        let addr = self.peer_addr(peer)?;
+        self.peers.get(&addr)?.rtt
     }
 
     /// Pump the socket and internal timers, returning everything that happened.
@@ -201,12 +221,13 @@ impl Host {
         let mut work = PollWork::default();
         self.drain_socket(now, &mut events, &mut work);
         work.socket_events = events.len();
-        work.timeout_events = self.process_timeouts(now, &mut events, MAX_POLL_TIMEOUT_EVENTS);
-        self.send_keepalive_pings(now);
+        self.process_peer_maintenance(now, &mut events, &mut work);
         debug_assert!(work.packets <= MAX_POLL_PACKETS);
         debug_assert!(work.bytes <= MAX_POLL_BYTES);
         debug_assert!(work.socket_events <= MAX_POLL_SOCKET_EVENTS);
         debug_assert!(work.timeout_events <= MAX_POLL_TIMEOUT_EVENTS);
+        debug_assert!(work.maintenance_scans <= MAX_POLL_MAINTENANCE_SCANS);
+        debug_assert!(work.keepalive_sends <= MAX_POLL_KEEPALIVE_SENDS);
         debug_assert!(events.len() <= MAX_POLL_EVENTS);
         (events, work)
     }
@@ -330,10 +351,11 @@ impl Host {
             return;
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
-        let local_peer_id = self.next_local_peer_id;
-        self.next_local_peer_id += 1;
+        let Some(slot) = self.allocate_peer_slot() else {
+            return;
+        };
+        let id = PeerId::try_from(slot + 1).expect("bounded peer slot fits PeerId");
+        let local_peer_id = i32::try_from(slot).expect("bounded peer slot fits LiteNetLib peer id");
 
         let accept = protocol::build_connect_accept(
             req.connect_time,
@@ -345,6 +367,7 @@ impl Host {
 
         self.insert_peer(Peer {
             id,
+            slot,
             addr,
             connect_time: req.connect_time,
             connection_number: req.connection_number,
@@ -360,14 +383,27 @@ impl Host {
 
     fn insert_peer(&mut self, peer: Peer) {
         let id = peer.id;
+        let slot = peer.slot;
         let addr = peer.addr;
+        debug_assert_eq!(id, PeerId::try_from(slot + 1).unwrap());
+        debug_assert!(self.peer_slots[slot].is_none());
         *self.peers_per_ip.entry(addr.ip()).or_insert(0) += 1;
         self.peers.insert(addr, peer);
-        self.by_id.insert(id, addr);
+        self.peer_slots[slot] = Some(addr);
+    }
+
+    fn allocate_peer_slot(&mut self) -> Option<usize> {
+        if self.peer_slots.len() < self.max_peers {
+            let slot = self.peer_slots.len();
+            self.peer_slots.push(None);
+            Some(slot)
+        } else {
+            self.free_peer_slots.pop()
+        }
     }
 
     fn remove_peer_at(&mut self, addr: SocketAddr) -> Option<Peer> {
-        let peer_id = self.peers.get(&addr)?.id;
+        let slot = self.peers.get(&addr)?.slot;
         let ip = addr.ip();
         let remove_counter = match self.peers_per_ip.get_mut(&ip)? {
             count if *count > 1 => {
@@ -380,7 +416,9 @@ impl Host {
             self.peers_per_ip.remove(&ip);
         }
         let peer = self.peers.remove(&addr)?;
-        self.by_id.remove(&peer_id);
+        debug_assert_eq!(self.peer_slots[slot], Some(addr));
+        self.peer_slots[slot] = None;
+        self.free_peer_slots.push(slot);
         Some(peer)
     }
 
@@ -428,31 +466,50 @@ impl Host {
         events.push(Event::Disconnected(id, DisconnectReason::Remote));
     }
 
-    fn process_timeouts(
+    fn process_peer_maintenance(
         &mut self,
         now: Instant,
         events: &mut Vec<Event>,
-        max_events: usize,
-    ) -> usize {
-        let timeout = self.timeout;
-        let expired: Vec<SocketAddr> = self
-            .peers
-            .iter()
-            .filter(|(_, p)| now.saturating_duration_since(p.last_recv) > timeout)
-            .map(|(addr, _)| *addr)
-            .take(max_events)
-            .collect();
-        let before = events.len();
-        for addr in expired {
-            if let Some(peer) = self.remove_peer_at(addr) {
-                events.push(Event::Disconnected(peer.id, DisconnectReason::Timeout));
-            }
+        work: &mut PollWork,
+    ) {
+        let slot_count = self.peer_slots.len();
+        if slot_count == 0 {
+            self.maintenance_cursor = 0;
+            return;
         }
-        events.len() - before
-    }
 
-    fn send_keepalive_pings(&mut self, now: Instant) {
-        for peer in self.peers.values_mut() {
+        let scan_count = slot_count.min(MAX_POLL_MAINTENANCE_SCANS);
+        for _ in 0..scan_count {
+            if self.maintenance_cursor >= slot_count {
+                self.maintenance_cursor = 0;
+            }
+            let slot = self.maintenance_cursor;
+            self.maintenance_cursor += 1;
+            work.maintenance_scans += 1;
+
+            let Some(addr) = self.peer_slots[slot] else {
+                continue;
+            };
+            let expired = self
+                .peers
+                .get(&addr)
+                .is_some_and(|peer| now.saturating_duration_since(peer.last_recv) > self.timeout);
+            if expired {
+                if work.timeout_events < MAX_POLL_TIMEOUT_EVENTS {
+                    if let Some(peer) = self.remove_peer_at(addr) {
+                        events.push(Event::Disconnected(peer.id, DisconnectReason::Timeout));
+                        work.timeout_events += 1;
+                    }
+                }
+                continue;
+            }
+
+            if work.keepalive_sends >= MAX_POLL_KEEPALIVE_SENDS {
+                continue;
+            }
+            let Some(peer) = self.peers.get_mut(&addr) else {
+                continue;
+            };
             if now.saturating_duration_since(peer.last_ping_sent) < PING_INTERVAL {
                 continue;
             }
@@ -461,6 +518,7 @@ impl Host {
             peer.ping_sent_at = Some(now);
             let ping = protocol::build_ping(peer.ping_seq);
             let _ = self.socket.send_to(&ping, peer.addr);
+            work.keepalive_sends += 1;
         }
     }
 
@@ -475,7 +533,7 @@ impl Host {
                 "payload exceeds MTU; fragmentation is not supported at init-0",
             ));
         }
-        let Some(addr) = self.by_id.get(&peer).copied() else {
+        let Some(addr) = self.peer_addr(peer) else {
             return Ok(());
         };
         let packet = protocol::build_unreliable(bytes);
@@ -488,7 +546,7 @@ impl Host {
     /// The caller already owns the corresponding application-session cleanup,
     /// so this does not enqueue a second [`Event::Disconnected`].
     pub fn disconnect(&mut self, peer: PeerId) -> bool {
-        let Some(addr) = self.by_id.get(&peer).copied() else {
+        let Some(addr) = self.peer_addr(peer) else {
             return false;
         };
         let Some(peer) = self.remove_peer_at(addr) else {
@@ -512,8 +570,10 @@ impl Host {
             events.push(Event::Disconnected(peer.id, DisconnectReason::Shutdown));
         }
         self.peers.clear();
-        self.by_id.clear();
+        self.peer_slots.clear();
+        self.free_peer_slots.clear();
         self.peers_per_ip.clear();
+        self.maintenance_cursor = 0;
         events
     }
 }
@@ -549,7 +609,69 @@ mod tests {
         assert!(work.bytes <= MAX_POLL_BYTES);
         assert!(work.socket_events <= MAX_POLL_SOCKET_EVENTS);
         assert!(work.timeout_events <= MAX_POLL_TIMEOUT_EVENTS);
+        assert!(work.maintenance_scans <= MAX_POLL_MAINTENANCE_SCANS);
+        assert!(work.keepalive_sends <= MAX_POLL_KEEPALIVE_SENDS);
         assert!(events.len() <= MAX_POLL_EVENTS);
+    }
+
+    fn connect_many(server: &mut Host, count: usize, now: Instant) -> Vec<UdpSocket> {
+        let server_addr = server.local_addr().unwrap();
+        let mut clients = Vec::with_capacity(count);
+        for connect_time in 1..=count {
+            let client = client_from("127.0.0.1", server_addr);
+            client
+                .send(&connect_datagram(connect_time as i64, "sailwind-online"))
+                .unwrap();
+            clients.push(client);
+            if connect_time % MAX_POLL_PACKETS == 0 {
+                let (events, work) = server.poll_with_work(now);
+                assert_bounded_poll(work, &events);
+            }
+        }
+        while server.peer_count() < count {
+            let (events, work) = server.poll_with_work(now);
+            assert_bounded_poll(work, &events);
+        }
+        clients
+    }
+
+    fn drain_packets(client: &UdpSocket) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match client.recv(&mut buf) {
+                Ok(n) => packets.push(buf[..n].to_vec()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return packets,
+                Err(error) => panic!("reading test client: {error}"),
+            }
+        }
+    }
+
+    fn assert_peer_indices_consistent(server: &Host) {
+        assert_eq!(
+            server.peer_slots.len(),
+            server.free_peer_slots.len() + server.peers.len()
+        );
+        assert!(server.maintenance_cursor <= server.peer_slots.len());
+
+        let mut free = vec![false; server.peer_slots.len()];
+        for &slot in &server.free_peer_slots {
+            assert!(slot < server.peer_slots.len());
+            assert!(!free[slot], "free-list slot {slot} must appear once");
+            free[slot] = true;
+            assert!(server.peer_slots[slot].is_none());
+        }
+        for (slot, addr) in server.peer_slots.iter().enumerate() {
+            match addr {
+                Some(addr) => {
+                    let peer = &server.peers[addr];
+                    assert_eq!(peer.slot, slot);
+                    assert_eq!(peer.id, PeerId::try_from(slot + 1).unwrap());
+                    assert!(!free[slot]);
+                }
+                None => assert!(free[slot]),
+            }
+        }
     }
 
     #[test]
@@ -722,6 +844,115 @@ mod tests {
     }
 
     #[test]
+    fn production_peers_have_bounded_fair_keepalive_maintenance() {
+        let peer_count = MAX_POLL_MAINTENANCE_SCANS + 1;
+        let mut server =
+            Host::bind_with_limits("127.0.0.1:0", "sailwind-online", peer_count, peer_count)
+                .unwrap();
+        let t0 = Instant::now();
+        let clients = connect_many(&mut server, peer_count, t0);
+        for client in &clients {
+            let packets = drain_packets(client);
+            assert!(packets.iter().any(|packet| {
+                protocol::Header::from_byte(packet[0]).property
+                    == protocol::property::CONNECT_ACCEPT
+            }));
+        }
+
+        let due_at = t0 + PING_INTERVAL;
+        let mut pinged = vec![false; peer_count];
+        let mut keepalive_sends = 0;
+        for _ in 0..3 {
+            let (events, work) = server.poll_with_work(due_at);
+            assert!(events.is_empty());
+            assert_bounded_poll(work, &events);
+            keepalive_sends += work.keepalive_sends;
+            for (index, client) in clients.iter().enumerate() {
+                pinged[index] |= drain_packets(client).iter().any(|packet| {
+                    protocol::Header::from_byte(packet[0]).property == protocol::property::PING
+                });
+            }
+            if pinged.iter().all(|ping| *ping) {
+                break;
+            }
+        }
+        assert!(
+            pinged.iter().all(|ping| *ping),
+            "round-robin maintenance must eventually send a keepalive to every live peer"
+        );
+        assert_eq!(
+            keepalive_sends, peer_count,
+            "each due peer must receive exactly one keepalive during a complete pass"
+        );
+        assert_peer_indices_consistent(&server);
+    }
+
+    #[test]
+    fn production_peer_timeouts_are_scan_bounded_and_eventually_complete() {
+        let peer_count = MAX_POLL_MAINTENANCE_SCANS + 1;
+        let mut server =
+            Host::bind_with_limits("127.0.0.1:0", "sailwind-online", peer_count, peer_count)
+                .unwrap();
+        let t0 = Instant::now();
+        let clients = connect_many(&mut server, peer_count, t0);
+        let expired_at = t0 + DEFAULT_TIMEOUT + Duration::from_secs(1);
+        let mut timeout_events = 0;
+        for poll_index in 0..peer_count.div_ceil(MAX_POLL_TIMEOUT_EVENTS) + 3 {
+            let (events, work) = server.poll_with_work(expired_at);
+            assert_bounded_poll(work, &events);
+            if poll_index == 0 {
+                assert_eq!(work.maintenance_scans, MAX_POLL_MAINTENANCE_SCANS);
+                assert_eq!(work.timeout_events, MAX_POLL_TIMEOUT_EVENTS);
+            }
+            timeout_events += events
+                .iter()
+                .filter(|event| matches!(event, Event::Disconnected(_, DisconnectReason::Timeout)))
+                .count();
+            assert_peer_indices_consistent(&server);
+            if server.peer_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(timeout_events, peer_count);
+        assert_eq!(server.peer_count(), 0);
+        assert_peer_indices_consistent(&server);
+        drop(clients);
+    }
+
+    #[test]
+    fn bounded_slot_ids_cannot_wrap_or_collide_under_transport_churn() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 2, 2).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+        let now = Instant::now();
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+
+        for connect_time in 1..=10_000i64 {
+            client
+                .send(&connect_datagram(connect_time, "sailwind-online"))
+                .unwrap();
+            let events = server.poll(now);
+            let connected = events
+                .iter()
+                .find_map(|event| match event {
+                    Event::Connected(peer) => Some(*peer),
+                    _ => None,
+                })
+                .expect("every replacement must connect");
+            assert!(
+                connected <= 2,
+                "PeerId must be derived from a bounded live slot"
+            );
+
+            let n = client.recv(&mut accept).unwrap();
+            assert_eq!(n, protocol::CONNECT_ACCEPT_SIZE);
+            let local_peer_id = i32::from_le_bytes(accept[11..15].try_into().unwrap());
+            assert!((0..2).contains(&local_peer_id));
+            assert_peer_indices_consistent(&server);
+        }
+    }
+
+    #[test]
     fn per_ip_admission_uses_bounded_counter_state_instead_of_peer_scans() {
         let source = include_str!("lib.rs");
         let counter_field = ["peers_per_ip: HashMap<IpAddr", ", usize>"].concat();
@@ -789,18 +1020,21 @@ mod tests {
             server.poll(Instant::now()),
             vec![
                 Event::Disconnected(1, DisconnectReason::Remote),
-                Event::Connected(4)
+                Event::Connected(1)
             ]
         );
         assert_eq!(server.peer_count(), 3);
         assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 2);
+        assert_peer_indices_consistent(&server);
 
-        assert!(server.disconnect(4));
+        assert!(server.disconnect(1));
         assert_eq!(server.peer_count(), 2);
         assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 1);
+        assert_peer_indices_consistent(&server);
         server.shutdown();
         assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 0);
         assert_eq!(server.peer_count_for_ip("127.0.0.2".parse().unwrap()), 0);
+        assert_peer_indices_consistent(&server);
     }
 
     #[test]

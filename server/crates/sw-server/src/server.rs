@@ -2129,6 +2129,62 @@ mod handshake_tests {
     }
 
     #[test]
+    fn winning_source_cannot_retake_before_an_entire_other_source_window() {
+        let mut server = make_server_with_config(Config {
+            hello_min_interval_ms: 250,
+            new_session_min_interval_ms: 1_000,
+            ..Config::default()
+        });
+
+        let (first_client, first_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let first = hello_envelope(
+            "attacker-first-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, first_peer, &first, 1_000);
+        assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+
+        let (early_client, early_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let early = hello_envelope(
+            "attacker-at-2001",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, early_peer, &early, 2_001);
+        assert_eq!(
+            receive_server_hello(&early_client),
+            (false, "server busy; retry".to_string())
+        );
+
+        let (legitimate_client, legitimate_peer) = connect_peer_from(&mut server, "127.0.0.2");
+        let legitimate = hello_envelope(
+            "legitimate-at-window-end",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, legitimate_peer, &legitimate, 3_000);
+        assert_eq!(
+            receive_server_hello(&legitimate_client),
+            (true, String::new()),
+            "another source must be uncontested even at the last instant of its full window"
+        );
+
+        let (late_client, late_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let late = hello_envelope(
+            "attacker-at-3001",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, late_peer, &late, 3_001);
+        assert_eq!(
+            receive_server_hello(&late_client),
+            (false, "server busy; retry".to_string()),
+            "the attacker must not retake the global gate one millisecond after the reserved window"
+        );
+    }
+
+    #[test]
     fn duplicate_hello_burst_is_dropped_before_response_or_session_work() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
