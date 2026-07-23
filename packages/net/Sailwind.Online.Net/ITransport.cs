@@ -26,8 +26,11 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Bring the manager up. Returns false when the socket cannot bind.</summary>
         bool Start();
 
-        /// <summary>Open (or re-open) the single peer to <paramref name="host"/>:<paramref name="port"/> with the connect key.</summary>
-        void Connect(string host, int port, string key);
+        /// <summary>
+        /// Open (or keep opening) the single peer to <paramref name="host"/>:<paramref name="port"/>
+        /// with the connect key. Returns true when a current peer exists after the attempt.
+        /// </summary>
+        bool Connect(string host, int port, string key);
 
         /// <summary>Immediately drop the current peer without reporting a network-originated disconnect.</summary>
         void DropPeer();

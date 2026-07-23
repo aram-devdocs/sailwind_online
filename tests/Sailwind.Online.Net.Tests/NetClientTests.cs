@@ -85,6 +85,169 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
+        public void Connect_WhenTransportStartFails_RetriesStartBeforeOpeningPeer()
+        {
+            var transport = new MockTransport();
+            transport.StartResults.Enqueue(false);
+            transport.StartResults.Enqueue(true);
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+
+            net.Connect(Options);
+
+            now = NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(1, transport.StartCalls);
+            Assert.Equal(0, transport.ConnectCalls);
+            Assert.False(transport.IsRunning);
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.StartCalls);
+            Assert.Equal(1, transport.ConnectCalls);
+            Assert.True(transport.IsRunning);
+            Assert.Equal(Options.Host, transport.LastHost);
+            Assert.Equal(Options.Port, transport.LastPort);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+        }
+
+        [Fact]
+        public void Connect_WhileHandshaking_RestartsSameOptionsWithFreshPeer()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            Assert.Single(transport.Sent);
+
+            net.Connect(Options);
+
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(2, transport.FreshPeerConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+            Assert.Single(transport.Sent);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            Assert.Equal(2, transport.Sent.Count);
+            Assert.Equal(Options.DisplayName, Decode(transport.Sent[1]).PayloadAsClientHello().DisplayName);
+        }
+
+        [Fact]
+        public void Connect_WhileReady_RestartsWithNewOptionsAndClearsSession()
+        {
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            var net = new NetClient(log, transport, () => 100);
+            net.Connect(Options);
+            transport.RaisePeerConnected();
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 77, snapshotHz: 8));
+            net.SendClientState(new BoatPose());
+            byte[] snapshot = SnapshotDeltaEnvelope(1, 88, 1f, 2f, 3f, 0f, 0f, 0f, 1f, 123, 10);
+            transport.RaiseNetworkReceive(snapshot);
+            Assert.True(net.Cache.TryGetPlayer(88, out _));
+
+            var replacement = new ConnectOptions
+            {
+                Host = "replacement-host",
+                Port = 5252,
+                DisplayName = "Bea",
+                Token = "replacement-token",
+                GameBuild = "replacement-build",
+                ModVersion = "0.2.0",
+                ApiSurfaceHash = "replacement-hash"
+            };
+            transport.Sent.Clear();
+
+            net.Connect(replacement);
+
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(2, transport.FreshPeerConnectCalls);
+            Assert.Equal("replacement-host", transport.LastHost);
+            Assert.Equal(5252, transport.LastPort);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+            Assert.Equal(0ul, net.PlayerId);
+            Assert.Equal((byte)4, net.SnapshotHz);
+            Assert.False(net.Cache.TryGetPlayer(88, out _));
+            Assert.Empty(transport.Sent);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            ClientHello hello = Decode(Assert.Single(transport.Sent)).PayloadAsClientHello();
+            Assert.Equal("Bea", hello.DisplayName);
+            Assert.Equal("replacement-token", hello.Token);
+
+            transport.RaiseNetworkReceive(ServerHelloEnvelope(accepted: true, playerId: 99, snapshotHz: 12));
+            net.SendClientState(new BoatPose());
+            transport.RaiseNetworkReceive(snapshot);
+
+            Assert.Equal(ConnectionStatus.Ready, net.Status);
+            Assert.Equal(99ul, net.PlayerId);
+            Assert.Equal((byte)12, net.SnapshotHz);
+            Assert.Equal(2, log.Infos.FindAll(message => message.Contains("First outbound position")).Count);
+            Assert.Equal(2, log.Infos.FindAll(message => message.Contains("First inbound position")).Count);
+            Assert.DoesNotContain(log.Infos, message => message.Contains(replacement.Token));
+        }
+
+        [Fact]
+        public void Connect_Null_ThrowsWithoutChangingCurrentAttempt()
+        {
+            var transport = new MockTransport();
+            var net = new NetClient(new NullNetLog(), transport, () => 0);
+            net.Connect(Options);
+
+            Assert.Throws<ArgumentNullException>(() => net.Connect(null));
+
+            Assert.Equal(1, transport.StartCalls);
+            Assert.Equal(1, transport.ConnectCalls);
+            Assert.Equal(0, transport.DropPeerCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+            Assert.Equal(Options.Host, transport.LastHost);
+            Assert.Equal(Options.Port, transport.LastPort);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            ClientHello hello = Decode(Assert.Single(transport.Sent)).PayloadAsClientHello();
+            Assert.Equal(Options.DisplayName, hello.DisplayName);
+            Assert.Equal(Options.Token, hello.Token);
+        }
+
+        [Fact]
+        public void Connect_WhenTransportCreatesNoPeer_RemainsDisconnectedUntilRetrySucceeds()
+        {
+            var transport = new MockTransport { ConnectResult = false };
+            long now = 0;
+            var net = new NetClient(new NullNetLog(), transport, () => now);
+
+            net.Connect(Options);
+
+            Assert.True(transport.IsRunning);
+            Assert.Equal(1, transport.StartCalls);
+            Assert.Equal(1, transport.ConnectCalls);
+            Assert.Equal(0, transport.FreshPeerConnectCalls);
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+
+            transport.ConnectResult = true;
+            now = NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(1, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(1, transport.FreshPeerConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+        }
+
+        [Fact]
         public void Handshake_PeerConnectedThenServerHello_ReachesReady()
         {
             var transport = new MockTransport();

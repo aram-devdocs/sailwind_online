@@ -11,11 +11,20 @@ namespace Sailwind.Online.Net.Tests
             var slot = new CurrentPeerSlot<object>();
             var pendingPeer = new object();
 
-            slot.SetIfPresent(pendingPeer);
-            slot.SetIfPresent(null);
+            Assert.True(slot.SetIfPresent(pendingPeer));
+            Assert.True(slot.SetIfPresent(null));
 
             Assert.Same(pendingPeer, slot.Value);
             Assert.True(slot.IsCurrent(pendingPeer));
+        }
+
+        [Fact]
+        public void NoCurrentPeer_NullCreation_ReportsFailure()
+        {
+            var slot = new CurrentPeerSlot<object>();
+
+            Assert.False(slot.SetIfPresent(null));
+            Assert.Null(slot.Value);
         }
 
         [Fact]

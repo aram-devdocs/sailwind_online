@@ -162,20 +162,27 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Begin (or restart) a session with the given options.</summary>
         public void Connect(ConnectOptions options)
         {
+            if (options == null)
+            {
+                throw new ArgumentNullException(nameof(options));
+            }
+
             if (_status == ConnectionStatus.Connecting && ReferenceEquals(_options, options))
             {
                 return;
             }
 
-            _options = options;
-
-            if (!_transport.IsRunning && !_transport.Start())
+            if (_status != ConnectionStatus.Disconnected)
             {
-                _log.LogError("[Sailwind.Online] Failed to start LiteNetLib NetManager.");
-                return;
+                _status = ConnectionStatus.Disconnected;
+                _transport.DropPeer();
             }
 
-            OpenPeer();
+            _options = options;
+            _reconnectBackoffMs = DefaultReconnectMs;
+            ResetSession();
+
+            StartTransportAndOpenPeer();
         }
 
         /// <summary>Poll the transport and service the handshake/reconnect timers. Call every frame.</summary>
@@ -194,7 +201,7 @@ namespace Sailwind.Online.Client.Net
             }
             else if (_status == ConnectionStatus.Disconnected && _options != null && now >= _nextReconnectMs)
             {
-                OpenPeer();
+                StartTransportAndOpenPeer();
             }
 
             _cache.PruneStale(now, SnapshotCache.DefaultStaleMs);
@@ -245,11 +252,40 @@ namespace Sailwind.Online.Client.Net
                 return;
             }
 
+            if (!_transport.IsRunning)
+            {
+                _status = ConnectionStatus.Disconnected;
+                ScheduleReconnect();
+                return;
+            }
+
             _cache.Clear();
             ResetPositionObservability();
-            _transport.Connect(options.Host, options.Port, ConnectKey);
+            if (!_transport.Connect(options.Host, options.Port, ConnectKey))
+            {
+                _status = ConnectionStatus.Disconnected;
+                ScheduleReconnect();
+                _log.LogWarning(
+                    "[Sailwind.Online] Transport did not create a peer for " +
+                    options.Host + ":" + options.Port + "; will retry.");
+                return;
+            }
+
             _status = ConnectionStatus.Connecting;
             _log.LogInfo("[Sailwind.Online] Connecting to " + options.Host + ":" + options.Port + " ...");
+        }
+
+        private void StartTransportAndOpenPeer()
+        {
+            if (!_transport.IsRunning && !_transport.Start())
+            {
+                _status = ConnectionStatus.Disconnected;
+                ScheduleReconnect();
+                _log.LogError("[Sailwind.Online] Failed to start LiteNetLib NetManager; will retry.");
+                return;
+            }
+
+            OpenPeer();
         }
 
         private void ScheduleReconnect()
@@ -304,6 +340,13 @@ namespace Sailwind.Online.Client.Net
 
         private void OnPeerConnected()
         {
+            if (_status != ConnectionStatus.Connecting)
+            {
+                _log.LogDebug(
+                    "[Sailwind.Online] Ignored transport connect while " + StatusText + ".");
+                return;
+            }
+
             _status = ConnectionStatus.Handshaking;
             SendHello();
             _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
@@ -525,6 +568,19 @@ namespace Sailwind.Online.Client.Net
         {
             _loggedFirstOutboundPosition = false;
             _loggedFirstInboundPosition = false;
+        }
+
+        private void ResetSession()
+        {
+            _cache.Clear();
+            _seq = 0;
+            _lastHelloMs = 0;
+            _nextReconnectMs = 0;
+            _snapshotHz = 4;
+            _playerId = 0;
+            _serverDay = 0;
+            _serverTimeOfDay = 0;
+            ResetPositionObservability();
         }
 
         private void RejectHandshake(string warning)
