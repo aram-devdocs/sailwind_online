@@ -18,7 +18,13 @@ from urllib.parse import urlparse
 GATES = ("spec", "quality", "architecture", "security")
 PR_FIELDS = (
     "number,state,isDraft,baseRefName,headRefName,headRefOid,"
-    "mergeStateStatus,closingIssuesReferences"
+    "mergeStateStatus"
+)
+CLOSURE_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "closingIssuesReferences(first:100){nodes{number "
+    "repository{nameWithOwner}}}}}}"
 )
 RUN_ID_RE = re.compile(r"(?P<issue>[1-9][0-9]*)-[a-z0-9]+(?:-[a-z0-9]+)*")
 HEAD_OID_RE = re.compile(r"[0-9a-fA-F]{40}")
@@ -183,8 +189,8 @@ def load_pr(runner, pr_number, repo):
     return data
 
 
-def validate_pr(pr, pr_number, issue_number, branch):
-    """Validate PR identity, mergeability, head, and linked issue."""
+def validate_pr(pr, pr_number, branch):
+    """Validate PR identity, mergeability, and head."""
     if pr.get("number") != pr_number:
         raise MergePreconditionError(
             f"PR lookup returned #{pr.get('number')!r}, expected #{pr_number}"
@@ -214,16 +220,70 @@ def validate_pr(pr, pr_number, issue_number, branch):
         raise MergePreconditionError(
             f"PR #{pr_number} returned invalid head commit {head_oid!r}"
         )
-    links = pr.get("closingIssuesReferences")
-    if not isinstance(links, list) or not any(
-        isinstance(link, dict) and link.get("number") == issue_number
-        for link in links
-    ):
+    return head_oid
+
+
+def validate_closure_reference(
+    runner,
+    pr_number,
+    issue_number,
+    repo,
+):
+    """Require GraphQL to report the exact recorded issue as a closing link."""
+    owner, name = repo.split("/", 1)
+    command = [
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={CLOSURE_QUERY}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"number={pr_number}",
+    ]
+    result = runner(command)
+    response = read_json_result(
+        result,
+        f"closure references for PR #{pr_number}",
+        MergePreconditionError,
+    )
+    if not isinstance(response, dict):
+        raise MergePreconditionError(
+            f"closure references for PR #{pr_number} returned a non-object"
+        )
+    if response.get("errors"):
+        raise MergePreconditionError(
+            f"closure references for PR #{pr_number} returned GraphQL errors: "
+            f"{response['errors']!r}"
+        )
+    try:
+        nodes = response["data"]["repository"]["pullRequest"][
+            "closingIssuesReferences"
+        ]["nodes"]
+    except (KeyError, TypeError) as exc:
+        raise MergePreconditionError(
+            f"closure references for PR #{pr_number} returned an unexpected "
+            "GraphQL shape"
+        ) from exc
+    if not isinstance(nodes, list):
+        raise MergePreconditionError(
+            f"closure references for PR #{pr_number} returned non-list nodes"
+        )
+    linked = any(
+        isinstance(node, dict)
+        and node.get("number") == issue_number
+        and isinstance(node.get("repository"), dict)
+        and node["repository"].get("nameWithOwner") == repo
+        for node in nodes
+    )
+    if not linked:
         raise MergePreconditionError(
             f"PR #{pr_number} does not link recorded issue #{issue_number} "
-            "for closure"
+            f"in {repo} for closure"
         )
-    return head_oid
 
 
 def validate_required_checks(runner, pr_number, repo):
@@ -344,8 +404,13 @@ def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
     head_oid = validate_pr(
         first_pr,
         pr_number,
-        issue_number,
         state["branch"],
+    )
+    validate_closure_reference(
+        runner,
+        pr_number,
+        issue_number,
+        repo,
     )
     validate_required_checks(runner, pr_number, repo)
 
@@ -356,7 +421,13 @@ def merge_completed_run(runs_dir, run_id, runner=run_command, dry_run=False):
             f"PR #{pr_number} head changed from {head_oid} to {final_head}; "
             "checks must pass again on the new head"
         )
-    validate_pr(final_pr, pr_number, issue_number, state["branch"])
+    validate_pr(final_pr, pr_number, state["branch"])
+    validate_closure_reference(
+        runner,
+        pr_number,
+        issue_number,
+        repo,
+    )
 
     if dry_run:
         return MergeResult(pr_number, issue_number, head_oid, False)

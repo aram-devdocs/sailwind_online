@@ -79,9 +79,44 @@ class GatedMergeTests(unittest.TestCase):
             "--json",
             (
                 "number,state,isDraft,baseRefName,headRefName,headRefOid,"
-                "mergeStateStatus,closingIssuesReferences"
+                "mergeStateStatus"
             ),
         ]
+
+    def closure_command(self):
+        return [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={gated_merge.CLOSURE_QUERY}",
+            "-F",
+            "owner=aram-devdocs",
+            "-F",
+            "name=sailwind_online",
+            "-F",
+            "number=52",
+        ]
+
+    def closure_result(self, issue=48):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "closingIssuesReferences": {
+                            "nodes": [
+                                {
+                                    "number": issue,
+                                    "repository": {
+                                        "nameWithOwner": self.repo,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
 
     def open_pr(self, **overrides):
         data = {
@@ -92,7 +127,6 @@ class GatedMergeTests(unittest.TestCase):
             "headRefName": "feat/48-gated-self-merge",
             "headRefOid": self.head,
             "mergeStateStatus": "CLEAN",
-            "closingIssuesReferences": [{"number": 48}],
         }
         data.update(overrides)
         return data
@@ -106,6 +140,7 @@ class GatedMergeTests(unittest.TestCase):
                 "",
             ),
             (self.pr_view_command(), 0, self.open_pr(), ""),
+            (self.closure_command(), 0, self.closure_result(), ""),
             (
                 [
                     "gh",
@@ -123,6 +158,7 @@ class GatedMergeTests(unittest.TestCase):
                 "",
             ),
             (self.pr_view_command(), 0, self.open_pr(), ""),
+            (self.closure_command(), 0, self.closure_result(), ""),
             (
                 [
                     "gh",
@@ -190,7 +226,7 @@ class GatedMergeTests(unittest.TestCase):
         runner.assert_finished()
 
     def test_dry_run_checks_every_precondition_without_merging(self):
-        responses = self.success_responses()[:4]
+        responses = self.success_responses()[:6]
         runner = FakeRunner(responses)
 
         result = gated_merge.merge_completed_run(
@@ -200,6 +236,28 @@ class GatedMergeTests(unittest.TestCase):
         self.assertFalse(result.merged)
         self.assertNotIn(["gh", "pr", "merge"], [call[:3] for call in runner.calls])
         runner.assert_finished()
+
+    def test_pr_view_uses_supported_fields_and_graphql_checks_issue_link(self):
+        runner = FakeRunner(self.success_responses())
+
+        gated_merge.merge_completed_run(
+            self.runs_dir, self.run_id, runner=runner
+        )
+
+        pr_views = [
+            call for call in runner.calls if call[:3] == ["gh", "pr", "view"]
+        ]
+        self.assertTrue(pr_views)
+        self.assertTrue(
+            all(
+                "closingIssuesReferences" not in call[call.index("--json") + 1]
+                for call in pr_views
+            )
+        )
+        self.assertEqual(
+            sum(call == self.closure_command() for call in runner.calls),
+            2,
+        )
 
     def test_accepts_a_recorded_pr_url_but_uses_its_exact_number(self):
         self.write_state(pr=f"https://github.com/{self.repo}/pull/52")
@@ -240,7 +298,6 @@ class GatedMergeTests(unittest.TestCase):
             "base": {"baseRefName": "main"},
             "head": {"headRefName": "feat/other"},
             "merge state": {"mergeStateStatus": "BLOCKED"},
-            "issue link": {"closingIssuesReferences": [{"number": 49}]},
             "head oid": {"headRefOid": "invalid"},
         }
         for label, overrides in cases.items():
@@ -278,7 +335,35 @@ class GatedMergeTests(unittest.TestCase):
         for label, checks in cases.items():
             with self.subTest(label=label):
                 responses = self.success_responses()
-                responses[2] = (responses[2][0], 1, checks, "")
+                responses[3] = (responses[3][0], 1, checks, "")
+                runner = FakeRunner(responses)
+                with self.assertRaises(gated_merge.MergePreconditionError):
+                    gated_merge.merge_completed_run(
+                        self.runs_dir, self.run_id, runner=runner
+                    )
+                self.assertFalse(
+                    any(call[:3] == ["gh", "pr", "merge"] for call in runner.calls)
+                )
+
+    def test_rejects_missing_wrong_or_failed_graphql_closure_reference(self):
+        cases = {
+            "missing": (0, self.closure_result(), ""),
+            "wrong issue": (0, self.closure_result(issue=49), ""),
+            "command failure": (1, "", "GraphQL unavailable"),
+        }
+        cases["missing"][1]["data"]["repository"]["pullRequest"][
+            "closingIssuesReferences"
+        ]["nodes"] = []
+        for label, replacement in cases.items():
+            with self.subTest(label=label):
+                responses = self.success_responses()
+                rc, output, error = replacement
+                responses[2] = (
+                    self.closure_command(),
+                    rc,
+                    output,
+                    error,
+                )
                 runner = FakeRunner(responses)
                 with self.assertRaises(gated_merge.MergePreconditionError):
                     gated_merge.merge_completed_run(
@@ -290,7 +375,7 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_rechecks_the_same_head_immediately_before_merge(self):
         responses = self.success_responses()
-        responses[3] = (
+        responses[4] = (
             self.pr_view_command(),
             0,
             self.open_pr(headRefOid="b" * 40),
@@ -311,15 +396,15 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_rejects_failed_merge_or_post_merge_confirmation(self):
         cases = {
-            "merge command": (4, 1, "", "merge refused"),
+            "merge command": (6, 1, "", "merge refused"),
             "pr confirmation": (
-                5,
+                7,
                 0,
                 {"number": 52, "state": "OPEN", "mergedAt": None},
                 "",
             ),
             "issue confirmation": (
-                6,
+                8,
                 0,
                 {"number": 48, "state": "OPEN"},
                 "",
