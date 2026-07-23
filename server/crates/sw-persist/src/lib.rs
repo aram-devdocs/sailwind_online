@@ -265,6 +265,20 @@ impl Db {
             .optional()
     }
 
+    /// Load at most `limit` persisted identity keys in stable player-id order.
+    ///
+    /// The caller requests one row past its own hard ceiling to detect an
+    /// oversized database without ever materializing an unbounded result.
+    pub fn player_identities(&self, limit: u32) -> Result<Vec<(String, i64)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT token_hash, id FROM players ORDER BY id ASC LIMIT ?1")?;
+        let identities = statement
+            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(identities)
+    }
+
     /// A player's current gold balance (0 if the player does not exist).
     pub fn player_balance(&self, id: i64) -> Result<i64> {
         Ok(self
@@ -682,6 +696,20 @@ mod tests {
         assert_eq!(reconnected.name, "Renamed");
         assert_eq!(reconnected.created_at, first.created_at);
         assert_eq!(reconnected.last_seen, 300);
+    }
+
+    #[test]
+    fn player_identity_load_is_stable_and_hard_limited() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.upsert_player_by_token("hash-one", "First", 100).unwrap();
+        db.upsert_player_by_token("hash-two", "Second", 100)
+            .unwrap();
+
+        assert_eq!(
+            db.player_identities(1).unwrap(),
+            vec![("hash-one".to_string(), first.id)]
+        );
+        assert_eq!(db.player_identities(0).unwrap(), Vec::new());
     }
 
     #[test]

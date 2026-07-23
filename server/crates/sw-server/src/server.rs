@@ -2,11 +2,11 @@
 
 use crate::clock::{clock_from_epoch, WorldClock};
 use crate::codec::{self, BoatSnap, Caps, MooringSnap, PlayerSnap};
-use crate::config::Config;
+use crate::config::{Config, MAX_PLAYER_ROWS};
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
 use crate::ratelimit::{BoundedRateLimiter, GlobalRateLimiter, RateLimiter};
 use crate::validate;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,9 +55,7 @@ pub struct Server {
     db: Db,
     world: World,
     sessions: HashMap<PeerId, Session>,
-    // Logical sessions replaced on another connection stay barred until their
-    // still-live transport peer disconnects. This set is bounded by live peers.
-    superseded_peers: HashSet<PeerId>,
+    identity_players: HashMap<String, u64>,
     seq: u32,
     snapshot_tick: u32,
     boot: Instant,
@@ -81,6 +79,7 @@ impl Server {
     /// the socket. Fails before the readiness line if binding fails.
     pub fn new(cfg: Config, running: Arc<AtomicBool>) -> anyhow::Result<Server> {
         let db = Db::open(&cfg.db_path)?;
+        let identity_players = load_identity_players(&db)?;
 
         // World clock epoch: first boot stamps "now"; later boots reuse it.
         let now = now_ms();
@@ -121,7 +120,7 @@ impl Server {
             db,
             world,
             sessions: HashMap::new(),
-            superseded_peers: HashSet::new(),
+            identity_players,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -271,11 +270,6 @@ impl Server {
             return Ok(());
         }
 
-        if self.superseded_peers.contains(&peer) {
-            self.reject_hello(peer, "session replaced by a newer connection");
-            return Ok(());
-        }
-
         if hello.protocol_version() != sw_contracts::PROTOCOL_VERSION {
             let reason = format!(
                 "protocol version mismatch: client {}, server {}",
@@ -359,18 +353,14 @@ impl Server {
             return Ok(());
         }
 
-        let active_player_id = self
-            .sessions
-            .values()
-            .find(|session| session.identity_hash == identity_hash)
-            .map(|session| session.player_id);
-        if active_player_id
+        let known_player_id = self.identity_players.get(&identity_hash).copied();
+        if known_player_id
             .is_some_and(|player_id| !self.reconnect_limiter.allow(player_id, admission_ms))
         {
             self.reject_hello(peer, "server busy; retry");
             return Ok(());
         }
-        if active_player_id.is_none() && !self.new_session_limiter.allow(admission_ms) {
+        if known_player_id.is_none() && !self.new_session_limiter.allow(admission_ms) {
             self.reject_hello(peer, "server busy; retry");
             return Ok(());
         }
@@ -387,8 +377,22 @@ impl Server {
                 return Ok(());
             }
         };
-        let player_id = player.id as u64;
-        if active_player_id.is_none() {
+        let player_id = u64::try_from(player.id)
+            .map_err(|_| anyhow::anyhow!("admitted player id must be nonnegative"))?;
+        if let Some(expected_player_id) = known_player_id {
+            if player_id != expected_player_id {
+                return Err(anyhow::anyhow!(
+                    "persisted identity index disagrees with admitted player"
+                ));
+            }
+        } else {
+            if self.identity_players.len() >= MAX_PLAYER_ROWS as usize {
+                return Err(anyhow::anyhow!(
+                    "persisted identity index reached its hard ceiling"
+                ));
+            }
+            self.identity_players
+                .insert(identity_hash.clone(), player_id);
             let _ = self.reconnect_limiter.allow(player_id, admission_ms);
         }
 
@@ -400,8 +404,11 @@ impl Server {
             .map(|(&pp, _)| pp)
             .collect();
         for pp in stale {
+            if self.host.peer_addr(pp).is_some() && !self.host.disconnect(pp) {
+                return Err(anyhow::anyhow!("failed to evict superseded transport peer"));
+            }
             self.sessions.remove(&pp);
-            self.superseded_peers.insert(pp);
+            self.hello_limiter.clear(u64::from(pp));
         }
 
         let mut sub = Subscription::new(self.cfg.aoi_radius_i32());
@@ -792,7 +799,6 @@ impl Server {
 
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
         self.hello_limiter.clear(u64::from(peer));
-        self.superseded_peers.remove(&peer);
         if let Some(s) = self.sessions.remove(&peer) {
             self.world.remove(s.player_id);
             // Drop the player's throttle state across every message class: a
@@ -1010,6 +1016,34 @@ fn token_hash(token: &str) -> String {
     format!("{h:016x}")
 }
 
+fn load_identity_players(db: &Db) -> anyhow::Result<HashMap<String, u64>> {
+    load_identity_players_up_to(db, MAX_PLAYER_ROWS)
+}
+
+fn load_identity_players_up_to(db: &Db, max_players: u32) -> anyhow::Result<HashMap<String, u64>> {
+    let rows = db.player_identities(max_players.saturating_add(1))?;
+    if rows.len() > max_players as usize {
+        return Err(anyhow::anyhow!(
+            "players table exceeds the hard identity ceiling of {max_players}"
+        ));
+    }
+
+    rows.into_iter()
+        .map(|(identity_hash, player_id)| {
+            if identity_hash.len() != 16
+                || !identity_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(anyhow::anyhow!(
+                    "persisted player identity hash has an invalid shape"
+                ));
+            }
+            let player_id = u64::try_from(player_id)
+                .map_err(|_| anyhow::anyhow!("persisted player id must be nonnegative"))?;
+            Ok((identity_hash, player_id))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn test_peer_ip(peer: PeerId) -> IpAddr {
     IpAddr::V6(std::net::Ipv6Addr::from(u128::from(peer) + 1))
@@ -1042,6 +1076,17 @@ mod tests {
     }
 
     #[test]
+    fn persisted_identity_index_fails_closed_at_its_hard_bound() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_player_by_token(&token_hash("first"), "First", 1)
+            .unwrap();
+        db.upsert_player_by_token(&token_hash("second"), "Second", 1)
+            .unwrap();
+
+        assert!(load_identity_players_up_to(&db, 1).is_err());
+    }
+
+    #[test]
     fn vec_and_quat_defaults() {
         assert_eq!(vec3_of(None), [0.0, 0.0, 0.0]);
         assert_eq!(quat_of(None), [0.0, 0.0, 0.0, 1.0]);
@@ -1059,8 +1104,13 @@ mod handshake_tests {
     use sw_world::Grid;
 
     fn make_server() -> Server {
+        make_server_with_db(Db::open_in_memory().unwrap())
+    }
+
+    fn make_server_with_db(db: Db) -> Server {
         let cfg = Config::default();
         let world = World::new(Grid::new(cfg.cell_size_m));
+        let identity_players = load_identity_players(&db).unwrap();
         Server {
             host: Host::bind_with_limits(
                 "127.0.0.1:0",
@@ -1069,10 +1119,10 @@ mod handshake_tests {
                 cfg.max_transport_peers_per_ip_usize(),
             )
             .unwrap(),
-            db: Db::open_in_memory().unwrap(),
+            db,
             world,
             sessions: HashMap::new(),
-            superseded_peers: HashSet::new(),
+            identity_players,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -1811,29 +1861,77 @@ mod handshake_tests {
         let player_id = server.sessions[&replacement_peer].player_id;
         let world_cell = server.world.cell_of_entity(player_id);
         assert!(!server.sessions.contains_key(&first_peer));
+        assert!(
+            server.host.peer_addr(first_peer).is_none(),
+            "a superseded logical session must be removed from the transport"
+        );
+        assert_eq!(
+            server.host.peer_count(),
+            1,
+            "superseded peers must not retain transport quota"
+        );
 
-        let stale_retry_ms = replacement_admission_ms
-            + server
-                .cfg
-                .hello_min_interval_ms_i64()
-                .max(server.cfg.new_session_min_interval_ms_i64());
-        deliver_hello_at(&mut server, first_peer, &hello, stale_retry_ms);
+        loop {
+            let mut packet = [0u8; protocol::MTU];
+            let received = first_client.recv(&mut packet).unwrap();
+            if protocol::Header::from_byte(packet[0]).property == protocol::property::DISCONNECT {
+                assert_eq!(received, protocol::DISCONNECT_SIZE);
+                break;
+            }
+        }
+
+        first_client
+            .send(&protocol::build_unreliable(&hello))
+            .unwrap();
+        first_client.send(&protocol::build_ping(1)).unwrap();
+        assert!(
+            server.host.poll(Instant::now()).is_empty(),
+            "data and keepalive traffic from the evicted address must be ignored"
+        );
 
         assert_eq!(server.sessions.len(), 1);
         assert!(!server.sessions.contains_key(&first_peer));
         assert_eq!(server.sessions[&replacement_peer].player_id, player_id);
         assert_eq!(server.world.len(), 1);
         assert_eq!(server.world.cell_of_entity(player_id), world_cell);
-        assert_eq!(
-            receive_server_hello(&first_client),
-            (false, "session replaced by a newer connection".to_string())
-        );
+    }
 
-        server
-            .on_disconnect(first_peer, DisconnectReason::Remote)
+    #[test]
+    fn persisted_offline_identity_does_not_compete_with_fresh_token_admission() {
+        let persisted_token = "persisted-offline-token";
+        let db = Db::open_in_memory().unwrap();
+        let persisted = db
+            .upsert_player_by_token(&token_hash(persisted_token), "Returning", 100)
             .unwrap();
-        assert!(!server.superseded_peers.contains(&first_peer));
-        assert_eq!(server.sessions[&replacement_peer].player_id, player_id);
+        let mut server = make_server_with_db(db);
+        let admission_ms = 1_000;
+
+        let (fresh_client, fresh_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let fresh = hello_envelope(
+            "fresh-attacker-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, fresh_peer, &fresh, admission_ms);
+        assert_eq!(receive_server_hello(&fresh_client), (true, String::new()));
+
+        let (returning_client, returning_peer) = connect_peer_from(&mut server, "127.0.0.2");
+        let returning = hello_envelope(
+            persisted_token,
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, returning_peer, &returning, admission_ms);
+
+        assert_eq!(
+            receive_server_hello(&returning_client),
+            (true, String::new()),
+            "a persisted identity must use reconnect admission even while the new-token gate is busy"
+        );
+        assert_eq!(
+            server.sessions[&returning_peer].player_id,
+            persisted.id as u64
+        );
     }
 
     #[test]
@@ -2242,7 +2340,7 @@ mod aoi_harden_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
-            superseded_peers: HashSet::new(),
+            identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -2456,7 +2554,7 @@ mod market_dispatch_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
-            superseded_peers: HashSet::new(),
+            identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -2703,7 +2801,7 @@ mod input_hardening_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
-            superseded_peers: HashSet::new(),
+            identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),

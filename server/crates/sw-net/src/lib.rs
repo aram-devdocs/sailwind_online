@@ -17,7 +17,7 @@ pub mod protocol;
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Opaque, stable identifier for a connected peer, assigned by the host.
@@ -85,6 +85,7 @@ pub struct Host {
     socket: UdpSocket,
     peers: HashMap<SocketAddr, Peer>,
     by_id: HashMap<PeerId, SocketAddr>,
+    peers_per_ip: HashMap<IpAddr, usize>,
     next_id: PeerId,
     next_local_peer_id: i32,
     connect_key: String,
@@ -125,6 +126,7 @@ impl Host {
             socket,
             peers: HashMap::new(),
             by_id: HashMap::new(),
+            peers_per_ip: HashMap::new(),
             next_id: 1,
             next_local_peer_id: 0,
             connect_key: connect_key.to_string(),
@@ -148,6 +150,11 @@ impl Host {
     /// Number of currently connected peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    #[cfg(test)]
+    fn peer_count_for_ip(&self, ip: IpAddr) -> usize {
+        self.peers_per_ip.get(&ip).copied().unwrap_or(0)
     }
 
     /// Last measured round-trip time to `peer`, if a Pong has come back.
@@ -258,16 +265,10 @@ impl Host {
             }
             // A genuinely new session from the same address replaces the old one.
             let old_id = existing.id;
-            self.peers.remove(&addr);
-            self.by_id.remove(&old_id);
+            self.remove_peer_at(addr);
             events.push(Event::Disconnected(old_id, DisconnectReason::Remote));
         } else if self.peers.len() >= self.max_peers
-            || self
-                .peers
-                .keys()
-                .filter(|connected| connected.ip() == addr.ip())
-                .count()
-                >= self.max_peers_per_ip
+            || self.peers_per_ip.get(&addr.ip()).copied().unwrap_or(0) >= self.max_peers_per_ip
         {
             return;
         }
@@ -285,23 +286,45 @@ impl Host {
         );
         let _ = self.socket.send_to(&accept, addr);
 
-        self.peers.insert(
+        self.insert_peer(Peer {
+            id,
             addr,
-            Peer {
-                id,
-                addr,
-                connect_time: req.connect_time,
-                connection_number: req.connection_number,
-                local_peer_id,
-                last_recv: now,
-                last_ping_sent: now,
-                ping_seq: 0,
-                ping_sent_at: None,
-                rtt: None,
-            },
-        );
-        self.by_id.insert(id, addr);
+            connect_time: req.connect_time,
+            connection_number: req.connection_number,
+            local_peer_id,
+            last_recv: now,
+            last_ping_sent: now,
+            ping_seq: 0,
+            ping_sent_at: None,
+            rtt: None,
+        });
         events.push(Event::Connected(id));
+    }
+
+    fn insert_peer(&mut self, peer: Peer) {
+        let id = peer.id;
+        let addr = peer.addr;
+        *self.peers_per_ip.entry(addr.ip()).or_insert(0) += 1;
+        self.peers.insert(addr, peer);
+        self.by_id.insert(id, addr);
+    }
+
+    fn remove_peer_at(&mut self, addr: SocketAddr) -> Option<Peer> {
+        let peer_id = self.peers.get(&addr)?.id;
+        let ip = addr.ip();
+        let remove_counter = match self.peers_per_ip.get_mut(&ip)? {
+            count if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        };
+        if remove_counter {
+            self.peers_per_ip.remove(&ip);
+        }
+        let peer = self.peers.remove(&addr)?;
+        self.by_id.remove(&peer_id);
+        Some(peer)
     }
 
     fn handle_ping(&mut self, data: &[u8], addr: SocketAddr, now: Instant) {
@@ -344,8 +367,7 @@ impl Host {
             &protocol::build_control(protocol::property::SHUTDOWN_OK),
             addr,
         );
-        self.peers.remove(&addr);
-        self.by_id.remove(&id);
+        self.remove_peer_at(addr);
         events.push(Event::Disconnected(id, DisconnectReason::Remote));
     }
 
@@ -358,8 +380,7 @@ impl Host {
             .map(|(addr, _)| *addr)
             .collect();
         for addr in expired {
-            if let Some(peer) = self.peers.remove(&addr) {
-                self.by_id.remove(&peer.id);
+            if let Some(peer) = self.remove_peer_at(addr) {
                 events.push(Event::Disconnected(peer.id, DisconnectReason::Timeout));
             }
         }
@@ -397,6 +418,23 @@ impl Host {
         Ok(())
     }
 
+    /// Remove one peer immediately and send the LiteNetLib Disconnect packet.
+    ///
+    /// The caller already owns the corresponding application-session cleanup,
+    /// so this does not enqueue a second [`Event::Disconnected`].
+    pub fn disconnect(&mut self, peer: PeerId) -> bool {
+        let Some(addr) = self.by_id.get(&peer).copied() else {
+            return false;
+        };
+        let Some(peer) = self.remove_peer_at(addr) else {
+            return false;
+        };
+        let _ = self
+            .socket
+            .send_to(&protocol::build_disconnect(peer.connect_time), peer.addr);
+        true
+    }
+
     /// Gracefully disconnect every peer (Disconnect packets + `Shutdown`
     /// events). Called on ctrl-c so clients learn immediately instead of
     /// waiting for their own timeout.
@@ -410,6 +448,7 @@ impl Host {
         }
         self.peers.clear();
         self.by_id.clear();
+        self.peers_per_ip.clear();
         events
     }
 }
@@ -441,6 +480,21 @@ mod tests {
     }
 
     #[test]
+    fn per_ip_admission_uses_bounded_counter_state_instead_of_peer_scans() {
+        let source = include_str!("lib.rs");
+        let counter_field = ["peers_per_ip: HashMap<IpAddr", ", usize>"].concat();
+        let full_peer_scan = [".fil", "ter(|connected| connected.ip() == addr.ip())"].concat();
+        assert!(
+            source.contains(&counter_field),
+            "the transport must maintain one bounded counter per live source IP"
+        );
+        assert!(
+            !source.contains(&full_peer_scan),
+            "connect admission must not scan every live peer"
+        );
+    }
+
+    #[test]
     fn peer_limits_bound_global_and_per_source_transport_state() {
         let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 3, 2).unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -454,6 +508,7 @@ mod tests {
             .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(2)]);
         assert_eq!(server.peer_count(), 2);
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 2);
 
         let same_source_excess = client_from("127.0.0.1", server_addr);
         same_source_excess
@@ -468,6 +523,7 @@ mod tests {
             .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(3)]);
         assert_eq!(server.peer_count(), 3);
+        assert_eq!(server.peer_count_for_ip("127.0.0.2".parse().unwrap()), 1);
 
         let global_excess = client_from("127.0.0.2", server_addr);
         global_excess
@@ -485,6 +541,24 @@ mod tests {
             protocol::CONNECT_ACCEPT_SIZE
         );
         assert_eq!(server.peer_count(), 3);
+
+        first.send(&connect_datagram(6, "sailwind-online")).unwrap();
+        assert_eq!(
+            server.poll(Instant::now()),
+            vec![
+                Event::Disconnected(1, DisconnectReason::Remote),
+                Event::Connected(4)
+            ]
+        );
+        assert_eq!(server.peer_count(), 3);
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 2);
+
+        assert!(server.disconnect(4));
+        assert_eq!(server.peer_count(), 2);
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 1);
+        server.shutdown();
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 0);
+        assert_eq!(server.peer_count_for_ip("127.0.0.2".parse().unwrap()), 0);
     }
 
     #[test]
@@ -533,6 +607,7 @@ mod tests {
             vec![Event::Disconnected(1, DisconnectReason::Remote)]
         );
         assert_eq!(server.peer_count(), 0);
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 0);
     }
 
     #[test]
@@ -620,6 +695,7 @@ mod tests {
             vec![Event::Disconnected(1, DisconnectReason::Timeout)]
         );
         assert_eq!(server.peer_count(), 0);
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 0);
     }
 
     #[test]
