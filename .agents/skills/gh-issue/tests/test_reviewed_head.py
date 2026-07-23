@@ -1,5 +1,9 @@
+import ast
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +17,14 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "gh_issue_run.py"
 SPEC = importlib.util.spec_from_file_location("gh_issue_run", SCRIPT)
 gh_issue_run = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gh_issue_run)
+
+VALIDATOR = SCRIPT.parents[1] / "validate_skill.py"
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "validate_skill",
+    VALIDATOR,
+)
+validate_skill = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(validate_skill)
 
 
 class ReviewedHeadTests(unittest.TestCase):
@@ -210,6 +222,117 @@ class ReviewedHeadTests(unittest.TestCase):
                     ),
                 ):
                     gh_issue_run.parse_issue_url(issue_url, "15")
+
+    def test_repo_root_probe_is_bounded_and_timeout_falls_back(self):
+        fallback = self.runs_dir / "fallback"
+        (fallback / ".agents").mkdir(parents=True)
+        with (
+            mock.patch.object(
+                gh_issue_run.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    ["git", "rev-parse"],
+                    5,
+                ),
+            ) as run,
+            mock.patch.object(Path, "cwd", return_value=fallback),
+        ):
+            self.assertEqual(gh_issue_run.repo_root(), fallback)
+
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            gh_issue_run.PROBE_TIMEOUT_SECONDS,
+        )
+
+    def test_validator_probes_are_bounded_and_timeout_is_reported(self):
+        with mock.patch.object(
+            validate_skill.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["python", "--version"], 5),
+        ) as run:
+            self.assertEqual(validate_skill.python_exe(), sys.executable)
+        self.assertTrue(run.call_args_list)
+        for call in run.call_args_list:
+            self.assertEqual(
+                call.kwargs["timeout"],
+                validate_skill.PROBE_TIMEOUT_SECONDS,
+            )
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                validate_skill,
+                "python_exe",
+                return_value=sys.executable,
+            ),
+            mock.patch.object(
+                validate_skill.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    [sys.executable, str(SCRIPT), "--help"],
+                    5,
+                ),
+            ) as help_run,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(validate_skill.main(), 1)
+        self.assertEqual(
+            help_run.call_args.kwargs["timeout"],
+            validate_skill.PROBE_TIMEOUT_SECONDS,
+        )
+        self.assertIn("timed out", output.getvalue())
+
+    def test_production_and_validator_subprocesses_have_timeouts(self):
+        scripts = (
+            SCRIPT,
+            VALIDATOR,
+            SCRIPT.parents[2] / "work" / "scripts" / "gated_merge.py",
+        )
+        for script in scripts:
+            tree = ast.parse(script.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                if not (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "run"
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "subprocess"
+                ):
+                    continue
+                self.assertIn(
+                    "timeout",
+                    {keyword.arg for keyword in node.keywords},
+                    f"unbounded subprocess.run in {script}:{node.lineno}",
+                )
+
+    def test_live_lock_cannot_be_stolen_or_released_by_another_owner(self):
+        first_dir = self.runs_dir / "first-lock"
+        other_dir = self.runs_dir / "other-lock"
+        first = gh_issue_run.acquire_lock(first_dir)
+        other = gh_issue_run.acquire_lock(other_dir)
+        try:
+            old = 1
+            os.utime(first_dir / ".lock", (old, old))
+            gh_issue_run.release_lock(other)
+            other = None
+            with (
+                mock.patch.object(
+                    gh_issue_run,
+                    "LOCK_WAIT_SECONDS",
+                    0,
+                ),
+                self.assertRaisesRegex(SystemExit, "another writer is active"),
+            ):
+                gh_issue_run.acquire_lock(first_dir)
+        finally:
+            if other is not None:
+                gh_issue_run.release_lock(other)
+            gh_issue_run.release_lock(first)
+
+        replacement = gh_issue_run.acquire_lock(first_dir)
+        gh_issue_run.release_lock(replacement)
 
     def test_migrates_completed_legacy_run_from_explicit_issue_url(self):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -430,13 +553,18 @@ class ReviewedHeadTests(unittest.TestCase):
                 "run_cmd",
                 side_effect=[
                     (0, registered, ""),
+                    (0, "", ""),
                     (1, "", "worktree is locked"),
                 ],
-            ),
+            ) as run,
             self.assertRaisesRegex(SystemExit, "worktree removal failed"),
         ):
             gh_issue_run.cmd_cleanup_worktree(args)
 
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["git", "worktree", "remove", str(worktree)],
+        )
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["phase"], "review")
         self.assertEqual(
@@ -444,7 +572,69 @@ class ReviewedHeadTests(unittest.TestCase):
             self.run_id + "\n",
         )
 
-    def test_cleanup_prunes_stale_registered_worktree_before_done(self):
+    def test_cleanup_rejects_post_review_dirty_or_untracked_files(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        (self.run_dir / "reviewed-head").write_text(
+            self.head + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        worktree.mkdir(parents=True)
+        registry = (
+            f"worktree {worktree}\n"
+            f"HEAD {self.head}\n"
+            "branch refs/heads/feat/15-ingame-handshake\n"
+        )
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            no_git=False,
+        )
+
+        for label, status in (
+            ("tracked", " M reviewed-file.txt"),
+            ("untracked", "?? post-review.txt"),
+        ):
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    gh_issue_run,
+                    "repo_root",
+                    return_value=self.runs_dir,
+                ),
+                mock.patch.object(
+                    gh_issue_run,
+                    "run_cmd",
+                    side_effect=[
+                        (0, registry, ""),
+                        (0, status, ""),
+                    ],
+                ) as run,
+                self.assertRaisesRegex(SystemExit, "worktree is not clean"),
+            ):
+                gh_issue_run.cmd_cleanup_worktree(args)
+
+            self.assertEqual(len(run.call_args_list), 2)
+            self.assertEqual(
+                run.call_args_list[1].args[0],
+                [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                ],
+            )
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "review")
+            self.assertEqual(
+                (self.runs_dir / "active").read_text(encoding="utf-8"),
+                self.run_id + "\n",
+            )
+
+    def test_cleanup_removes_exact_stale_registration_before_done(self):
         (self.runs_dir / "active").write_text(
             self.run_id + "\n",
             encoding="utf-8",
@@ -476,7 +666,6 @@ class ReviewedHeadTests(unittest.TestCase):
                 "run_cmd",
                 side_effect=[
                     (0, registered, ""),
-                    (1, "", "not a working tree"),
                     (0, "", ""),
                     (0, "", ""),
                 ],
@@ -495,7 +684,6 @@ class ReviewedHeadTests(unittest.TestCase):
                     str(worktree),
                     "--force",
                 ],
-                ["git", "worktree", "prune", "--expire", "now"],
                 ["git", "worktree", "list", "--porcelain"],
             ],
         )
@@ -538,7 +726,6 @@ class ReviewedHeadTests(unittest.TestCase):
                 "run_cmd",
                 side_effect=[
                     (0, registered, ""),
-                    (1, "", "not a working tree"),
                     (0, "", ""),
                     (0, registered, ""),
                 ],
@@ -645,7 +832,8 @@ class ReviewedHeadTests(unittest.TestCase):
             gh_issue_run.cmd_cleanup_worktree(args)
 
         self.assertEqual(registry_reads, 2)
-        self.assertFalse((self.runs_dir / ".lock").exists())
+        replacement = gh_issue_run.acquire_lock(self.runs_dir)
+        gh_issue_run.release_lock(replacement)
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["phase"], "done")
 

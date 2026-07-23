@@ -9,9 +9,10 @@ Exits nonzero on any problem so a run can gate on skill integrity. Checks:
      (probed by parsing `--help` output, so the check stays in sync with the
      real argparse surface).
   5. Runtime and workflow GitHub commands use an explicit repository.
-  6. The state.json flat-key contract is documented in the module docstring
+  6. Every production and validator subprocess has a timeout.
+  7. The state.json flat-key contract is documented in the module docstring
      and in the workflow contract.
-  7. Required SKILL.md sections are present.
+  8. Required SKILL.md sections are present.
 
 Stdlib only. Tries python3 then python for the subcommand probe so the check is
 portable; the dev path on this Windows machine is `python`.
@@ -30,6 +31,7 @@ REPOSITORY_CONFIG = AGENTS_DIR / "repository.json"
 WORK_SKILL = SKILL_DIR.parent / "work" / "SKILL.md"
 WORK_RUNTIME = SKILL_DIR.parent / "work" / "scripts" / "gated_merge.py"
 EXPECTED_REPOSITORY = "aram-devdocs/sailwind_online"
+PROBE_TIMEOUT_SECONDS = 5
 
 # Subcommands the docs promise and callers rely on.
 REQUIRED_SUBCOMMANDS = (
@@ -74,7 +76,12 @@ def python_exe():
     """Return the first working interpreter: python3 then python."""
     for exe in ("python3", "python"):
         try:
-            r = subprocess.run([exe, "--version"], capture_output=True, text=True)
+            r = subprocess.run(
+                [exe, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
             if r.returncode == 0:
                 return exe
         except (OSError, subprocess.SubprocessError):
@@ -117,6 +124,32 @@ def check_explicit_runtime_repositories(path, problems):
             problems.append(
                 f"{path.relative_to(AGENTS_DIR)} discovers repository "
                 "identity with gh repo view"
+            )
+
+
+def check_subprocess_timeouts(path, problems):
+    """Reject production or validator subprocesses without a timeout."""
+    if not path.is_file():
+        problems.append(f"{path.relative_to(AGENTS_DIR)} is missing")
+        return
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError) as exc:
+        problems.append(f"cannot parse {path.relative_to(AGENTS_DIR)}: {exc}")
+        return
+    for node in ast.walk(tree):
+        function = node.func if isinstance(node, ast.Call) else None
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "run"
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "subprocess"
+        ):
+            continue
+        if "timeout" not in {keyword.arg for keyword in node.keywords}:
+            problems.append(
+                f"{path.relative_to(AGENTS_DIR)} has an unbounded "
+                f"subprocess.run at line {node.lineno}"
             )
 
 
@@ -170,12 +203,28 @@ def main():
         problems.append("scripts/gh_issue_run.py is missing")
     else:
         exe = python_exe()
-        r = subprocess.run(
-            [exe, str(script), "--help"], capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            problems.append(f"'gh_issue_run.py --help' exited {r.returncode}")
-        help_text = r.stdout + r.stderr
+        try:
+            r = subprocess.run(
+                [exe, str(script), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            problems.append(
+                f"'gh_issue_run.py --help' timed out after "
+                f"{PROBE_TIMEOUT_SECONDS} seconds"
+            )
+            help_text = ""
+        except (OSError, subprocess.SubprocessError) as exc:
+            problems.append(f"'gh_issue_run.py --help' failed: {exc}")
+            help_text = ""
+        else:
+            if r.returncode != 0:
+                problems.append(
+                    f"'gh_issue_run.py --help' exited {r.returncode}"
+                )
+            help_text = r.stdout + r.stderr
         for cmd in REQUIRED_SUBCOMMANDS:
             if cmd not in help_text:
                 problems.append(f"subcommand '{cmd}' absent from --help output")
@@ -197,7 +246,11 @@ def main():
                     f"line {line_number}"
                 )
 
-    # 6. Flat-key contract documented (module docstring + workflow contract).
+    # 6. Bounded production and validator subprocesses.
+    for runtime in (script, WORK_RUNTIME, Path(__file__).resolve()):
+        check_subprocess_timeouts(runtime, problems)
+
+    # 7. Flat-key contract documented (module docstring + workflow contract).
     script_text = script.read_text(encoding="utf-8") if script.is_file() else ""
     for key in REQUIRED_KEYS:
         if key not in script_text:
@@ -209,7 +262,7 @@ def main():
     if contract_text and "flat" not in contract_text.lower():
         problems.append("workflow-contract.md does not state the flat-key contract")
 
-    # 7. Required SKILL.md sections.
+    # 8. Required SKILL.md sections.
     for sec in REQUIRED_SECTIONS:
         if skill_text and sec.lower() not in skill_text.lower():
             problems.append(f"SKILL.md missing a '{sec}' section")

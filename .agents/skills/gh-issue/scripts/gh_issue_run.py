@@ -33,8 +33,9 @@ Allowed flat keys (nothing else may be set):
 Two invariants are load-bearing and MUST NOT be removed:
     1. Backup-before-write: state.json is copied to state.json.bak before any
        write, so a crashed write leaves a recoverable prior state.
-    2. Single-writer lock: writes hold .lock (O_CREAT|O_EXCL, with a stale-lock
-       timeout) so two processes never interleave a read-modify-write.
+    2. Single-writer lock: writes hold an operating-system advisory lock on
+       .lock for the full operation, so two processes never interleave a
+       read-modify-write and a crashed writer releases ownership safely.
 
 Subcommands
 -----------
@@ -53,7 +54,8 @@ Runs directory resolution (highest precedence first):
     --runs-dir ARG  >  $SW_RUNS_DIR  >  <repo-root>/.agents/runs
 The override exists so tests exercise the machine without touching a real run.
 
-Stdlib only: json, argparse, os, subprocess, time, pathlib.
+Stdlib only: json, argparse, os, subprocess, time, pathlib, and the platform
+file-lock module.
 """
 
 import argparse
@@ -65,6 +67,11 @@ import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 # The four review gates in fixed order (spec first, security last). Mirrors
 # SW_GATE_ORDER in .claude/hooks/_lib.sh; keep the two in sync.
@@ -102,16 +109,12 @@ ALLOWED_KEYS = (
     "updated_at",
 )
 
-# A .lock older than this many seconds is treated as abandoned by a dead
-# process and reclaimed, because a crashed writer must not wedge the run
-# forever.
-STALE_LOCK_SECONDS = 30
-
 # How long to wait for a live lock before giving up.
 LOCK_WAIT_SECONDS = 10
 
 # External probes must not hang a durable run forever.
 COMMAND_TIMEOUT_SECONDS = 30
+PROBE_TIMEOUT_SECONDS = 5
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 REPOSITORY_CONFIG = Path(__file__).resolve().parents[3] / "repository.json"
 
@@ -126,6 +129,7 @@ def repo_root():
         out = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, check=False,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
         if out.returncode == 0 and out.stdout.strip():
             return Path(out.stdout.strip())
@@ -212,42 +216,70 @@ def run_cmd(cmd, cwd=None):
 # Locking
 # --------------------------------------------------------------------------- #
 
+class LockHandle:
+    """One process-owned advisory lock held through its open file."""
+
+    def __init__(self, path, stream):
+        self.path = path
+        self.stream = stream
+        self.released = False
+
+
+def try_lock_file(stream):
+    """Try one nonblocking exclusive lock acquisition."""
+    stream.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def unlock_file(stream):
+    """Release the advisory lock held by this exact open file."""
+    stream.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def acquire_lock(rundir):
-    """Take the single-writer lock, reclaiming a stale one. Returns lock path."""
+    """Take a bounded process-owned advisory lock."""
     lock = rundir / ".lock"
     rundir.mkdir(parents=True, exist_ok=True)
+    try:
+        stream = lock.open("a+b")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+    except OSError as exc:
+        raise SystemExit(f"error: cannot open lock {lock}: {exc}") from exc
+
     deadline = time.time() + LOCK_WAIT_SECONDS
     while True:
         try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
-            os.close(fd)
-            return lock
-        except FileExistsError:
-            # Reclaim an abandoned lock left by a dead writer.
-            try:
-                age = time.time() - lock.stat().st_mtime
-            except OSError:
-                age = 0
-            if age > STALE_LOCK_SECONDS:
-                try:
-                    lock.unlink()
-                except OSError:
-                    pass
-                continue
+            try_lock_file(stream)
+            return LockHandle(lock, stream)
+        except OSError:
             if time.time() > deadline:
+                stream.close()
                 raise SystemExit(
-                    f"error: could not acquire {lock} (held for {age:.0f}s); "
-                    "another writer is active"
+                    f"error: could not acquire {lock}; another writer is active"
                 )
             time.sleep(0.2)
 
 
 def release_lock(lock):
+    if not isinstance(lock, LockHandle):
+        raise TypeError("release_lock requires the owning LockHandle")
+    if lock.released:
+        return
     try:
-        lock.unlink()
-    except OSError:
-        pass
+        unlock_file(lock.stream)
+    finally:
+        lock.stream.close()
+        lock.released = True
 
 
 # --------------------------------------------------------------------------- #
@@ -974,6 +1006,29 @@ def validate_cleanup_entry(args, run_id, data, entry):
         )
 
 
+def require_clean_worktree(worktree):
+    """Fail unless the exact worktree has no tracked or untracked changes."""
+    rc, out, err = run_cmd(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
+        cwd=str(worktree),
+    )
+    if rc != 0:
+        raise SystemExit(
+            f"error: cannot verify worktree cleanliness (rc={rc}): "
+            f"{err or out}; run remains active and non-done for cleanup retry"
+        )
+    if out:
+        raise SystemExit(
+            f"error: worktree is not clean after review: {out}; "
+            "run remains active and non-done for cleanup retry"
+        )
+
+
 def cmd_cleanup_worktree(args):
     run_id = resolve_run_id(args)
     rundir = run_dir(args, run_id)
@@ -1007,31 +1062,35 @@ def cmd_cleanup_worktree(args):
             entry = entries.get(target)
             if entry is not None:
                 validate_cleanup_entry(args, run_id, data, entry)
-                rc, out, err = run_cmd(
-                    ["git", "worktree", "remove", str(worktree), "--force"],
-                    cwd=str(root),
-                )
-                if rc == 0:
-                    print(f"removed worktree {worktree}")
-                elif worktree.exists():
+                worktree_present = worktree.exists()
+                if worktree_present:
+                    require_clean_worktree(worktree)
+                    remove_command = [
+                        "git",
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                    ]
+                else:
+                    remove_command = [
+                        "git",
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                        "--force",
+                    ]
+                rc, out, err = run_cmd(remove_command, cwd=str(root))
+                if rc != 0:
                     raise SystemExit(
                         f"error: worktree removal failed (rc={rc}): "
                         f"{err or out}; run remains active and non-done for "
                         "cleanup retry"
                     )
+                if worktree_present:
+                    print(f"removed worktree {worktree}")
                 else:
-                    prune_rc, prune_out, prune_err = run_cmd(
-                        ["git", "worktree", "prune", "--expire", "now"],
-                        cwd=str(root),
-                    )
-                    if prune_rc != 0:
-                        raise SystemExit(
-                            f"error: stale worktree registry cleanup failed "
-                            f"(rc={prune_rc}): {prune_err or prune_out}; run "
-                            "remains active and non-done for cleanup retry"
-                        )
                     print(
-                        f"pruned stale worktree registration for {worktree}"
+                        f"removed stale worktree registration for {worktree}"
                     )
             elif worktree.exists():
                 raise SystemExit(

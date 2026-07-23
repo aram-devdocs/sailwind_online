@@ -167,13 +167,16 @@ global lock and deletes only a marker still naming the completed run. A marker
 replaced by another run is preserved.
 
 Worktree cleanup reads the full Git worktree registry entry even when the
-recorded directory is missing. Before force removal or stale pruning, the path,
-branch, and head must match the run's recorded branch and reviewed commit. A
-replacement registration fails without mutation. The state machine holds its
-global lifecycle lock through the final registry/path absence check and `done`
-write, while `init-run` holds the same lock for creation. A removal, prune,
-identity, or verification error keeps the prior phase and active marker so
-cleanup can be retried.
+recorded directory is missing. The path, branch, and head must match the run's
+recorded branch and reviewed commit. An existing worktree must still be clean,
+including untracked files, immediately before normal removal. Force is limited
+to removing the exact matched registry entry after its path is verified absent.
+A dirty path or replacement registration fails without mutation. The state
+machine holds an ownership-safe advisory lifecycle lock through the final
+registry/path absence check and `done` write, while `init-run` holds the same
+lock for creation. Process exit releases a crashed owner's lock; file age never
+steals a live lock. A removal, identity, or verification error keeps the prior
+phase and active marker so cleanup can be retried.
 
 Before a run exists, `/work` reads the one-field tracked
 `.agents/repository.json` file and passes its

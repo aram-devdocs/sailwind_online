@@ -82,8 +82,10 @@ or different from the PR head.
   any modification, so a crashed write leaves a recoverable prior state. The
   new state is written to `state.json.tmp` and atomically renamed into place.
 - **Single-writer lock.** Every write holds `.lock` in the run directory,
-  created with `O_CREAT|O_EXCL`. A lock older than 30 seconds is treated as
-  abandoned and reclaimed, so a dead writer cannot wedge the run.
+  using an operating-system advisory file lock for the full operation. Lock
+  ownership belongs to the open file handle, so age cannot steal a live lock
+  and one owner cannot release another. Acquisition is bounded, and process
+  exit releases a crashed writer's lock safely.
 
 ## Phase transition table
 
@@ -118,11 +120,14 @@ PR, closed issue, and remote branch deletion. Active-marker writes and the
 expected-run compare-and-delete share the global run lock, so a replacement
 marker is preserved. Cleanup checks the Git worktree registry, reconciles a
 stale entry only when its full porcelain record matches the run path, recorded
-branch, and reviewed head. A replacement entry is never removed. Cleanup holds
-the global lifecycle lock through final registry and filesystem verification
-and the `done` state write; `init-run` uses the same lock while creating
-worktrees. Any cleanup failure leaves the prior phase and active marker
-unchanged so resume retries cleanup.
+branch, and reviewed head. An existing worktree must have no tracked or
+untracked changes immediately before normal removal. Force removal is limited
+to the exact identity-matched registry entry after its path is verified absent.
+A dirty path or replacement entry is never removed. Cleanup holds the global
+lifecycle lock through final registry and filesystem verification and the
+`done` state write; `init-run` uses the same lock while creating worktrees. Any
+cleanup failure leaves the prior phase and active marker unchanged so resume
+retries cleanup.
 
 | hook                          | trigger        | reads                          | effect                                                                 |
 | ----------------------------- | -------------- | ------------------------------ | ---------------------------------------------------------------------- |
