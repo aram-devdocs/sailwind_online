@@ -162,20 +162,25 @@ proves that same PR head passed the CI mirror of `make validate`.
 Immediately before merging, the script reads the PR again and refuses a changed
 head, rechecks issue linkage, and reads required checks again. It passes that
 exact head to `gh pr merge --match-head-commit` only when the final check read
-still passes, uses squash merge, and requests remote branch deletion. It then
+still passes and uses squash merge without GitHub's unguarded branch-delete
+flag. It then
 confirms the PR is `MERGED` and polls the linked issue for bounded closure
-confirmation. Every `gh` call has a fixed timeout and fails closed with the
-command purpose. It then independently queries the recorded remote feature ref.
-An absent ref succeeds; a ref still at the reviewed head is deleted and queried
-again. A ref that moved to any other commit is never deleted.
+confirmation. Every external command has a fixed timeout and fails closed with
+the command purpose. It then independently queries the recorded remote feature
+ref. An absent ref succeeds. A ref still at the reviewed head is deleted with a
+SHA-bound `--force-with-lease` and queried again, so a move between lookup and
+deletion makes the atomic operation fail. A ref at any other commit is never
+deleted.
 
 The merge command is retry-safe. If GitHub accepted the squash merge but a
 confirmation call failed or issue closure was delayed, rerun the same command.
 It accepts only the exact recorded PR, branch, issue link, reviewed head, and
 required checks; when that PR is already `MERGED`, it skips the merge call,
 finishes bounded confirmation, repairs or confirms remote branch deletion, and
-clears the active handoff. Any branch lookup, deletion, or verification failure
-keeps the handoff active for another safe retry.
+asks the run state machine to clear the active handoff under its lock only if
+the marker still names this run. Any branch lookup, deletion, verification, or
+marker compare failure keeps the handoff active for another safe retry. A
+replacement active marker is preserved.
 
 If the command prints `STOP`, report its exact precondition failure and stop
 without merging or selecting another issue. If it prints `ERROR`, report the

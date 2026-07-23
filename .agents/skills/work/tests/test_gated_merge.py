@@ -164,14 +164,14 @@ class GatedMergeTests(unittest.TestCase):
 
     def branch_delete_command(self):
         return [
-            "gh",
-            "api",
-            "--method",
-            "DELETE",
+            "git",
+            "push",
             (
-                "repos/aram-devdocs/sailwind_online/git/refs/heads/"
-                "feat/48-gated-self-merge"
+                "--force-with-lease=refs/heads/"
+                f"feat/48-gated-self-merge:{self.head}"
             ),
+            "origin",
+            ":refs/heads/feat/48-gated-self-merge",
         ]
 
     def open_pr(self, **overrides):
@@ -274,7 +274,6 @@ class GatedMergeTests(unittest.TestCase):
                     "--repo",
                     self.repo,
                     "--squash",
-                    "--delete-branch",
                     "--match-head-commit",
                     self.head,
                 ],
@@ -328,6 +327,12 @@ class GatedMergeTests(unittest.TestCase):
         self.assertEqual(result.issue_number, 48)
         self.assertEqual(result.head_oid, self.head)
         self.assertTrue(result.merged)
+        merge_call = next(
+            call
+            for call in runner.calls
+            if call[:3] == ["gh", "pr", "merge"]
+        )
+        self.assertNotIn("--delete-branch", merge_call)
         self.assertFalse((self.runs_dir / "active").exists())
         runner.assert_finished()
 
@@ -700,6 +705,14 @@ class GatedMergeTests(unittest.TestCase):
                 "temporary delete failure",
             )
         )
+        first_responses.append(
+            (
+                self.branch_lookup_command(),
+                0,
+                self.branch_result(self.head),
+                "",
+            )
+        )
         first_runner = FakeRunner(first_responses)
 
         with self.assertRaisesRegex(
@@ -714,6 +727,48 @@ class GatedMergeTests(unittest.TestCase):
                 sleeper=lambda _: None,
             )
         self.assertTrue((self.runs_dir / "active").exists())
+
+    def test_atomic_delete_rejects_branch_move_between_lookup_and_push(self):
+        responses = self.merged_retry_responses("CLOSED")
+        responses[-1] = (
+            self.branch_lookup_command(),
+            0,
+            self.branch_result(self.head),
+            "",
+        )
+        responses.extend(
+            [
+                (
+                    self.branch_delete_command(),
+                    1,
+                    "",
+                    "stale info",
+                ),
+                (
+                    self.branch_lookup_command(),
+                    0,
+                    self.branch_result("b" * 40),
+                    "",
+                ),
+            ]
+        )
+        runner = FakeRunner(responses)
+
+        with self.assertRaisesRegex(
+            gated_merge.MergeConfirmationError,
+            "moved to",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=runner,
+                confirmation_attempts=1,
+                sleeper=lambda _: None,
+            )
+
+        self.assertIn(self.branch_delete_command(), runner.calls)
+        self.assertTrue((self.runs_dir / "active").exists())
+        runner.assert_finished()
 
         retry_responses = self.merged_retry_responses("CLOSED")
         retry_responses[-1] = (
@@ -795,7 +850,37 @@ class GatedMergeTests(unittest.TestCase):
         self.assertFalse((self.runs_dir / "active").exists())
         runner.assert_finished()
 
-    def test_gh_subprocess_timeout_is_explicit_and_actionable(self):
+    def test_replacement_active_marker_is_preserved_during_clear(self):
+        runner = FakeRunner(self.merged_retry_responses("CLOSED"))
+        replacement = "49-new-active-run"
+
+        def replace_then_clear(command):
+            (self.runs_dir / "active").write_text(
+                replacement + "\n",
+                encoding="utf-8",
+            )
+            return gated_merge.run_command(command)
+
+        with self.assertRaisesRegex(
+            gated_merge.MergeConfirmationError,
+            "active handoff clear failed",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=runner,
+                state_runner=replace_then_clear,
+                confirmation_attempts=1,
+                sleeper=lambda _: None,
+            )
+
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            replacement + "\n",
+        )
+        runner.assert_finished()
+
+    def test_subprocess_timeout_is_explicit_and_actionable(self):
         command = ["gh", "repo", "view", "--json", "nameWithOwner"]
         with mock.patch.object(
             gated_merge.subprocess,

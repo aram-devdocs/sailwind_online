@@ -37,6 +37,12 @@ HEAD_OID_RE = re.compile(r"[0-9a-fA-F]{40}")
 GH_TIMEOUT_SECONDS = 30
 CLOSURE_CONFIRMATION_ATTEMPTS = 5
 CLOSURE_POLL_INTERVAL_SECONDS = 2
+STATE_MACHINE_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "gh-issue"
+    / "scripts"
+    / "gh_issue_run.py"
+)
 
 
 class MergePreconditionError(RuntimeError):
@@ -69,7 +75,7 @@ def run_command(command):
             command,
             124,
             "",
-            f"gh command timed out after {GH_TIMEOUT_SECONDS} seconds",
+            f"command timed out after {GH_TIMEOUT_SECONDS} seconds",
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
@@ -495,7 +501,7 @@ def remote_branch_lookup(runner, repo, branch):
 
 
 def ensure_remote_branch_deleted(runner, repo, branch, expected_head):
-    """Delete only the expected feature ref, then independently verify absence."""
+    """Atomically delete only the expected ref, then verify its absence."""
     target = remote_branch_lookup(runner, repo, branch)
     if target is None:
         return
@@ -506,26 +512,26 @@ def ensure_remote_branch_deleted(runner, repo, branch, expected_head):
         )
 
     delete_command = [
-        "gh",
-        "api",
-        "--method",
-        "DELETE",
-        f"repos/{repo}/git/refs/heads/{branch}",
+        "git",
+        "push",
+        f"--force-with-lease=refs/heads/{branch}:{expected_head.lower()}",
+        "origin",
+        f":refs/heads/{branch}",
     ]
     result = runner(delete_command)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        raise MergeConfirmationError(
-            f"remote branch deletion failed for {branch!r}: {detail}"
-        )
-
     remaining = remote_branch_lookup(runner, repo, branch)
     if remaining is None:
         return
     if remaining != expected_head.lower():
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise MergeConfirmationError(
-            f"remote branch {branch!r} moved to {remaining} during deletion "
-            "verification"
+            f"remote branch {branch!r} moved to {remaining}; the atomic lease "
+            f"prevented deletion of that commit ({detail})"
+        )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise MergeConfirmationError(
+            f"remote branch deletion failed for {branch!r}: {detail}"
         )
     raise MergeConfirmationError(
         f"remote branch deletion was not confirmed: {branch!r} still points "
@@ -550,26 +556,30 @@ def validate_active_handoff(runs_dir, run_id):
         )
 
 
-def clear_active_handoff(runs_dir, run_id):
-    """Clear only the active marker for the confirmed merged run."""
-    active = Path(runs_dir) / "active"
-    if not active.exists():
-        return
-    try:
-        named = active.read_text(encoding="utf-8").strip()
-        if named == run_id:
-            active.unlink()
-    except OSError as exc:
+def clear_active_handoff(runs_dir, run_id, runner):
+    """Ask the state machine to compare-and-delete the active marker."""
+    command = [
+        sys.executable,
+        str(STATE_MACHINE_SCRIPT),
+        "--runs-dir",
+        str(Path(runs_dir)),
+        "clear-active",
+        "--expected-run-id",
+        run_id,
+    ]
+    result = runner(command)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise MergeConfirmationError(
-            f"merged successfully but could not clear active handoff "
-            f"{active}: {exc}"
-        ) from exc
+            f"active handoff clear failed for {run_id!r}: {detail}"
+        )
 
 
 def merge_completed_run(
     runs_dir,
     run_id,
     runner=run_command,
+    state_runner=run_command,
     dry_run=False,
     confirmation_attempts=CLOSURE_CONFIRMATION_ATTEMPTS,
     sleeper=time.sleep,
@@ -623,7 +633,7 @@ def merge_completed_run(
             state["branch"],
             head_oid,
         )
-        clear_active_handoff(runs_dir, run_id)
+        clear_active_handoff(runs_dir, run_id, state_runner)
         return MergeResult(pr_number, issue_number, head_oid, True)
 
     final_pr = load_pr(runner, pr_number, repo)
@@ -658,7 +668,7 @@ def merge_completed_run(
             state["branch"],
             head_oid,
         )
-        clear_active_handoff(runs_dir, run_id)
+        clear_active_handoff(runs_dir, run_id, state_runner)
         return MergeResult(pr_number, issue_number, head_oid, True)
 
     validate_required_checks(runner, pr_number, repo)
@@ -674,7 +684,6 @@ def merge_completed_run(
         "--repo",
         repo,
         "--squash",
-        "--delete-branch",
         "--match-head-commit",
         head_oid,
     ]
@@ -703,7 +712,7 @@ def merge_completed_run(
         state["branch"],
         head_oid,
     )
-    clear_active_handoff(runs_dir, run_id)
+    clear_active_handoff(runs_dir, run_id, state_runner)
     return MergeResult(pr_number, issue_number, head_oid, True)
 
 

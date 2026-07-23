@@ -198,6 +198,11 @@ class ReviewedHeadTests(unittest.TestCase):
             no_git=False,
         )
 
+        registered = (
+            f"worktree {worktree}\n"
+            f"HEAD {self.head}\n"
+            "branch refs/heads/feat/15-ingame-handshake\n"
+        )
         with (
             mock.patch.object(
                 gh_issue_run,
@@ -207,7 +212,10 @@ class ReviewedHeadTests(unittest.TestCase):
             mock.patch.object(
                 gh_issue_run,
                 "run_cmd",
-                return_value=(1, "", "worktree is locked"),
+                side_effect=[
+                    (0, registered, ""),
+                    (1, "", "worktree is locked"),
+                ],
             ),
             self.assertRaisesRegex(SystemExit, "worktree removal failed"),
         ):
@@ -218,6 +226,137 @@ class ReviewedHeadTests(unittest.TestCase):
         self.assertEqual(
             (self.runs_dir / "active").read_text(encoding="utf-8"),
             self.run_id + "\n",
+        )
+
+    def test_cleanup_prunes_stale_registered_worktree_before_done(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        registered = (
+            f"worktree {worktree}\n"
+            f"HEAD {self.head}\n"
+            "branch refs/heads/feat/15-ingame-handshake\n"
+        )
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            no_git=False,
+        )
+
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                side_effect=[
+                    (0, registered, ""),
+                    (1, "", "not a working tree"),
+                    (0, "", ""),
+                    (0, "", ""),
+                ],
+            ) as run,
+        ):
+            gh_issue_run.cmd_cleanup_worktree(args)
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "worktree", "list", "--porcelain"],
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    str(worktree),
+                    "--force",
+                ],
+                ["git", "worktree", "prune", "--expire", "now"],
+                ["git", "worktree", "list", "--porcelain"],
+            ],
+        )
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "done")
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            self.run_id + "\n",
+        )
+
+    def test_cleanup_keeps_run_non_done_when_registration_remains(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        worktree = self.runs_dir / ".worktrees" / self.run_id
+        registered = (
+            f"worktree {worktree}\n"
+            f"HEAD {self.head}\n"
+            "branch refs/heads/feat/15-ingame-handshake\n"
+        )
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            no_git=False,
+        )
+
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                side_effect=[
+                    (0, registered, ""),
+                    (1, "", "not a working tree"),
+                    (0, "", ""),
+                    (0, registered, ""),
+                ],
+            ),
+            self.assertRaisesRegex(SystemExit, "remains registered"),
+        ):
+            gh_issue_run.cmd_cleanup_worktree(args)
+
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "review")
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            self.run_id + "\n",
+        )
+
+    def test_clear_active_preserves_replacement_marker(self):
+        replacement = "99-replacement-run"
+        (self.runs_dir / "active").write_text(
+            replacement + "\n",
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs_dir),
+                "clear-active",
+                "--expected-run-id",
+                self.run_id,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("active run changed", result.stderr)
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            replacement + "\n",
         )
 
 

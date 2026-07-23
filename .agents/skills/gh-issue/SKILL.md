@@ -54,9 +54,12 @@ condition, recorded through the state machine, before the next begins.
   three-attempt cap. Exit: CI is green.
 - **cleanup** `gh_issue_run.py cleanup-worktree` removes the worktree, sets
   `phase=done`, and retains the active marker for `/work`. Exit: worktree gone,
-  phase done, merge handoff remains discoverable. If worktree removal fails,
-  stop with the prior phase and active marker intact, because a Windows file
-  lock must remain retryable rather than becoming a false `done`.
+  its Git registry entry gone, phase done, merge handoff remains discoverable.
+  Cleanup checks `git worktree list --porcelain`, prunes stale registration for
+  a missing recorded path, and verifies both filesystem and registry absence
+  before advancing. If any removal, prune, or verification fails, stop with the
+  prior phase and active marker intact, because cleanup must remain retryable
+  rather than becoming a false `done`.
 - **done** Terminal for `/gh-issue`. The run reports and stops. It does NOT
   merge its own PR or clear the handoff that `/work` must resume.
 
@@ -140,7 +143,9 @@ dead-run failure.
 When the active run is already at `done`, its missing worktree is expected.
 `validate-resume` routes directly to `/work`'s gated merge. The active marker
 MUST remain until merge and issue-closure confirmation succeed, because clearing
-it earlier would let issue selection skip an unfinished handoff.
+it earlier would let issue selection skip an unfinished handoff. `/work` asks
+the state machine to compare-and-delete that marker under its global run lock;
+if another run replaced it, the replacement is preserved.
 
 ## Boundaries
 

@@ -41,7 +41,7 @@ Subcommands
     update-state --key K --value V
     get-state [--key K]
     set-active RUN_ID
-    clear-active
+    clear-active --expected-run-id RUN_ID
     validate-resume
     record-reviewed-head [--run-id RUN_ID]
     poll-pr
@@ -156,6 +156,20 @@ def reviewed_head_path(args, run_id):
 
 def active_path(args):
     return runs_dir(args) / "active"
+
+
+def write_active_run(args, run_id):
+    """Atomically replace the active marker under the global run lock."""
+    root = runs_dir(args)
+    lock = acquire_lock(root)
+    try:
+        marker = active_path(args)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(run_id + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(marker))
+    finally:
+        release_lock(lock)
 
 
 # --------------------------------------------------------------------------- #
@@ -323,8 +337,7 @@ def cmd_init_run(args):
         release_lock(lock)
 
     # Mark this run active for the hooks.
-    active_path(args).parent.mkdir(parents=True, exist_ok=True)
-    active_path(args).write_text(run_id + "\n", encoding="utf-8")
+    write_active_run(args, run_id)
     print(f"active run set to '{run_id}'")
 
     # Create the isolated worktree. The script does this at /work time; --no-git
@@ -475,18 +488,34 @@ def cmd_set_active(args):
         raise SystemExit(
             f"error: run '{run_id}' has no state.json; cannot set it active"
         )
-    active_path(args).parent.mkdir(parents=True, exist_ok=True)
-    active_path(args).write_text(run_id + "\n", encoding="utf-8")
+    write_active_run(args, run_id)
     print(f"active run set to '{run_id}'")
 
 
 def cmd_clear_active(args):
-    ap = active_path(args)
-    if ap.exists():
-        ap.unlink()
-        print("active run cleared")
-    else:
-        print("no active run to clear")
+    root = runs_dir(args)
+    lock = acquire_lock(root)
+    try:
+        ap = active_path(args)
+        if not ap.exists():
+            print("no active run to clear")
+            return
+        try:
+            named = ap.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SystemExit(f"error: cannot read active run marker: {exc}")
+        if named != args.expected_run_id:
+            raise SystemExit(
+                f"error: active run changed to {named!r}; expected "
+                f"{args.expected_run_id!r}, so the replacement was preserved"
+            )
+        try:
+            ap.unlink()
+        except OSError as exc:
+            raise SystemExit(f"error: cannot clear active run marker: {exc}")
+        print(f"active run '{args.expected_run_id}' cleared")
+    finally:
+        release_lock(lock)
 
 
 def cmd_validate_resume(args):
@@ -614,28 +643,95 @@ def cmd_poll_pr(args):
         print(f"  {c.get('bucket') or c.get('state'):8} {c.get('name')}")
 
 
+def normalized_path(path):
+    """Return a case-normalized absolute path for exact worktree matching."""
+    return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+
+def registered_worktree_paths(root):
+    """Read the Git worktree registry and return its exact recorded paths."""
+    rc, out, err = run_cmd(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(root),
+    )
+    if rc != 0:
+        raise SystemExit(
+            f"error: worktree registry inspection failed (rc={rc}): "
+            f"{err or out}"
+        )
+    return {
+        normalized_path(line.removeprefix("worktree "))
+        for line in out.splitlines()
+        if line.startswith("worktree ")
+    }
+
+
 def cmd_cleanup_worktree(args):
     run_id = resolve_run_id(args)
     spath = state_path(args, run_id)
     data = read_state(spath)
     root = repo_root()
-    worktree = root / data.get("worktree", "")
+    recorded_worktree = data.get("worktree", "")
+    expected_worktree = Path(".worktrees") / run_id
+    if (
+        not recorded_worktree
+        or Path(recorded_worktree).is_absolute()
+        or Path(recorded_worktree) != expected_worktree
+    ):
+        raise SystemExit(
+            f"error: recorded worktree {recorded_worktree!r} does not match "
+            f"the exact run path {str(expected_worktree)!r}"
+        )
+    worktree = root / recorded_worktree
 
     if args.no_git:
         print("no-git: skipped 'git worktree remove'")
-    elif data.get("worktree") and worktree.exists():
-        rc, out, err = run_cmd(
-            ["git", "worktree", "remove", str(worktree), "--force"], cwd=str(root)
-        )
-        if rc == 0:
-            print(f"removed worktree {worktree}")
-        else:
+    else:
+        target = normalized_path(worktree)
+        registered = target in registered_worktree_paths(root)
+        if registered:
+            rc, out, err = run_cmd(
+                ["git", "worktree", "remove", str(worktree), "--force"],
+                cwd=str(root),
+            )
+            if rc == 0:
+                print(f"removed worktree {worktree}")
+            elif worktree.exists():
+                raise SystemExit(
+                    f"error: worktree removal failed (rc={rc}): "
+                    f"{err or out}; run remains active and non-done for "
+                    "cleanup retry"
+                )
+            else:
+                prune_rc, prune_out, prune_err = run_cmd(
+                    ["git", "worktree", "prune", "--expire", "now"],
+                    cwd=str(root),
+                )
+                if prune_rc != 0:
+                    raise SystemExit(
+                        f"error: stale worktree registry cleanup failed "
+                        f"(rc={prune_rc}): {prune_err or prune_out}; run "
+                        "remains active and non-done for cleanup retry"
+                    )
+                print(f"pruned stale worktree registration for {worktree}")
+        elif worktree.exists():
             raise SystemExit(
-                f"error: worktree removal failed (rc={rc}): {err or out}; "
+                f"error: worktree path {worktree} exists but is not registered; "
+                "refusing to remove an unowned directory"
+            )
+        else:
+            print(f"worktree {worktree} already absent")
+
+        if target in registered_worktree_paths(root):
+            raise SystemExit(
+                f"error: worktree {worktree} remains registered after cleanup; "
                 "run remains active and non-done for cleanup retry"
             )
-    else:
-        print(f"worktree {worktree} already absent")
+        if worktree.exists():
+            raise SystemExit(
+                f"error: worktree path {worktree} remains after cleanup; run "
+                "remains active and non-done for cleanup retry"
+            )
 
     rundir = run_dir(args, run_id)
     lock = acquire_lock(rundir)
@@ -709,7 +805,15 @@ def build_parser():
     sp.add_argument("run_id", help="run id to mark active")
     sp.set_defaults(func=cmd_set_active)
 
-    sp = sub.add_parser("clear-active", help="remove the active marker")
+    sp = sub.add_parser(
+        "clear-active",
+        help="remove the active marker only when it names the expected run",
+    )
+    sp.add_argument(
+        "--expected-run-id",
+        required=True,
+        help="run id that must still own the active marker",
+    )
     sp.set_defaults(func=cmd_clear_active)
 
     sp = sub.add_parser(
