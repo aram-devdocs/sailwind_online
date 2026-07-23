@@ -249,29 +249,49 @@ impl Server {
         }
 
         let max_string_len = self.cfg.max_wire_string_len_usize();
-        let Some(api_surface_hash) = hello.api_surface_hash() else {
-            self.reject_hello(peer, "missing API surface hash");
-            return Ok(());
-        };
-        if api_surface_hash.is_empty() {
-            self.reject_hello(peer, "missing API surface hash");
+        if let Err(reason) = validate_hello_string(
+            hello.api_surface_hash(),
+            "API surface hash",
+            true,
+            max_string_len,
+        ) {
+            self.reject_hello(peer, &reason);
             return Ok(());
         }
-        if !validate::string_within_limit(api_surface_hash, max_string_len) {
-            let reason =
-                format!("API surface hash exceeds maximum length ({max_string_len} bytes)");
+        let token = match validate_hello_string(hello.token(), "token", true, max_string_len) {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!("required hello string validated as absent"),
+            Err(reason) => {
+                self.reject_hello(peer, &reason);
+                return Ok(());
+            }
+        };
+        let display_name = match validate_hello_string(
+            hello.display_name(),
+            "display name",
+            false,
+            max_string_len,
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                self.reject_hello(peer, &reason);
+                return Ok(());
+            }
+        };
+        if let Err(reason) =
+            validate_hello_string(hello.game_build(), "game build", false, max_string_len)
+        {
+            self.reject_hello(peer, &reason);
+            return Ok(());
+        }
+        if let Err(reason) =
+            validate_hello_string(hello.mod_version(), "mod version", false, max_string_len)
+        {
             self.reject_hello(peer, &reason);
             return Ok(());
         }
 
-        let token = hello.token().unwrap_or("");
-        let name = hello.display_name().unwrap_or("sailor").to_string();
-
-        if token.is_empty() {
-            // Auth is assertion-only, but a token must at least be present.
-            self.reject_hello(peer, "missing token");
-            return Ok(());
-        }
+        let name = display_name.unwrap_or("sailor").to_string();
 
         let identity_hash = token_hash(token);
         if let Some((player_id, identity_matches)) = self
@@ -898,6 +918,21 @@ fn token_hash(token: &str) -> String {
     format!("{h:016x}")
 }
 
+fn validate_hello_string<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    required: bool,
+    max_len: usize,
+) -> Result<Option<&'a str>, String> {
+    if required && value.is_none_or(str::is_empty) {
+        return Err(format!("missing {field}"));
+    }
+    if value.is_some_and(|string| !validate::string_within_limit(string, max_len)) {
+        return Err(format!("{field} exceeds maximum length ({max_len} bytes)"));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,18 +1077,39 @@ mod handshake_tests {
         protocol_version: u16,
         api_surface_hash: Option<&str>,
     ) -> Vec<u8> {
+        hello_envelope_with_strings(
+            Some(token),
+            Some("Sailor"),
+            Some("game-build"),
+            Some("mod-version"),
+            api_surface_hash,
+            protocol_version,
+        )
+    }
+
+    fn hello_envelope_with_strings(
+        token: Option<&str>,
+        display_name: Option<&str>,
+        game_build: Option<&str>,
+        mod_version: Option<&str>,
+        api_surface_hash: Option<&str>,
+        protocol_version: u16,
+    ) -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::new();
-        let token = fbb.create_string(token);
-        let name = fbb.create_string("Sailor");
+        let token = token.map(|value| fbb.create_string(value));
+        let name = display_name.map(|value| fbb.create_string(value));
+        let game_build = game_build.map(|value| fbb.create_string(value));
+        let mod_version = mod_version.map(|value| fbb.create_string(value));
         let api_hash = api_surface_hash.map(|value| fbb.create_string(value));
         let hello = p::ClientHello::create(
             &mut fbb,
             &p::ClientHelloArgs {
                 protocol_version,
-                display_name: Some(name),
-                token: Some(token),
+                display_name: name,
+                token,
+                game_build,
+                mod_version,
                 api_surface_hash: api_hash,
-                ..Default::default()
             },
         );
         finish_envelope(&mut fbb, 1, p::Payload::ClientHello, hello.as_union_value())
@@ -1193,6 +1249,184 @@ mod handshake_tests {
     }
 
     #[test]
+    fn every_client_hello_string_is_bounded_before_persistence_or_session_creation() {
+        let max_len = Config::default().max_wire_string_len_usize();
+        let too_long = "x".repeat(max_len + 1);
+        let cases = [
+            (
+                "token",
+                hello_envelope_with_strings(
+                    Some(&too_long),
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    Some("surface-hash"),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                format!("token exceeds maximum length ({max_len} bytes)"),
+            ),
+            (
+                "display name",
+                hello_envelope_with_strings(
+                    Some("handshake-token"),
+                    Some(&too_long),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    Some("surface-hash"),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                format!("display name exceeds maximum length ({max_len} bytes)"),
+            ),
+            (
+                "game build",
+                hello_envelope_with_strings(
+                    Some("handshake-token"),
+                    Some("Sailor"),
+                    Some(&too_long),
+                    Some("mod-version"),
+                    Some("surface-hash"),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                format!("game build exceeds maximum length ({max_len} bytes)"),
+            ),
+            (
+                "mod version",
+                hello_envelope_with_strings(
+                    Some("handshake-token"),
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some(&too_long),
+                    Some("surface-hash"),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                format!("mod version exceeds maximum length ({max_len} bytes)"),
+            ),
+            (
+                "API surface hash",
+                hello_envelope_with_strings(
+                    Some("handshake-token"),
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    Some(&too_long),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                format!("API surface hash exceeds maximum length ({max_len} bytes)"),
+            ),
+        ];
+
+        for (field, bytes, expected_reason) in cases {
+            let mut server = make_server();
+            let (client, peer) = connect_peer(&mut server);
+
+            deliver_hello(&mut server, peer, &bytes);
+
+            assert!(
+                !server.sessions.contains_key(&peer),
+                "over-long {field} created a session"
+            );
+            assert!(
+                server.db.player(1).unwrap().is_none(),
+                "over-long {field} persisted a player"
+            );
+            assert_eq!(receive_server_hello(&client), (false, expected_reason));
+        }
+    }
+
+    #[test]
+    fn token_and_api_hash_are_required_while_other_hello_strings_remain_optional() {
+        let required_cases = [
+            (
+                "missing token",
+                hello_envelope_with_strings(
+                    None,
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    Some("surface-hash"),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                "missing token",
+            ),
+            (
+                "empty token",
+                hello_envelope_with_strings(
+                    Some(""),
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    Some("surface-hash"),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                "missing token",
+            ),
+            (
+                "missing API surface hash",
+                hello_envelope_with_strings(
+                    Some("handshake-token"),
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    None,
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                "missing API surface hash",
+            ),
+            (
+                "empty API surface hash",
+                hello_envelope_with_strings(
+                    Some("handshake-token"),
+                    Some("Sailor"),
+                    Some("game-build"),
+                    Some("mod-version"),
+                    Some(""),
+                    sw_contracts::PROTOCOL_VERSION,
+                ),
+                "missing API surface hash",
+            ),
+        ];
+
+        for (case, bytes, expected_reason) in required_cases {
+            let mut server = make_server();
+            let (client, peer) = connect_peer(&mut server);
+
+            deliver_hello(&mut server, peer, &bytes);
+
+            assert!(
+                !server.sessions.contains_key(&peer),
+                "{case} created a session"
+            );
+            assert!(
+                server.db.player(1).unwrap().is_none(),
+                "{case} persisted a player"
+            );
+            assert_eq!(
+                receive_server_hello(&client),
+                (false, expected_reason.to_string())
+            );
+        }
+
+        for (display_name, game_build, mod_version, expected_name) in [
+            (None, None, None, "sailor"),
+            (Some(""), Some(""), Some(""), ""),
+        ] {
+            let mut server = make_server();
+            let bytes = hello_envelope_with_strings(
+                Some("handshake-token"),
+                display_name,
+                game_build,
+                mod_version,
+                Some("surface-hash"),
+                sw_contracts::PROTOCOL_VERSION,
+            );
+
+            deliver_hello(&mut server, 1, &bytes);
+
+            assert_eq!(server.sessions[&1].display_name, expected_name);
+        }
+    }
+
+    #[test]
     fn valid_protocol_and_api_surface_hash_create_session() {
         let mut server = make_server();
         let bytes = hello_envelope(
@@ -1204,6 +1438,64 @@ mod handshake_tests {
         deliver_hello(&mut server, 1, &bytes);
 
         assert!(server.sessions.contains_key(&1));
+    }
+
+    #[test]
+    fn near_limit_display_name_and_chat_cannot_emit_an_oversized_datagram() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let max_len = server.cfg.max_wire_string_len_usize();
+        let display_name = "n".repeat(max_len);
+        let text = "t".repeat(max_len);
+        let hello = hello_envelope_with_strings(
+            Some("handshake-token"),
+            Some(&display_name),
+            Some("game-build"),
+            Some("mod-version"),
+            Some("surface-hash"),
+            sw_contracts::PROTOCOL_VERSION,
+        );
+        deliver_hello(&mut server, peer, &hello);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        loop {
+            let mut join_update = [0u8; sw_net::protocol::MTU];
+            match client.recv(&mut join_update) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("failed to drain join update: {error}"),
+            }
+        }
+
+        let encoded = codec::chat_broadcast(2, 1, &display_name, &text, 0, 1_000);
+        assert!(
+            encoded.len() > sw_net::protocol::MTU - sw_net::protocol::HEADER_SIZE,
+            "the regression input must exceed the fixed unfragmented payload"
+        );
+
+        let mut fbb = FlatBufferBuilder::new();
+        let text = fbb.create_string(&text);
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text),
+                channel: 0,
+            },
+        );
+        let bytes = finish_envelope(&mut fbb, 2, p::Payload::ChatSend, chat.as_union_value());
+        let env = decode_envelope(&bytes).unwrap();
+        server.on_chat(peer, env.payload_as_chat_send().unwrap(), 1_000);
+
+        assert_no_outbound_datagram(&client);
     }
 
     #[test]

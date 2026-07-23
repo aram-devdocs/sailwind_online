@@ -300,12 +300,12 @@ namespace Sailwind.Online.Client.Net
             return _seq;
         }
 
-        private void SendHello()
+        private bool SendHello()
         {
             ConnectOptions? options = _options;
             if (options == null)
             {
-                return;
+                return false;
             }
 
             byte[] bytes = _codec.EncodeClientHello(
@@ -317,8 +317,14 @@ namespace Sailwind.Online.Client.Net
                 options.ModVersion,
                 options.ApiSurfaceHash);
 
-            SendRaw(bytes);
+            if (!SendRaw(bytes))
+            {
+                EndHandshakeAttempt();
+                return false;
+            }
+
             _lastHelloMs = NowMs;
+            return true;
         }
 
         private bool SendRaw(byte[] bytes)
@@ -348,8 +354,10 @@ namespace Sailwind.Online.Client.Net
             }
 
             _status = ConnectionStatus.Handshaking;
-            SendHello();
-            _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
+            if (SendHello())
+            {
+                _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
+            }
         }
 
         private void OnPeerDisconnected(string reason)
@@ -585,11 +593,16 @@ namespace Sailwind.Online.Client.Net
 
         private void RejectHandshake(string warning)
         {
+            EndHandshakeAttempt();
+            _log.LogWarning(warning);
+        }
+
+        private void EndHandshakeAttempt()
+        {
             _status = ConnectionStatus.Disconnected;
             ResetPositionObservability();
             ScheduleReconnect();
             _transport.DropPeer();
-            _log.LogWarning(warning);
         }
 
         public static string FormatTimeOfDay(float fractionOfDay)

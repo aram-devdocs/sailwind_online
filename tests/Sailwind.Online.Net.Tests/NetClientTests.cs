@@ -548,6 +548,57 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
+        public void ClientHello_WhenPacketCannotBeSent_DropsPeerAndReconnectsAfterBackoff()
+        {
+            var options = new ConnectOptions
+            {
+                Host = "test-host",
+                Port = 4242,
+                DisplayName = new string('x', NetClient.Mtu),
+                Token = "tok",
+                GameBuild = "build",
+                ModVersion = "0.1.0",
+                ApiSurfaceHash = "hash"
+            };
+            var transport = new MockTransport();
+            var log = new RecordingLog();
+            long now = 0;
+            var net = new NetClient(log, transport, () => now);
+            net.Connect(options);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.False(transport.IsPeerConnected);
+            Assert.Empty(transport.Sent);
+            int warningsAfterFailedSend = log.Warnings.Count;
+            Assert.True(warningsAfterFailedSend > 0);
+            Assert.DoesNotContain(log.Warnings, message => message.Contains(options.Token));
+
+            now = NetClient.HelloRetryMs;
+            net.Poll();
+            Assert.Equal(warningsAfterFailedSend, log.Warnings.Count);
+            Assert.Equal(1, transport.ConnectCalls);
+
+            options.DisplayName = "Ari";
+            now = NetClient.DefaultReconnectMs - 1;
+            net.Poll();
+            Assert.Equal(1, transport.ConnectCalls);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            Assert.Equal(ConnectionStatus.Connecting, net.Status);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            Assert.Single(transport.Sent);
+            Assert.Equal("Ari", Decode(transport.Sent[0]).PayloadAsClientHello().DisplayName);
+        }
+
+        [Fact]
         public void Disconnect_ReconnectsWithExponentialBackoff()
         {
             var transport = new MockTransport();
