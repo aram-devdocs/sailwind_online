@@ -47,6 +47,17 @@ namespace Sailwind.Online.Client.Net
             }
         }
 
+        public int MaxUnreliablePayloadSize
+        {
+            get
+            {
+                NetPeer? peer = _peer.Value;
+                return peer != null
+                    ? peer.GetMaxSinglePacketSize(DeliveryMethod.Unreliable)
+                    : 0;
+            }
+        }
+
         public int Ping
         {
             get

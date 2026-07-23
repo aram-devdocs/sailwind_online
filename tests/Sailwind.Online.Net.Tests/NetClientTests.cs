@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
 using Google.FlatBuffers;
+using LiteNetLib;
 using Sailwind.Api;
 using Sailwind.Online.Client.Net;
 using SwProto;
@@ -548,23 +549,13 @@ namespace Sailwind.Online.Net.Tests
         }
 
         [Fact]
-        public void ClientHello_WhenPacketCannotBeSent_DropsPeerAndReconnectsAfterBackoff()
+        public void ClientHello_WhenPacketExceedsTransportCapacity_DropsPeerAndReconnectsAfterBackoff()
         {
-            var options = new ConnectOptions
-            {
-                Host = "test-host",
-                Port = 4242,
-                DisplayName = new string('x', NetClient.Mtu),
-                Token = "tok",
-                GameBuild = "build",
-                ModVersion = "0.1.0",
-                ApiSurfaceHash = "hash"
-            };
-            var transport = new MockTransport();
+            var transport = new MockTransport { MaxUnreliablePayloadSize = 1 };
             var log = new RecordingLog();
             long now = 0;
             var net = new NetClient(log, transport, () => now);
-            net.Connect(options);
+            net.Connect(Options);
 
             transport.RaisePeerConnected();
 
@@ -574,14 +565,14 @@ namespace Sailwind.Online.Net.Tests
             Assert.Empty(transport.Sent);
             int warningsAfterFailedSend = log.Warnings.Count;
             Assert.True(warningsAfterFailedSend > 0);
-            Assert.DoesNotContain(log.Warnings, message => message.Contains(options.Token));
+            Assert.DoesNotContain(log.Warnings, message => message.Contains(Options.Token));
 
             now = NetClient.HelloRetryMs;
             net.Poll();
             Assert.Equal(warningsAfterFailedSend, log.Warnings.Count);
             Assert.Equal(1, transport.ConnectCalls);
 
-            options.DisplayName = "Ari";
+            transport.MaxUnreliablePayloadSize = NetClient.Mtu - 1;
             now = NetClient.DefaultReconnectMs - 1;
             net.Poll();
             Assert.Equal(1, transport.ConnectCalls);
@@ -595,7 +586,49 @@ namespace Sailwind.Online.Net.Tests
 
             Assert.Equal(ConnectionStatus.Handshaking, net.Status);
             Assert.Single(transport.Sent);
-            Assert.Equal("Ari", Decode(transport.Sent[0]).PayloadAsClientHello().DisplayName);
+            Assert.Equal(Options.DisplayName, Decode(transport.Sent[0]).PayloadAsClientHello().DisplayName);
+        }
+
+        [Fact]
+        public void ClientHello_WhenTransportRejectsPacketAsTooBig_DropsAndRecoversAfterBackoff()
+        {
+            var transport = new MockTransport();
+            transport.SendFailures.Enqueue(new TooBigPacketException("first boundary failure"));
+            transport.SendFailures.Enqueue(new TooBigPacketException("second boundary failure"));
+            var log = new RecordingLog();
+            long now = 0;
+            var net = new NetClient(log, transport, () => now);
+            net.Connect(Options);
+
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.Equal(1, transport.DropPeerCalls);
+            Assert.Empty(transport.Sent);
+
+            now = NetClient.DefaultReconnectMs;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Disconnected, net.Status);
+            Assert.Equal(2, transport.DropPeerCalls);
+            Assert.Empty(transport.Sent);
+
+            now = NetClient.DefaultReconnectMs + (2 * NetClient.DefaultReconnectMs) - 1;
+            net.Poll();
+            Assert.Equal(2, transport.ConnectCalls);
+
+            now++;
+            net.Poll();
+            Assert.Equal(3, transport.ConnectCalls);
+            transport.RaisePeerConnected();
+
+            Assert.Equal(ConnectionStatus.Handshaking, net.Status);
+            Assert.Single(transport.Sent);
+            Assert.Equal(2, log.Warnings.Count);
+            Assert.All(log.Warnings, message => Assert.Contains("oversized packet", message));
+            Assert.DoesNotContain(log.Warnings, message => message.Contains(Options.Token));
         }
 
         [Fact]

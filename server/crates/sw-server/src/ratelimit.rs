@@ -73,6 +73,12 @@ impl RateLimiter {
     pub fn tracked_count(&self) -> usize {
         self.last.len()
     }
+
+    /// Last admitted monotonic timestamp for a key.
+    #[cfg(test)]
+    pub fn last_accepted_ms(&self, key: u64) -> Option<i64> {
+        self.last.get(&key).copied()
+    }
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ namespace Sailwind.Online.Net.Tests
         /// <summary>Every datagram NetClient handed to <see cref="Send"/>, in order.</summary>
         public readonly List<byte[]> Sent = new List<byte[]>();
 
+        /// <summary>Queued send failures, consumed before a datagram is recorded.</summary>
+        public readonly Queue<Exception> SendFailures = new Queue<Exception>();
+
         private bool _running;
         private bool _hasPeer;
         private bool _peerConnected;
@@ -48,6 +51,8 @@ namespace Sailwind.Online.Net.Tests
         public bool IsRunning => _running;
 
         public bool IsPeerConnected => _peerConnected;
+
+        public int MaxUnreliablePayloadSize { get; set; } = NetClient.Mtu - 1;
 
         public int Ping { get; set; } = -1;
 
@@ -98,6 +103,11 @@ namespace Sailwind.Online.Net.Tests
 
         public void Send(byte[] data, DeliveryMethod deliveryMethod)
         {
+            if (SendFailures.Count > 0)
+            {
+                throw SendFailures.Dequeue();
+            }
+
             Sent.Add(data);
         }
 

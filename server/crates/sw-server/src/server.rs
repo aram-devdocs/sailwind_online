@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sw_contracts::decode_envelope;
 use sw_contracts::sw_proto as p;
 use sw_econ::{Ledger, Market, MarketAck, Trade, Txn};
-use sw_net::{DisconnectReason, Event, Host, PeerId};
+use sw_net::{protocol, DisconnectReason, Event, Host, PeerId};
 use sw_persist::{Db, MooringRow};
 use sw_world::{AoiUpdate, Cell, Subscription, World};
 
@@ -183,6 +183,16 @@ impl Server {
     }
 
     fn handle_data(&mut self, peer: PeerId, bytes: &[u8]) -> anyhow::Result<()> {
+        self.handle_data_at(peer, bytes, self.admission_ms(), now_ms())
+    }
+
+    fn handle_data_at(
+        &mut self,
+        peer: PeerId,
+        bytes: &[u8],
+        admission_ms: i64,
+        persistence_ms: i64,
+    ) -> anyhow::Result<()> {
         // Verified decode: hostile/garbage datagrams are simply dropped.
         let Ok(env) = decode_envelope(bytes) else {
             return Ok(());
@@ -190,32 +200,32 @@ impl Server {
         match env.payload_type() {
             p::Payload::ClientHello => {
                 if let Some(h) = env.payload_as_client_hello() {
-                    self.on_hello(peer, h)?;
+                    self.on_hello_at(peer, h, admission_ms, persistence_ms)?;
                 }
             }
             p::Payload::ClientState => {
                 if let Some(cs) = env.payload_as_client_state() {
-                    self.on_client_state(peer, cs, now_ms());
+                    self.on_client_state(peer, cs, admission_ms);
                 }
             }
             p::Payload::EconTxn => {
                 if let Some(t) = env.payload_as_econ_txn() {
-                    self.on_econ(peer, t, now_ms())?;
+                    self.on_econ(peer, t, admission_ms, persistence_ms)?;
                 }
             }
             p::Payload::MarketTradeRequest => {
                 if let Some(r) = env.payload_as_market_trade_request() {
-                    self.on_trade(peer, r, now_ms())?;
+                    self.on_trade(peer, r, admission_ms, persistence_ms)?;
                 }
             }
             p::Payload::MoorRequest => {
                 if let Some(m) = env.payload_as_moor_request() {
-                    self.on_moor(peer, m, now_ms())?;
+                    self.on_moor(peer, m, admission_ms, persistence_ms)?;
                 }
             }
             p::Payload::ChatSend => {
                 if let Some(c) = env.payload_as_chat_send() {
-                    self.on_chat(peer, c, now_ms());
+                    self.on_chat(peer, c, admission_ms);
                 }
             }
             _ => {}
@@ -223,8 +233,9 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(test)]
     fn on_hello(&mut self, peer: PeerId, hello: p::ClientHello<'_>) -> anyhow::Result<()> {
-        self.on_hello_at(peer, hello, self.hello_admission_ms(), now_ms())
+        self.on_hello_at(peer, hello, self.admission_ms(), now_ms())
     }
 
     fn on_hello_at(
@@ -463,7 +474,13 @@ impl Server {
         }
     }
 
-    fn on_econ(&mut self, peer: PeerId, txn: p::EconTxn<'_>, now_ms: i64) -> anyhow::Result<()> {
+    fn on_econ(
+        &mut self,
+        peer: PeerId,
+        txn: p::EconTxn<'_>,
+        admission_ms: i64,
+        persistence_ms: i64,
+    ) -> anyhow::Result<()> {
         let Some(player_id) = self.sessions.get(&peer).map(|s| s.player_id) else {
             return Ok(());
         };
@@ -482,7 +499,7 @@ impl Server {
         // charged against the aggregate per-player econ throttle.
         let txn_id = txn.txn_id();
         let already_applied = self.db.lookup_txn(txn_id as i64)?.is_some();
-        if !already_applied && !self.econ_limiter.allow(player_id, now_ms) {
+        if !already_applied && !self.econ_limiter.allow(player_id, admission_ms) {
             tracing::debug!(player_id, txn_id, "econ txn rate limited");
             return Ok(());
         }
@@ -495,7 +512,7 @@ impl Server {
         };
 
         let ack = {
-            let mut ledger = Ledger::new(DbLedgerStore::new(&self.db, now_ms));
+            let mut ledger = Ledger::new(DbLedgerStore::new(&self.db, persistence_ms));
             ledger.apply(player_id, &txn)?
         };
         tracing::debug!(
@@ -518,7 +535,8 @@ impl Server {
         &mut self,
         peer: PeerId,
         req: p::MarketTradeRequest<'_>,
-        now_ms: i64,
+        admission_ms: i64,
+        persistence_ms: i64,
     ) -> anyhow::Result<()> {
         let Some(player_id) = self.sessions.get(&peer).map(|s| s.player_id) else {
             return Ok(());
@@ -538,7 +556,7 @@ impl Server {
         // attacker-supplied `port_id` never opens a fresh bucket, so rotating it
         // cannot raise a player's trade throughput.
         let already_applied = self.db.lookup_trade(trade.txn_id)?.is_some();
-        if !already_applied && !self.trade_limiter.allow(player_id, now_ms) {
+        if !already_applied && !self.trade_limiter.allow(player_id, admission_ms) {
             let (stock, price) = self
                 .db
                 .market_state(trade.port_id, trade.item_id)?
@@ -559,7 +577,7 @@ impl Server {
         }
 
         let ack = {
-            let mut market = Market::new(DbMarketStore::new(&self.db, now_ms));
+            let mut market = Market::new(DbMarketStore::new(&self.db, persistence_ms));
             market.apply(&trade)?
         };
         tracing::debug!(
@@ -582,7 +600,8 @@ impl Server {
         &mut self,
         peer: PeerId,
         req: p::MoorRequest<'_>,
-        now_ms: i64,
+        admission_ms: i64,
+        persistence_ms: i64,
     ) -> anyhow::Result<()> {
         let Some((owner, aboard)) = self
             .sessions
@@ -615,13 +634,13 @@ impl Server {
         // class). Reject a new moor beyond the configured rate BEFORE the write,
         // keyed by player so it is rotation-proof and memory-bounded exactly like
         // the trade/econ/chat limiters.
-        if !self.moor_limiter.allow(owner, now_ms) {
+        if !self.moor_limiter.allow(owner, admission_ms) {
             tracing::debug!(owner, "moor request rate limited");
             return Ok(());
         }
 
         let cell = self.world.grid().cell_of(pos[0], pos[2]);
-        let created = now_ms;
+        let created = persistence_ms;
 
         let row = MooringRow {
             boat_id: boat_id as i64,
@@ -684,6 +703,11 @@ impl Server {
         let text = text.to_string();
         let channel = chat.channel();
         let t_ms = self.uptime_ms();
+        let bytes =
+            codec::chat_broadcast(self.next_seq(), sender_player, &name, &text, channel, t_ms);
+        if bytes.len() > protocol::MTU - protocol::HEADER_SIZE {
+            return;
+        }
 
         // Deliver to every session whose AoI currently includes the sender's cell.
         let recipients: Vec<PeerId> = self
@@ -694,8 +718,6 @@ impl Server {
             .collect();
 
         for target in recipients {
-            let bytes =
-                codec::chat_broadcast(self.next_seq(), sender_player, &name, &text, channel, t_ms);
             self.send(target, &bytes);
         }
     }
@@ -846,7 +868,7 @@ impl Server {
         self.boot.elapsed().as_millis() as u32
     }
 
-    fn hello_admission_ms(&self) -> i64 {
+    fn admission_ms(&self) -> i64 {
         self.boot.elapsed().as_millis().min(i64::MAX as u128) as i64
     }
 
@@ -1444,6 +1466,7 @@ mod handshake_tests {
     fn near_limit_display_name_and_chat_cannot_emit_an_oversized_datagram() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
+        let (observer, observer_peer) = connect_peer(&mut server);
         let max_len = server.cfg.max_wire_string_len_usize();
         let display_name = "n".repeat(max_len);
         let text = "t".repeat(max_len);
@@ -1457,22 +1480,37 @@ mod handshake_tests {
         );
         deliver_hello(&mut server, peer, &hello);
         assert_eq!(receive_server_hello(&client), (true, String::new()));
+        let observer_hello = hello_envelope_with_strings(
+            Some("observer-token"),
+            Some("Observer"),
+            Some("game-build"),
+            Some("mod-version"),
+            Some("surface-hash"),
+            sw_contracts::PROTOCOL_VERSION,
+        );
+        deliver_hello(&mut server, observer_peer, &observer_hello);
+        assert_eq!(receive_server_hello(&observer), (true, String::new()));
         client
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        loop {
-            let mut join_update = [0u8; sw_net::protocol::MTU];
-            match client.recv(&mut join_update) {
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
+        for socket in [&client, &observer] {
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            loop {
+                let mut join_update = [0u8; sw_net::protocol::MTU];
+                match socket.recv(&mut join_update) {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("failed to drain join update: {error}"),
                 }
-                Err(error) => panic!("failed to drain join update: {error}"),
             }
         }
 
@@ -1493,9 +1531,16 @@ mod handshake_tests {
         );
         let bytes = finish_envelope(&mut fbb, 2, p::Payload::ChatSend, chat.as_union_value());
         let env = decode_envelope(&bytes).unwrap();
+        let seq_before_chat = server.seq;
         server.on_chat(peer, env.payload_as_chat_send().unwrap(), 1_000);
 
+        assert_eq!(
+            server.seq,
+            seq_before_chat.wrapping_add(1),
+            "one invalid broadcast must be rejected once, not encoded once per recipient"
+        );
         assert_no_outbound_datagram(&client);
+        assert_no_outbound_datagram(&observer);
     }
 
     #[test]
@@ -2003,7 +2048,12 @@ mod market_dispatch_tests {
         let bytes = trade_envelope(txn_id, port, item, qty, price);
         let env = decode_envelope(&bytes).unwrap();
         server
-            .on_trade(peer, env.payload_as_market_trade_request().unwrap(), now_ms)
+            .on_trade(
+                peer,
+                env.payload_as_market_trade_request().unwrap(),
+                now_ms,
+                now_ms,
+            )
             .unwrap();
     }
 
@@ -2235,7 +2285,7 @@ mod input_hardening_tests {
     fn send_econ(server: &mut Server, peer: PeerId, env_bytes: &[u8], now_ms: i64) {
         let env = decode_envelope(env_bytes).unwrap();
         server
-            .on_econ(peer, env.payload_as_econ_txn().unwrap(), now_ms)
+            .on_econ(peer, env.payload_as_econ_txn().unwrap(), now_ms, now_ms)
             .unwrap();
     }
 
@@ -2258,8 +2308,122 @@ mod input_hardening_tests {
     fn send_moor(server: &mut Server, peer: PeerId, env_bytes: &[u8], now_ms: i64) {
         let env = decode_envelope(env_bytes).unwrap();
         server
-            .on_moor(peer, env.payload_as_moor_request().unwrap(), now_ms)
+            .on_moor(peer, env.payload_as_moor_request().unwrap(), now_ms, now_ms)
             .unwrap();
+    }
+
+    fn trade_envelope(txn_id: u64, qty: i64) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let req = p::MarketTradeRequest::create(
+            &mut fbb,
+            &p::MarketTradeRequestArgs {
+                txn_id,
+                port_id: 10,
+                item_id: 5,
+                qty,
+                unit_price: 100,
+            },
+        );
+        finish_envelope(
+            &mut fbb,
+            7,
+            p::Payload::MarketTradeRequest,
+            req.as_union_value(),
+        )
+    }
+
+    fn chat_envelope(text: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let text_off = fbb.create_string(text);
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text_off),
+                channel: 0,
+            },
+        );
+        finish_envelope(&mut fbb, 5, p::Payload::ChatSend, chat.as_union_value())
+    }
+
+    #[test]
+    fn backward_wall_clock_does_not_wedge_any_message_rate_limiter() {
+        let mut server = make_server(Config {
+            client_state_min_interval_ms: 250,
+            chat_min_interval_ms: 250,
+            econ_min_interval_ms: 250,
+            trade_min_interval_ms: 250,
+            moor_min_interval_ms: 250,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        let player_id = join(&mut server, peer, "tok-clock-liveness");
+
+        let first_admission_ms = 1_000;
+        let next_admission_ms = 1_250;
+        let first_epoch_ms = 2_000;
+        let corrected_epoch_ms = 500;
+
+        for (bytes, admission_ms, epoch_ms) in [
+            (
+                motion_envelope(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                first_admission_ms,
+                first_epoch_ms,
+            ),
+            (
+                motion_envelope(2.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                next_admission_ms,
+                corrected_epoch_ms,
+            ),
+            (chat_envelope("first"), first_admission_ms, first_epoch_ms),
+            (
+                chat_envelope("second"),
+                next_admission_ms,
+                corrected_epoch_ms,
+            ),
+            (
+                econ_envelope(1, 100, "first"),
+                first_admission_ms,
+                first_epoch_ms,
+            ),
+            (
+                econ_envelope(2, 50, "second"),
+                next_admission_ms,
+                corrected_epoch_ms,
+            ),
+            (trade_envelope(11, 10), first_admission_ms, first_epoch_ms),
+            (trade_envelope(12, 5), next_admission_ms, corrected_epoch_ms),
+            (
+                moor_envelope(0.0, 0.0, "first"),
+                first_admission_ms,
+                first_epoch_ms,
+            ),
+            (
+                moor_envelope(0.0, 0.0, "second"),
+                next_admission_ms,
+                corrected_epoch_ms,
+            ),
+        ] {
+            server
+                .handle_data_at(peer, &bytes, admission_ms, epoch_ms)
+                .unwrap();
+        }
+
+        assert_eq!(server.sessions[&peer].pos[0], 2.0);
+        assert_eq!(server.db.player_balance(player_id as i64).unwrap(), 150);
+        assert_eq!(server.db.market_state(10, 5).unwrap(), Some((15, 100)));
+        for admitted_at in [
+            server.client_state_limiter.last_accepted_ms(player_id),
+            server.chat_limiter.last_accepted_ms(player_id),
+            server.econ_limiter.last_accepted_ms(player_id),
+            server.trade_limiter.last_accepted_ms(player_id),
+            server.moor_limiter.last_accepted_ms(player_id),
+        ] {
+            assert_eq!(admitted_at, Some(next_admission_ms));
+        }
+        let cell = server.world.grid().cell_of(0.0, 0.0);
+        let moorings = server.db.moorings_in_cell(cell.cx, cell.cz).unwrap();
+        assert_eq!(moorings[0].name, "second");
+        assert_eq!(moorings[0].created_at, first_epoch_ms);
     }
 
     // ---- PART 1a: per-message input validation ----
@@ -2508,16 +2672,7 @@ mod input_hardening_tests {
     }
 
     fn send_chat(server: &mut Server, peer: PeerId, text: &str, now_ms: i64) {
-        let mut fbb = FlatBufferBuilder::new();
-        let text_off = fbb.create_string(text);
-        let chat = p::ChatSend::create(
-            &mut fbb,
-            &p::ChatSendArgs {
-                text: Some(text_off),
-                channel: 0,
-            },
-        );
-        let bytes = finish_envelope(&mut fbb, 5, p::Payload::ChatSend, chat.as_union_value());
+        let bytes = chat_envelope(text);
         let env = decode_envelope(&bytes).unwrap();
         server.on_chat(peer, env.payload_as_chat_send().unwrap(), now_ms);
     }

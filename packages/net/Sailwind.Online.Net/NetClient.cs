@@ -334,14 +334,31 @@ namespace Sailwind.Online.Client.Net
                 return false;
             }
 
-            if (bytes.Length > Mtu)
+            int maxPayloadSize = _transport.MaxUnreliablePayloadSize;
+            if (maxPayloadSize <= 0 || bytes.Length > maxPayloadSize)
             {
-                _log.LogWarning("[Sailwind.Online] Dropping oversized packet (" + bytes.Length + " > " + Mtu + " bytes).");
+                LogOversizedPacket(bytes.Length, maxPayloadSize);
                 return false;
             }
 
-            _transport.Send(bytes, DeliveryMethod.Unreliable);
+            try
+            {
+                _transport.Send(bytes, DeliveryMethod.Unreliable);
+            }
+            catch (TooBigPacketException)
+            {
+                LogOversizedPacket(bytes.Length, maxPayloadSize);
+                return false;
+            }
+
             return true;
+        }
+
+        private void LogOversizedPacket(int packetSize, int maxPayloadSize)
+        {
+            _log.LogWarning(
+                "[Sailwind.Online] Dropping oversized packet (" + packetSize +
+                " bytes; current unreliable capacity " + maxPayloadSize + " payload bytes).");
         }
 
         private void OnPeerConnected()
