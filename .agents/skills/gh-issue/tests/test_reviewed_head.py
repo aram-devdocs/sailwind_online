@@ -1,12 +1,18 @@
+import importlib.util
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "gh_issue_run.py"
+SPEC = importlib.util.spec_from_file_location("gh_issue_run", SCRIPT)
+gh_issue_run = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(gh_issue_run)
 
 
 class ReviewedHeadTests(unittest.TestCase):
@@ -174,6 +180,45 @@ class ReviewedHeadTests(unittest.TestCase):
         self.assertEqual(resume.returncode, 0, resume.stderr)
         self.assertIn("resume the /work gated merge", resume.stdout)
         self.assertNotIn("recreate it", resume.stdout)
+
+    def test_cleanup_failure_keeps_run_non_done_and_active(self):
+        (self.runs_dir / "active").write_text(
+            self.run_id + "\n",
+            encoding="utf-8",
+        )
+        worktree = (
+            self.runs_dir
+            / ".worktrees"
+            / self.run_id
+        )
+        worktree.mkdir(parents=True)
+        args = SimpleNamespace(
+            runs_dir=str(self.runs_dir),
+            run_id=self.run_id,
+            no_git=False,
+        )
+
+        with (
+            mock.patch.object(
+                gh_issue_run,
+                "repo_root",
+                return_value=self.runs_dir,
+            ),
+            mock.patch.object(
+                gh_issue_run,
+                "run_cmd",
+                return_value=(1, "", "worktree is locked"),
+            ),
+            self.assertRaisesRegex(SystemExit, "worktree removal failed"),
+        ):
+            gh_issue_run.cmd_cleanup_worktree(args)
+
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "review")
+        self.assertEqual(
+            (self.runs_dir / "active").read_text(encoding="utf-8"),
+            self.run_id + "\n",
+        )
 
 
 if __name__ == "__main__":

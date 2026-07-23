@@ -54,7 +54,9 @@ condition, recorded through the state machine, before the next begins.
   three-attempt cap. Exit: CI is green.
 - **cleanup** `gh_issue_run.py cleanup-worktree` removes the worktree, sets
   `phase=done`, and retains the active marker for `/work`. Exit: worktree gone,
-  phase done, merge handoff remains discoverable.
+  phase done, merge handoff remains discoverable. If worktree removal fails,
+  stop with the prior phase and active marker intact, because a Windows file
+  lock must remain retryable rather than becoming a false `done`.
 - **done** Terminal for `/gh-issue`. The run reports and stops. It does NOT
   merge its own PR or clear the handoff that `/work` must resume.
 

@@ -165,13 +165,17 @@ exact head to `gh pr merge --match-head-commit` only when the final check read
 still passes, uses squash merge, and requests remote branch deletion. It then
 confirms the PR is `MERGED` and polls the linked issue for bounded closure
 confirmation. Every `gh` call has a fixed timeout and fails closed with the
-command purpose.
+command purpose. It then independently queries the recorded remote feature ref.
+An absent ref succeeds; a ref still at the reviewed head is deleted and queried
+again. A ref that moved to any other commit is never deleted.
 
 The merge command is retry-safe. If GitHub accepted the squash merge but a
 confirmation call failed or issue closure was delayed, rerun the same command.
 It accepts only the exact recorded PR, branch, issue link, reviewed head, and
 required checks; when that PR is already `MERGED`, it skips the merge call,
-finishes bounded confirmation, and clears the active handoff.
+finishes bounded confirmation, repairs or confirms remote branch deletion, and
+clears the active handoff. Any branch lookup, deletion, or verification failure
+keeps the handoff active for another safe retry.
 
 If the command prints `STOP`, report its exact precondition failure and stop
 without merging or selecting another issue. If it prints `ERROR`, report the

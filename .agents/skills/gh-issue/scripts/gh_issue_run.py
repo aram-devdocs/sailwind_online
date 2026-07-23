@@ -630,7 +630,10 @@ def cmd_cleanup_worktree(args):
         if rc == 0:
             print(f"removed worktree {worktree}")
         else:
-            print(f"warning: worktree remove failed (rc={rc}): {err or out}")
+            raise SystemExit(
+                f"error: worktree removal failed (rc={rc}): {err or out}; "
+                "run remains active and non-done for cleanup retry"
+            )
     else:
         print(f"worktree {worktree} already absent")
 

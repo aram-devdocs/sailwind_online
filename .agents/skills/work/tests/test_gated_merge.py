@@ -132,6 +132,48 @@ class GatedMergeTests(unittest.TestCase):
             }
         }
 
+    def branch_lookup_command(self):
+        return [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={gated_merge.BRANCH_QUERY}",
+            "-F",
+            "owner=aram-devdocs",
+            "-F",
+            "name=sailwind_online",
+            "-F",
+            "qualified=refs/heads/feat/48-gated-self-merge",
+        ]
+
+    def branch_result(self, head=None):
+        ref = None
+        if head is not None:
+            ref = {
+                "name": "feat/48-gated-self-merge",
+                "target": {"oid": head},
+            }
+        return {
+            "data": {
+                "repository": {
+                    "ref": ref,
+                }
+            }
+        }
+
+    def branch_delete_command(self):
+        return [
+            "gh",
+            "api",
+            "--method",
+            "DELETE",
+            (
+                "repos/aram-devdocs/sailwind_online/git/refs/heads/"
+                "feat/48-gated-self-merge"
+            ),
+        ]
+
     def open_pr(self, **overrides):
         data = {
             "number": 52,
@@ -242,10 +284,16 @@ class GatedMergeTests(unittest.TestCase):
             ),
             self.confirmation_pr_response(),
             self.issue_response("CLOSED"),
+            (
+                self.branch_lookup_command(),
+                0,
+                self.branch_result(),
+                "",
+            ),
         ]
 
-    def merged_retry_responses(self, *issue_states):
-        return [
+    def merged_retry_responses(self, *issue_states, include_branch=True):
+        responses = [
             (
                 ["gh", "repo", "view", "--json", "nameWithOwner"],
                 0,
@@ -258,6 +306,16 @@ class GatedMergeTests(unittest.TestCase):
             self.confirmation_pr_response(),
             *(self.issue_response(state) for state in issue_states),
         ]
+        if include_branch:
+            responses.append(
+                (
+                    self.branch_lookup_command(),
+                    0,
+                    self.branch_result(),
+                    "",
+                )
+            )
+        return responses
 
     def test_merges_only_after_all_checks_and_confirms_results(self):
         runner = FakeRunner(self.success_responses())
@@ -595,7 +653,12 @@ class GatedMergeTests(unittest.TestCase):
 
     def test_closure_polling_is_bounded_and_keeps_run_resumable(self):
         runner = FakeRunner(
-            self.merged_retry_responses("OPEN", "OPEN", "OPEN")
+            self.merged_retry_responses(
+                "OPEN",
+                "OPEN",
+                "OPEN",
+                include_branch=False,
+            )
         )
         sleeps = []
 
@@ -619,6 +682,117 @@ class GatedMergeTests(unittest.TestCase):
             ],
         )
         self.assertTrue((self.runs_dir / "active").exists())
+        runner.assert_finished()
+
+    def test_retry_repairs_exact_remote_branch_after_delete_failure(self):
+        first_responses = self.success_responses()
+        first_responses[-1] = (
+            self.branch_lookup_command(),
+            0,
+            self.branch_result(self.head),
+            "",
+        )
+        first_responses.append(
+            (
+                self.branch_delete_command(),
+                1,
+                "",
+                "temporary delete failure",
+            )
+        )
+        first_runner = FakeRunner(first_responses)
+
+        with self.assertRaisesRegex(
+            gated_merge.MergeConfirmationError,
+            "remote branch deletion failed",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=first_runner,
+                confirmation_attempts=1,
+                sleeper=lambda _: None,
+            )
+        self.assertTrue((self.runs_dir / "active").exists())
+
+        retry_responses = self.merged_retry_responses("CLOSED")
+        retry_responses[-1] = (
+            self.branch_lookup_command(),
+            0,
+            self.branch_result(self.head),
+            "",
+        )
+        retry_responses.extend(
+            [
+                (self.branch_delete_command(), 0, "", ""),
+                (
+                    self.branch_lookup_command(),
+                    0,
+                    self.branch_result(),
+                    "",
+                ),
+            ]
+        )
+        retry_runner = FakeRunner(retry_responses)
+
+        result = gated_merge.merge_completed_run(
+            self.runs_dir,
+            self.run_id,
+            runner=retry_runner,
+            confirmation_attempts=1,
+            sleeper=lambda _: None,
+        )
+
+        self.assertTrue(result.merged)
+        self.assertFalse(
+            any(
+                call[:3] == ["gh", "pr", "merge"]
+                for call in retry_runner.calls
+            )
+        )
+        self.assertFalse((self.runs_dir / "active").exists())
+        retry_runner.assert_finished()
+
+    def test_moved_remote_branch_is_never_deleted(self):
+        responses = self.merged_retry_responses("CLOSED")
+        responses[-1] = (
+            self.branch_lookup_command(),
+            0,
+            self.branch_result("b" * 40),
+            "",
+        )
+        runner = FakeRunner(responses)
+
+        with self.assertRaisesRegex(
+            gated_merge.MergeConfirmationError,
+            "moved to",
+        ):
+            gated_merge.merge_completed_run(
+                self.runs_dir,
+                self.run_id,
+                runner=runner,
+                confirmation_attempts=1,
+                sleeper=lambda _: None,
+            )
+
+        self.assertNotIn(self.branch_delete_command(), runner.calls)
+        self.assertTrue((self.runs_dir / "active").exists())
+        runner.assert_finished()
+
+    def test_already_absent_remote_branch_completes_handoff(self):
+        runner = FakeRunner(self.merged_retry_responses("CLOSED"))
+
+        result = gated_merge.merge_completed_run(
+            self.runs_dir,
+            self.run_id,
+            runner=runner,
+            confirmation_attempts=1,
+            sleeper=lambda _: None,
+        )
+
+        self.assertTrue(result.merged)
+        self.assertNotIn(self.branch_delete_command(), runner.calls)
+        self.assertFalse((self.runs_dir / "active").exists())
         runner.assert_finished()
 
     def test_gh_subprocess_timeout_is_explicit_and_actionable(self):

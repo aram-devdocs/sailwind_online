@@ -79,8 +79,11 @@ the state-machine-owned reviewed head, so a commit after review requires all
 four verdicts again. Cleanup retains the active run until merge and closure are
 confirmed, so a crash resumes that handoff before issue selection. The merge
 path is retry-safe after partial success and gives every GitHub call a bounded
-timeout. It resumes from durable run state after any compaction and never starts
-a second issue in the same invocation. Full loop:
+timeout. It clears the handoff only after independently confirming remote branch
+deletion, and never deletes a branch that moved from the reviewed head.
+Worktree-removal failure stays non-done and retryable. It resumes from durable
+run state after any compaction and never starts a second issue in the same
+invocation. Full loop:
 `.agents/skills/work/SKILL.md`; delegation model:
 `.agents/skills/subagent-driven-development`.
 

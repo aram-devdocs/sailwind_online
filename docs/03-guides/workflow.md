@@ -80,7 +80,8 @@ not memory, so a run that died mid-task recovers cleanly. The full loop is in
    reports a clean merge state, and has no pending or failed required checks.
    It rereads the head before a squash merge guarded by that exact commit,
    rechecks linkage and required checks at the final mutation boundary,
-   requests remote branch deletion, then confirms both `MERGED` and `CLOSED`.
+   requests remote branch deletion, then confirms `MERGED`, `CLOSED`, and
+   independent absence of the exact recorded remote feature ref.
    Cleanup retains the active-run marker until those confirmations succeed, so
    a restart resumes this handoff before selecting another issue.
 
@@ -145,7 +146,13 @@ The confirmation path uses bounded issue-closure polling and fixed timeouts for
 every GitHub command. If confirmation fails after GitHub accepted the merge,
 the active run remains discoverable. A retry verifies the exact already-merged
 PR, reviewed head, required checks, and closing issue link, skips a second merge
-call, and finishes confirmation before clearing the active marker.
+call, and finishes confirmation before clearing the active marker. If the
+recorded remote branch remains at the reviewed head, the retry deletes and
+rechecks it. A branch moved to another commit is never deleted.
+
+Worktree cleanup reaches `done` only after removal succeeds or the worktree is
+already absent. A removal error keeps the prior phase and active marker, so a
+Windows file lock can be cleared and cleanup retried.
 
 Any mismatch prints the exact failure and stops. `/work` does not merge a
 different PR, repair state by hand, or select another issue in that invocation.

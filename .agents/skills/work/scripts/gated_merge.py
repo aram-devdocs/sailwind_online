@@ -27,6 +27,11 @@ CLOSURE_QUERY = (
     "closingIssuesReferences(first:100){nodes{number "
     "repository{nameWithOwner}}}}}}"
 )
+BRANCH_QUERY = (
+    "query($owner:String!,$name:String!,$qualified:String!){"
+    "repository(owner:$owner,name:$name){ref(qualifiedName:$qualified){"
+    "name target{oid}}}}"
+)
 RUN_ID_RE = re.compile(r"(?P<issue>[1-9][0-9]*)-[a-z0-9]+(?:-[a-z0-9]+)*")
 HEAD_OID_RE = re.compile(r"[0-9a-fA-F]{40}")
 GH_TIMEOUT_SECONDS = 30
@@ -436,6 +441,98 @@ def confirm_merged(
     )
 
 
+def remote_branch_lookup(runner, repo, branch):
+    """Return the exact remote ref target, or None when the ref is absent."""
+    owner, name = repo.split("/", 1)
+    command = [
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={BRANCH_QUERY}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"qualified=refs/heads/{branch}",
+    ]
+    result = runner(command)
+    response = read_json_result(
+        result,
+        f"remote branch {branch!r} lookup",
+        MergeConfirmationError,
+    )
+    if not isinstance(response, dict):
+        raise MergeConfirmationError(
+            f"remote branch {branch!r} lookup returned a non-object"
+        )
+    if response.get("errors"):
+        raise MergeConfirmationError(
+            f"remote branch {branch!r} lookup returned GraphQL errors: "
+            f"{response['errors']!r}"
+        )
+    try:
+        ref = response["data"]["repository"]["ref"]
+    except (KeyError, TypeError) as exc:
+        raise MergeConfirmationError(
+            f"remote branch {branch!r} lookup returned an unexpected "
+            "GraphQL shape"
+        ) from exc
+    if ref is None:
+        return None
+    if not isinstance(ref, dict) or ref.get("name") != branch:
+        raise MergeConfirmationError(
+            f"remote branch lookup returned the wrong ref: {ref!r}"
+        )
+    target = ref.get("target")
+    oid = target.get("oid") if isinstance(target, dict) else None
+    if not isinstance(oid, str) or not HEAD_OID_RE.fullmatch(oid):
+        raise MergeConfirmationError(
+            f"remote branch {branch!r} returned invalid target {oid!r}"
+        )
+    return oid.lower()
+
+
+def ensure_remote_branch_deleted(runner, repo, branch, expected_head):
+    """Delete only the expected feature ref, then independently verify absence."""
+    target = remote_branch_lookup(runner, repo, branch)
+    if target is None:
+        return
+    if target != expected_head.lower():
+        raise MergeConfirmationError(
+            f"remote branch {branch!r} moved to {target}; expected "
+            f"{expected_head}, so it was not deleted"
+        )
+
+    delete_command = [
+        "gh",
+        "api",
+        "--method",
+        "DELETE",
+        f"repos/{repo}/git/refs/heads/{branch}",
+    ]
+    result = runner(delete_command)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise MergeConfirmationError(
+            f"remote branch deletion failed for {branch!r}: {detail}"
+        )
+
+    remaining = remote_branch_lookup(runner, repo, branch)
+    if remaining is None:
+        return
+    if remaining != expected_head.lower():
+        raise MergeConfirmationError(
+            f"remote branch {branch!r} moved to {remaining} during deletion "
+            "verification"
+        )
+    raise MergeConfirmationError(
+        f"remote branch deletion was not confirmed: {branch!r} still points "
+        f"to {remaining}"
+    )
+
+
 def validate_active_handoff(runs_dir, run_id):
     """Reject merging one completed run while a different run is active."""
     active = Path(runs_dir) / "active"
@@ -520,6 +617,12 @@ def merge_completed_run(
             confirmation_attempts,
             sleeper,
         )
+        ensure_remote_branch_deleted(
+            runner,
+            repo,
+            state["branch"],
+            head_oid,
+        )
         clear_active_handoff(runs_dir, run_id)
         return MergeResult(pr_number, issue_number, head_oid, True)
 
@@ -548,6 +651,12 @@ def merge_completed_run(
             repo,
             confirmation_attempts,
             sleeper,
+        )
+        ensure_remote_branch_deleted(
+            runner,
+            repo,
+            state["branch"],
+            head_oid,
         )
         clear_active_handoff(runs_dir, run_id)
         return MergeResult(pr_number, issue_number, head_oid, True)
@@ -587,6 +696,12 @@ def merge_completed_run(
         repo,
         confirmation_attempts,
         sleeper,
+    )
+    ensure_remote_branch_deleted(
+        runner,
+        repo,
+        state["branch"],
+        head_oid,
     )
     clear_active_handoff(runs_dir, run_id)
     return MergeResult(pr_number, issue_number, head_oid, True)
