@@ -25,8 +25,11 @@ own.
   contracts, infra, docs, release.
 - `make validate` MUST pass locally before you push, because it mirrors CI
   exactly and a red push wastes a round trip.
-- You do not merge your own PR. Merging is a separate review step, so nothing
-  lands on `dev` by the same hand that wrote it.
+- `/work` MAY merge the PR it created only through its gated merge script,
+  because that script rechecks the completed run, all independent review
+  verdicts, the current PR head, and required CI checks before merging.
+- A failed merge precondition MUST stop without merging, because an unchecked
+  self-merge would bypass the review boundary.
 - Merges are squash-only, so `dev` history reads as one Conventional Commit per
   change.
 
@@ -48,9 +51,9 @@ tooling reads to produce the changelog and version.
 
 ## The self-driving loop: `/work`
 
-The `/work` skill drives one issue from open to a green PR against `dev` without
-human steering, and it is resumable: it reads its state from disk, not memory,
-so a run that died mid-task recovers cleanly. The full loop is in
+The `/work` skill drives one issue from open through a gated squash merge into
+`dev` without human steering, and it is resumable: it reads its state from disk,
+not memory, so a run that died mid-task recovers cleanly. The full loop is in
 `.agents/skills/work/SKILL.md`. One issue per invocation.
 
 1. Orient and resume. It fetches, inspects the working tree, and reads the
@@ -66,8 +69,14 @@ so a run that died mid-task recovers cleanly. The full loop is in
    dispatches the subagents below and drives the per-issue lifecycle in
    `.agents/skills/gh-issue`.
 4. Review, verify, open the PR. It runs the fixed review gates in order, makes
-   `make validate` pass, opens the PR, and keeps it green. It never merges its
-   own PR.
+   `make validate` pass, opens the PR, and keeps it green.
+5. Recheck and merge. After `/gh-issue` reaches `done`, `/work` reads that
+   completed run and requires `plan_open=0` plus four `APPROVE` verdicts. Its
+   deterministic merge script verifies the recorded PR is open, not a draft,
+   targets `dev`, comes from the recorded branch, links the recorded issue,
+   reports a clean merge state, and has no pending or failed required checks.
+   It rereads the head before a squash merge guarded by that exact commit,
+   requests remote branch deletion, then confirms both `MERGED` and `CLOSED`.
 
 Supporting skills, all under `.agents/skills/`: `gh-runbook` (decompose a large
 issue), `gh-issue` (the per-issue lifecycle state machine), `gh-review` (the
@@ -111,7 +120,18 @@ unfenced.
 
 ## How merging works in practice
 
-A person (or, later, a review workflow) reviews the green PR and merges it. A
-single-maintainer account cannot approve its own PR, so the gate that protects
-`dev` is the CI status check, not a required approval, and the no-self-merge
-rule keeps the review boundary intact.
+The `/gh-issue` state machine remains responsible for producing a green PR and
+does not merge or change its state schema. `/work` owns the post-CI merge and
+MUST call `.agents/skills/work/scripts/gated_merge.py`, because a single
+deterministic path prevents a conversational shortcut around the gates.
+
+The script accepts only a completed run with no open plan items and four
+`APPROVE` review verdicts. The required CI `gate` is tied to the current PR head
+and mirrors `make validate`; the script reads the head again immediately before
+merging and gives it to GitHub as the expected head commit. GitHub refuses the
+merge if the branch changed in that interval. A successful run squash-merges,
+deletes the remote feature branch, confirms the PR is `MERGED`, and confirms the
+linked issue is `CLOSED`.
+
+Any mismatch prints the exact failure and stops. `/work` does not merge a
+different PR, repair state by hand, or select another issue in that invocation.

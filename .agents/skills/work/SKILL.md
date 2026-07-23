@@ -1,13 +1,14 @@
 ---
 name: work
-version: 2.0.0
+version: 2.1.0
 description: |
   The top-level self-driving loop. Orients against repo and run state, resumes
   an active run or selects the highest-priority unblocked GitHub issue, routes
   large issues through /gh-runbook and the rest straight to /gh-issue, drives
   the issue to a green PR against dev through gated subagent phases, mirrors the
-  review locally with /gh-review, records lessons, reports, and stops. One
-  issue per invocation; does not merge its own PR.
+  review locally with /gh-review, records lessons, and squash-merges only after
+  rechecking the completed run and current GitHub state. One issue per
+  invocation.
 user-invocable: true
 ---
 
@@ -15,11 +16,11 @@ user-invocable: true
 
 ## Purpose
 
-Drive one GitHub issue from open to a green pull request against `dev` without
+Drive one GitHub issue from open through a gated squash merge into `dev` without
 human steering, as a durable, resumable, subagent-driven run. The issue list is
 the backlog; this skill is the executor. The heavy lifting lives in
-`/gh-issue`; this loop selects the work, resumes crashed runs, and enforces the
-one-issue-per-invocation discipline.
+`/gh-issue`; this loop selects the work, resumes crashed runs, performs the
+post-CI merge, and enforces the one-issue-per-invocation discipline.
 
 Reference: `/gh-runbook` (decomposing a large issue), `/gh-issue` (the
 per-issue lifecycle), `/gh-review` (the local review mirror), and
@@ -57,8 +58,9 @@ present and clean or dirty, branch exists, PR state, outstanding gates) and
 prints an action list. Hand the active run back to `/gh-issue`, which resumes
 from the earliest phase whose reality is incomplete. A complete-but-uncommitted
 worktree is the classic dead-run trap: inspect the diff, then finish or discard
-deliberately, never blind-reset. When the resumed run reaches `done`, report
-and stop; do not also pick a new issue this invocation.
+deliberately, never blind-reset. When the resumed run reaches `done`, continue
+to the gated merge in step 8, report, and stop; do not also pick a new issue
+this invocation.
 
 If no run is active and the tree is clean:
 
@@ -129,7 +131,35 @@ tool needs a flag, a Windows trap), append one dated line to
 `.agents/lessons-learned.md` inside the same PR. Skip when there is nothing new;
 an empty entry is noise.
 
-### 8. Report and stop
+### 8. Gated squash merge
+
+`/gh-issue` ends at a green PR and keeps its state schema unchanged. After its
+run reaches `done`, `/work` owns the merge:
+
+    python .agents/skills/work/scripts/gated_merge.py --run-id <run_id>
+
+The script MUST be the only merge path in this loop, because it binds the
+operation to the completed run rather than trusting conversational memory. It
+requires `phase=done`, `plan_open=0`, all four recorded verdicts equal to
+`APPROVE`, and an issue, branch, and PR that exactly match the run. It then
+rechecks through `gh` that the PR is open, not a draft, targets `dev`, comes
+from the recorded branch, links the recorded issue for closure, reports
+`mergeStateStatus=CLEAN`, and has no pending or failed required checks. The
+required `gate` check proves the current PR head passed the CI mirror of
+`make validate`.
+
+Immediately before merging, the script reads the PR again and refuses a changed
+head. It passes that exact head to `gh pr merge --match-head-commit`, uses
+squash merge, and requests remote branch deletion. It then confirms the PR is
+`MERGED` and the linked issue is `CLOSED`.
+
+If the command prints `STOP`, report its exact precondition failure and stop
+without merging or selecting another issue. If it prints `ERROR`, report the
+exact merge or confirmation failure and stop without claiming success. Use
+`--dry-run` only for diagnostics, because it checks every precondition but does
+not merge.
+
+### 9. Report and stop
 
 End with exactly this summary, then stop. One issue per invocation.
 
@@ -137,7 +167,8 @@ End with exactly this summary, then stop. One issue per invocation.
     - Issue: #<N> <title>
     - Run: <N>-<slug> (phase: <final phase>)
     - Branch: feat/<N>-<slug>
-    - PR: <url> (CI: green | red)
+    - PR: <url> (MERGED | not merged: <exact failure>)
+    - Issue state: CLOSED | <actual state>
     - Gates: spec <v>; quality <v>; architecture <v>; security <v>
     - make validate: <pass | fail>
     - Lessons recorded: <yes: one line | no>
@@ -165,4 +196,5 @@ After three failed attempts on the same gate or CI failure:
 - Implementing in the orchestrator instead of dispatching `01-implementer`.
 - Hand-editing `state.json` instead of going through `gh_issue_run.py`.
 - Silent scope creep, silent test weakening, silent hook edits.
-- Merging your own PR.
+- Calling `gh pr merge` directly instead of the gated merge script.
+- Starting the next issue after either a successful or failed merge attempt.
