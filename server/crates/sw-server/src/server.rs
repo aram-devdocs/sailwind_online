@@ -1218,6 +1218,22 @@ mod handshake_tests {
         );
     }
 
+    fn receive_payload(client: &UdpSocket, expected: p::Payload) -> Vec<u8> {
+        loop {
+            let mut packet = [0u8; protocol::MTU];
+            let received = client.recv(&mut packet).unwrap();
+            assert_eq!(
+                protocol::Header::from_byte(packet[0]).property,
+                protocol::property::UNRELIABLE
+            );
+            let payload = packet[protocol::HEADER_SIZE..received].to_vec();
+            let env = decode_envelope(&payload).unwrap();
+            if env.payload_type() == expected {
+                return payload;
+            }
+        }
+    }
+
     #[test]
     fn protocol_mismatch_is_rejected_before_session_creation() {
         let mut server = make_server();
@@ -1541,6 +1557,66 @@ mod handshake_tests {
         );
         assert_no_outbound_datagram(&client);
         assert_no_outbound_datagram(&observer);
+    }
+
+    #[test]
+    fn valid_chat_is_preencoded_once_and_fanned_out_through_connected_peers() {
+        let mut server = make_server();
+        let (sender, sender_peer) = connect_peer(&mut server);
+        let (observer, observer_peer) = connect_peer(&mut server);
+        let sender_hello = hello_envelope_with_strings(
+            Some("sender-token"),
+            Some("Skipper"),
+            Some("game-build"),
+            Some("mod-version"),
+            Some("surface-hash"),
+            sw_contracts::PROTOCOL_VERSION,
+        );
+        deliver_hello(&mut server, sender_peer, &sender_hello);
+        assert_eq!(receive_server_hello(&sender), (true, String::new()));
+        let observer_hello = hello_envelope_with_strings(
+            Some("observer-token"),
+            Some("Observer"),
+            Some("game-build"),
+            Some("mod-version"),
+            Some("surface-hash"),
+            sw_contracts::PROTOCOL_VERSION,
+        );
+        deliver_hello(&mut server, observer_peer, &observer_hello);
+        assert_eq!(receive_server_hello(&observer), (true, String::new()));
+
+        let sender_player = server.sessions[&sender_peer].player_id;
+        let mut fbb = FlatBufferBuilder::new();
+        let text = fbb.create_string("fair winds");
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text),
+                channel: 2,
+            },
+        );
+        let bytes = finish_envelope(&mut fbb, 3, p::Payload::ChatSend, chat.as_union_value());
+        let seq_before_chat = server.seq;
+
+        server
+            .handle_data_at(sender_peer, &bytes, 1_000, 1_000)
+            .unwrap();
+
+        assert_eq!(server.seq, seq_before_chat.wrapping_add(1));
+        let sender_payload = receive_payload(&sender, p::Payload::ChatBroadcast);
+        let observer_payload = receive_payload(&observer, p::Payload::ChatBroadcast);
+        assert_eq!(
+            sender_payload, observer_payload,
+            "every recipient must receive the one pre-encoded broadcast"
+        );
+
+        let env = decode_envelope(&sender_payload).unwrap();
+        assert_eq!(env.seq(), seq_before_chat.wrapping_add(1));
+        let broadcast = env.payload_as_chat_broadcast().unwrap();
+        assert_eq!(broadcast.player_id(), sender_player);
+        assert_eq!(broadcast.display_name(), Some("Skipper"));
+        assert_eq!(broadcast.text(), Some("fair winds"));
+        assert_eq!(broadcast.channel(), 2);
     }
 
     #[test]
