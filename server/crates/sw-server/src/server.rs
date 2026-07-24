@@ -40,11 +40,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Global snapshot transport and CPU budgets charged on every fixed server tick.
 ///
-/// At the supported 1,024-session ceiling, 32 recipient visits make one round
-/// in 32 ticks. A dense recipient's stable 15-player selection takes three
-/// five-player packets, so every elected player recurs in at most 96 ticks
-/// (3.2 seconds at the production 30 Hz), strictly before the client's
-/// five-second stale-sample eviction.
+/// Configuration validation derives the exact worst case from these shared
+/// constants, including the nominal cadence rounded up to a recipient round.
 const SNAPSHOT_ENTITY_SCAN_PER_PACKET: usize = sw_net::DEFAULT_MAX_PEERS;
 
 /// Queued population fanout budgets. Chat is FIFO and rejects new accepted
@@ -52,8 +49,7 @@ const SNAPSHOT_ENTITY_SCAN_PER_PACKET: usize = sw_net::DEFAULT_MAX_PEERS;
 /// slot. Both share this fixed per-tick transport budget.
 const CHAT_QUEUE_ITEMS: usize = 256;
 const CHAT_QUEUE_BYTES: usize = CHAT_QUEUE_ITEMS * (protocol::MTU - protocol::HEADER_SIZE);
-const CHAT_QUEUE_RECIPIENTS: usize = CHAT_QUEUE_ITEMS * sw_net::DEFAULT_MAX_PEERS;
-const FANOUT_QUEUE_RECIPIENTS: usize = CHAT_QUEUE_RECIPIENTS + sw_net::DEFAULT_MAX_PEERS;
+const FANOUT_QUEUE_RECIPIENTS: usize = (CHAT_QUEUE_ITEMS + 1) * sw_net::DEFAULT_MAX_PEERS;
 const FANOUT_RECIPIENT_SCANS_PER_TICK: usize = sw_net::DEFAULT_MAX_PEERS;
 const FANOUT_SENDS_PER_TICK: usize = sw_net::DEFAULT_MAX_PEERS;
 
@@ -85,10 +81,16 @@ struct CellHydration {
     sent_any: bool,
 }
 
+#[derive(Clone, Copy)]
+struct FanoutRecipient {
+    peer: PeerId,
+    generation: u64,
+}
+
 struct FanoutJob {
     bytes: Vec<u8>,
     sender_cell: Option<Cell>,
-    recipients: Vec<(PeerId, u64)>,
+    recipients: Arc<[FanoutRecipient]>,
     next_recipient: usize,
 }
 
@@ -185,8 +187,8 @@ pub struct Server {
     aoi_recipient_cursor: Option<PeerId>,
     chat_fanout: VecDeque<FanoutJob>,
     chat_fanout_bytes: usize,
-    chat_fanout_recipients: usize,
     clock_fanout: Option<FanoutJob>,
+    fanout_audience_cache: Option<Arc<[FanoutRecipient]>>,
     fanout_prefer_clock: bool,
     dirty_players: BTreeSet<u64>,
     flush_players: BTreeSet<u64>,
@@ -272,8 +274,8 @@ impl Server {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
-            chat_fanout_recipients: 0,
             clock_fanout: None,
+            fanout_audience_cache: None,
             fanout_prefer_clock: true,
             dirty_players: BTreeSet::new(),
             flush_players: BTreeSet::new(),
@@ -950,23 +952,12 @@ impl Server {
         if bytes.len() > protocol::MTU - protocol::HEADER_SIZE {
             return;
         }
-        let recipients = self.capture_fanout_recipients();
-        if recipients.is_empty()
-            || recipients.len() > CHAT_QUEUE_RECIPIENTS - self.chat_fanout_recipients
-        {
+        let Some(recipients) = self.capture_fanout_recipients() else {
             return;
-        }
+        };
 
         self.chat_fanout_bytes += bytes.len();
-        self.chat_fanout_recipients += recipients.len();
-        debug_assert!(
-            self.chat_fanout_recipients
-                + self
-                    .clock_fanout
-                    .as_ref()
-                    .map_or(0, |job| job.recipients.len())
-                <= FANOUT_QUEUE_RECIPIENTS
-        );
+        debug_assert!(self.retained_fanout_audience_entries() <= FANOUT_QUEUE_RECIPIENTS);
         self.chat_fanout.push_back(FanoutJob {
             bytes,
             sender_cell: Some(cell),
@@ -1016,6 +1007,7 @@ impl Server {
         self.player_peers.insert(player_id, peer);
         self.player_order.insert(player_id);
         self.snapshot_recipients.insert(peer);
+        self.fanout_audience_cache = None;
         if dirty {
             self.dirty_players.insert(player_id);
         }
@@ -1040,6 +1032,7 @@ impl Server {
         let mut work = RecipientIndexWork::default();
         work.remove(&mut self.snapshot_recipients, peer);
         work.remove(&mut self.aoi_recipients, peer);
+        self.fanout_audience_cache = None;
         Some((session, work))
     }
 
@@ -1055,8 +1048,8 @@ impl Server {
     fn invalidate_fanout_jobs(&mut self) {
         self.chat_fanout.clear();
         self.chat_fanout_bytes = 0;
-        self.chat_fanout_recipients = 0;
         self.clock_fanout = None;
+        self.fanout_audience_cache = None;
     }
 
     fn schedule_aoi(&mut self, peer: PeerId) {
@@ -1454,12 +1447,13 @@ impl Server {
     fn broadcast_clock(&mut self) {
         let clock = self.clock_now();
         let bytes = codec::world_clock(self.next_seq(), clock);
-        let recipients = self.capture_fanout_recipients();
-        if recipients.is_empty() {
-            self.clock_fanout = None;
+        // Coalescing replaces the previous clock job, so release its captured
+        // audience before checking whether the current membership snapshot fits.
+        self.clock_fanout = None;
+        let Some(recipients) = self.capture_fanout_recipients() else {
             return;
-        }
-        debug_assert!(self.chat_fanout_recipients + recipients.len() <= FANOUT_QUEUE_RECIPIENTS);
+        };
+        debug_assert!(self.retained_fanout_audience_entries() <= FANOUT_QUEUE_RECIPIENTS);
         self.clock_fanout = Some(FanoutJob {
             bytes,
             sender_cell: None,
@@ -1468,16 +1462,43 @@ impl Server {
         });
     }
 
-    fn capture_fanout_recipients(&self) -> Vec<(PeerId, u64)> {
-        self.snapshot_recipients
+    fn capture_fanout_recipients(&mut self) -> Option<Arc<[FanoutRecipient]>> {
+        if let Some(cached) = self.fanout_audience_cache.as_ref() {
+            return Some(Arc::clone(cached));
+        }
+        let recipients: Vec<FanoutRecipient> = self
+            .snapshot_recipients
             .iter()
             .filter_map(|&peer| {
-                self.sessions
-                    .get(&peer)
-                    .map(|session| (peer, session.generation))
+                self.sessions.get(&peer).map(|session| FanoutRecipient {
+                    peer,
+                    generation: session.generation,
+                })
             })
             .take(self.cfg.max_transport_peers_usize())
-            .collect()
+            .collect();
+        if recipients.is_empty()
+            || self
+                .retained_fanout_audience_entries()
+                .checked_add(recipients.len())
+                .is_none_or(|entries| entries > FANOUT_QUEUE_RECIPIENTS)
+        {
+            return None;
+        }
+        let recipients = Arc::<[FanoutRecipient]>::from(recipients);
+        self.fanout_audience_cache = Some(Arc::clone(&recipients));
+        Some(recipients)
+    }
+
+    fn retained_fanout_audience_entries(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.fanout_audience_cache
+            .iter()
+            .chain(self.chat_fanout.iter().map(|job| &job.recipients))
+            .chain(self.clock_fanout.iter().map(|job| &job.recipients))
+            .filter(|audience| seen.insert(audience.as_ptr() as usize))
+            .map(|audience| audience.len())
+            .sum()
     }
 
     fn process_fanout_work(&mut self) -> FanoutTickWork {
@@ -1509,22 +1530,22 @@ impl Server {
                 && work.recipient_scans < recipient_scan_budget
                 && work.sends < send_budget
             {
-                let (peer, generation) = job.recipients[job.next_recipient];
+                let recipient = job.recipients[job.next_recipient];
                 job.next_recipient += 1;
                 work.recipient_scans += 1;
 
-                let should_send = self.sessions.get(&peer).is_some_and(|session| {
-                    session.generation == generation
+                let should_send = self.sessions.get(&recipient.peer).is_some_and(|session| {
+                    session.generation == recipient.generation
                         && job
                             .sender_cell
                             .is_none_or(|cell| session.sub.contains(cell))
                 });
                 if should_send {
-                    self.send(peer, &job.bytes);
+                    self.send(recipient.peer, &job.bytes);
                     work.sends += 1;
                     work.encoded_bytes += job.bytes.len();
                     #[cfg(test)]
-                    work.delivered.push((peer, generation));
+                    work.delivered.push((recipient.peer, recipient.generation));
                 }
             }
 
@@ -1534,9 +1555,6 @@ impl Server {
                     self.fanout_prefer_clock = false;
                 } else {
                     self.chat_fanout_bytes = self.chat_fanout_bytes.saturating_sub(job.bytes.len());
-                    self.chat_fanout_recipients = self
-                        .chat_fanout_recipients
-                        .saturating_sub(job.recipients.len());
                     self.fanout_prefer_clock = true;
                 }
             } else {
@@ -1661,8 +1679,8 @@ impl Server {
 
     fn caps(&self) -> Caps {
         Caps {
-            tick_hz: self.cfg.tick_hz.min(u8::MAX as u32) as u8,
-            snapshot_hz: self.cfg.snapshot_hz.min(u8::MAX as u32) as u8,
+            tick_hz: self.cfg.tick_hz_u8(),
+            snapshot_hz: self.cfg.snapshot_hz_u8(),
             aoi_radius_cells: self.cfg.aoi_radius_cells.min(u8::MAX as u32) as u8,
             cell_size_m: self.world.grid().cell_size_m,
             features: FEATURES,
@@ -1922,8 +1940,8 @@ mod handshake_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
-            chat_fanout_recipients: 0,
             clock_fanout: None,
+            fanout_audience_cache: None,
             fanout_prefer_clock: true,
             dirty_players: BTreeSet::new(),
             flush_players: BTreeSet::new(),
@@ -3636,8 +3654,8 @@ mod aoi_harden_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
-            chat_fanout_recipients: 0,
             clock_fanout: None,
+            fanout_audience_cache: None,
             fanout_prefer_clock: true,
             dirty_players: BTreeSet::new(),
             flush_players: BTreeSet::new(),
@@ -3848,6 +3866,108 @@ mod aoi_harden_tests {
             .unwrap();
     }
 
+    fn retained_chat_audience_entries(server: &Server) -> usize {
+        let mut audiences = HashSet::new();
+        server
+            .chat_fanout
+            .iter()
+            .filter(|job| audiences.insert(job.recipients.as_ptr() as usize))
+            .map(|job| job.recipients.len())
+            .sum()
+    }
+
+    fn chat_bytes(text: &str) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let text = fbb.create_string(text);
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text),
+                channel: 0,
+            },
+        );
+        finish_envelope(&mut fbb, 1, p::Payload::ChatSend, chat.as_union_value())
+    }
+
+    #[test]
+    fn stable_membership_shares_one_immutable_fanout_audience() {
+        const LIVE_PEERS: PeerId = 32;
+        const CHAT_BURST: usize = 128;
+
+        let mut server = make_server(Config {
+            chat_min_interval_ms: 0,
+            ..Config::default()
+        });
+        let center = Cell::new(0, 0);
+        for peer in 1..=LIVE_PEERS {
+            insert_dense_session(&mut server, peer, center);
+        }
+        let bytes = chat_bytes("shared audience");
+        for index in 0..CHAT_BURST {
+            let peer = index as PeerId % LIVE_PEERS + 1;
+            server
+                .handle_data_at(peer, &bytes, 1_000 + index as i64, 1_000 + index as i64)
+                .unwrap();
+        }
+
+        assert_eq!(server.chat_fanout.len(), CHAT_BURST);
+        assert_eq!(
+            retained_chat_audience_entries(&server),
+            LIVE_PEERS as usize,
+            "Arc references must count one immutable retained audience allocation"
+        );
+        let first = server.chat_fanout.front().unwrap().recipients.as_ptr();
+        assert!(
+            server
+                .chat_fanout
+                .iter()
+                .all(|job| std::ptr::eq(job.recipients.as_ptr(), first)),
+            "unchanged membership must reuse the exact audience allocation"
+        );
+    }
+
+    #[test]
+    fn membership_churn_retains_only_one_bounded_snapshot_per_enqueued_generation() {
+        const LIVE_PEERS: PeerId = 32;
+        const CHURNED_JOBS: usize = 64;
+
+        let mut server = make_server(Config {
+            chat_min_interval_ms: 0,
+            ..Config::default()
+        });
+        let center = Cell::new(0, 0);
+        for peer in 1..=LIVE_PEERS {
+            insert_dense_session(&mut server, peer, center);
+        }
+        let bytes = chat_bytes("generation snapshot");
+        for generation in 0..CHURNED_JOBS {
+            server
+                .handle_data_at(
+                    1,
+                    &bytes,
+                    2_000 + generation as i64,
+                    2_000 + generation as i64,
+                )
+                .unwrap();
+            let departed = server.unregister_session(LIVE_PEERS).unwrap();
+            server.world.remove(departed.player_id);
+            insert_dense_session_for_player(
+                &mut server,
+                LIVE_PEERS,
+                10_000 + generation as u64,
+                center,
+            );
+        }
+
+        let retained = retained_chat_audience_entries(&server);
+        assert_eq!(
+            retained,
+            LIVE_PEERS as usize * CHURNED_JOBS,
+            "each membership generation must retain one unique frozen audience, not one allocation per Arc reference"
+        );
+        assert!(retained <= FANOUT_QUEUE_RECIPIENTS);
+    }
+
     #[test]
     fn queued_fanout_never_wraps_or_delivers_to_a_reused_connection_identity() {
         const RECIPIENTS: PeerId = sw_net::DEFAULT_MAX_PEERS as PeerId;
@@ -3948,7 +4068,7 @@ mod aoi_harden_tests {
             "generation wrap must invalidate all captured pre-wrap identities"
         );
         assert_eq!(server.chat_fanout_bytes, 0);
-        assert_eq!(server.chat_fanout_recipients, 0);
+        assert_eq!(server.retained_fanout_audience_entries(), 0);
     }
 
     #[test]
@@ -4035,7 +4155,7 @@ mod aoi_harden_tests {
         let exact_recurrence_bound = recipient_round_ticks * elected_packets;
         assert_eq!(
             exact_recurrence_bound as u64,
-            snapshot_recurrence_ticks(DENSE_SESSIONS),
+            snapshot_recurrence_ticks(DENSE_SESSIONS, server.cfg.ticks_per_snapshot()).unwrap(),
             "config validation and the production scheduler must share one recurrence proof"
         );
         assert_eq!(exact_recurrence_bound, 96);
@@ -4091,7 +4211,13 @@ mod aoi_harden_tests {
 
     #[test]
     fn sparse_snapshots_keep_the_configured_nominal_cadence() {
-        let mut server = make_server(Config::default());
+        let mut server = make_server(Config {
+            tick_hz: 30,
+            snapshot_hz: 1,
+            max_transport_peers: 2,
+            max_transport_peers_per_ip: 2,
+            ..Config::default()
+        });
         let center = Cell::new(0, 0);
         insert_dense_session(&mut server, 1, center);
         insert_dense_session(&mut server, 2, center);
@@ -4458,10 +4584,10 @@ mod aoi_harden_tests {
         assert_eq!(server.chat_fanout.len(), CHAT_QUEUE_ITEMS);
         assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
         assert_eq!(
-            server.chat_fanout_recipients,
-            CHAT_QUEUE_ITEMS * DENSE_SESSIONS as usize
+            server.retained_fanout_audience_entries(),
+            DENSE_SESSIONS as usize,
+            "all stable-membership jobs and the cache share one audience allocation"
         );
-        assert!(server.chat_fanout_recipients <= CHAT_QUEUE_RECIPIENTS);
 
         let mut total_jobs_completed = 0usize;
         let mut total_db_updates = 0usize;
@@ -4494,16 +4620,8 @@ mod aoi_harden_tests {
 
             assert!(server.chat_fanout.len() <= CHAT_QUEUE_ITEMS);
             assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
-            assert!(server.chat_fanout_recipients <= CHAT_QUEUE_RECIPIENTS);
             assert!(server.clock_fanout.iter().count() <= 1);
-            assert!(
-                server.chat_fanout_recipients
-                    + server
-                        .clock_fanout
-                        .as_ref()
-                        .map_or(0, |job| job.recipients.len())
-                    <= FANOUT_QUEUE_RECIPIENTS
-            );
+            assert!(server.retained_fanout_audience_entries() <= FANOUT_QUEUE_RECIPIENTS);
             assert!(server.dirty_players.len() <= server.cfg.max_player_rows_u32() as usize);
             assert!(server.flush_players.len() <= server.cfg.max_player_rows_u32() as usize);
             assert!(
@@ -4514,7 +4632,11 @@ mod aoi_harden_tests {
 
         assert!(server.chat_fanout.is_empty());
         assert_eq!(server.chat_fanout_bytes, 0);
-        assert_eq!(server.chat_fanout_recipients, 0);
+        assert_eq!(
+            server.retained_fanout_audience_entries(),
+            DENSE_SESSIONS as usize,
+            "the current membership cache retains one reusable bounded audience"
+        );
         assert!(
             server.clock_fanout.is_none(),
             "the last coalesced clock must eventually reach its bounded audience"
@@ -4736,11 +4858,15 @@ mod aoi_harden_tests {
     #[test]
     fn caps_advertise_configured_aoi() {
         let server = make_server(Config {
+            tick_hz: u32::from(u8::MAX),
+            snapshot_hz: u32::from(u8::MAX),
             aoi_radius_cells: 5,
             cell_size_m: 2048.0,
             ..Config::default()
         });
         let caps = server.caps();
+        assert_eq!(caps.tick_hz, u8::MAX);
+        assert_eq!(caps.snapshot_hz, u8::MAX);
         assert_eq!(caps.aoi_radius_cells, 5);
         assert_eq!(caps.cell_size_m, 2048.0);
     }
@@ -4795,8 +4921,8 @@ mod market_dispatch_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
-            chat_fanout_recipients: 0,
             clock_fanout: None,
+            fanout_audience_cache: None,
             fanout_prefer_clock: true,
             dirty_players: BTreeSet::new(),
             flush_players: BTreeSet::new(),
@@ -5061,8 +5187,8 @@ mod input_hardening_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
-            chat_fanout_recipients: 0,
             clock_fanout: None,
+            fanout_audience_cache: None,
             fanout_prefer_clock: true,
             dirty_players: BTreeSet::new(),
             flush_players: BTreeSet::new(),
@@ -5819,6 +5945,7 @@ mod input_hardening_tests {
         // and run only by the non-blocking load job / `make load-test`.
         const N: u32 = 1_024;
         const TICKS: u32 = 450;
+        const TRANSPORT_CHAT_BURST: PeerId = 128;
         const LOAD_EPOCH_MS: i64 = 1_700_000_000_000;
 
         let cfg = Config::default();
@@ -5850,26 +5977,38 @@ mod input_hardening_tests {
         assert_eq!(server.sessions.len(), N as usize);
         assert_eq!(server.world.len(), N as usize);
 
-        // One maximum transport poll worth of accepted dense chat fanout; the
-        // remaining distinct-player inputs are rejected at the fixed queue cap.
-        for peer in 1..=N as PeerId {
-            send_chat(
-                &mut server,
-                peer,
-                "release hostile fanout",
-                100_000 + i64::from(peer),
-            );
-        }
-        assert_eq!(server.chat_fanout.len(), CHAT_QUEUE_ITEMS);
-        assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
-
         // Drive TICKS simulated ticks and measure the wall-clock server work. The
         // simulated clock advances by a full tick each round so every client's
         // per-tick update clears the throttle window (worst-case load).
         let step_ms = tick_dt.as_millis() as i64 + 1;
+        let chat = chat_envelope("release transport burst");
         let start = Instant::now();
+        let mut maximum_tick = Duration::ZERO;
+        let mut burst_tick = Duration::ZERO;
         for t in 0..TICKS {
+            let tick_start = Instant::now();
             let now = 10_000 + (t as i64) * step_ms;
+            if t == 0 {
+                for peer in 1..=TRANSPORT_CHAT_BURST {
+                    server
+                        .handle_data_at(peer, &chat, now + i64::from(peer), LOAD_EPOCH_MS)
+                        .unwrap();
+                }
+                assert_eq!(server.chat_fanout.len(), TRANSPORT_CHAT_BURST as usize);
+                assert_eq!(
+                    server.retained_fanout_audience_entries(),
+                    N as usize,
+                    "the burst must retain one shared audience allocation, not 128 copies"
+                );
+                let first = server.chat_fanout.front().unwrap().recipients.as_ptr();
+                assert!(
+                    server
+                        .chat_fanout
+                        .iter()
+                        .all(|job| std::ptr::eq(job.recipients.as_ptr(), first)),
+                    "all jobs captured under stable membership must share one audience"
+                );
+            }
             for i in 0..N {
                 let peer = (i + 1) as PeerId;
                 let jitter = (t % 8) as f32; // small in-cell movement
@@ -5910,33 +6049,34 @@ mod input_hardening_tests {
             }
             assert!(server.chat_fanout.len() <= CHAT_QUEUE_ITEMS);
             assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
-            assert!(server.chat_fanout_recipients <= CHAT_QUEUE_RECIPIENTS);
             assert!(server.clock_fanout.iter().count() <= 1);
-            assert!(
-                server.chat_fanout_recipients
-                    + server
-                        .clock_fanout
-                        .as_ref()
-                        .map_or(0, |job| job.recipients.len())
-                    <= FANOUT_QUEUE_RECIPIENTS
-            );
+            assert!(server.retained_fanout_audience_entries() <= FANOUT_QUEUE_RECIPIENTS);
             assert!(server.dirty_players.len() <= server.cfg.max_player_rows_u32() as usize);
             assert!(server.flush_players.len() <= server.cfg.max_player_rows_u32() as usize);
+
+            let tick_elapsed = tick_start.elapsed();
+            maximum_tick = maximum_tick.max(tick_elapsed);
+            if t == 0 {
+                burst_tick = tick_elapsed;
+            }
         }
         let elapsed = start.elapsed();
         let per_tick = elapsed / TICKS;
 
         assert!(server.chat_fanout.is_empty());
         assert_eq!(server.chat_fanout_bytes, 0);
-        assert_eq!(server.chat_fanout_recipients, 0);
+        assert_eq!(server.retained_fanout_audience_entries(), N as usize);
         assert!(server.clock_fanout.is_none());
 
         println!(
-            "load: {N} clients x {TICKS} ticks in {elapsed:?} => {per_tick:?}/tick (real-time budget {tick_dt:?})"
+            "load: {N} clients x {TICKS} ticks in {elapsed:?} => {per_tick:?}/tick, \
+             max {maximum_tick:?}, 128-chat burst tick {burst_tick:?} \
+             (real-time budget {tick_dt:?})"
         );
         assert!(
-            per_tick < tick_dt,
-            "per-tick server work {per_tick:?} exceeded the {tick_dt:?} real-time budget at {N} clients"
+            maximum_tick < tick_dt,
+            "whole-tick server work {maximum_tick:?} (burst {burst_tick:?}) exceeded the \
+             {tick_dt:?} real-time budget at {N} clients"
         );
     }
 }

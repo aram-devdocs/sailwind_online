@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::path::Path;
+use std::time::Duration;
 
 /// Upper bound on the AoI radius, in cells. A radius drives a `(2r+1)^2` block
 /// allocation ([`sw_world::cells_in_radius`]); bounding it here keeps that math
@@ -58,10 +59,38 @@ pub(crate) const SNAPSHOT_ENTITIES_PER_PACKET: usize = 5;
 pub(crate) const SNAPSHOT_VISIBILITY_CEILING: usize = 15;
 pub(crate) const SNAPSHOT_CLIENT_EXPIRY_SECS: u64 = 5;
 
-/// Worst-case ticks between advertisements of one elected dense player.
-pub(crate) fn snapshot_recurrence_ticks(peers: u32) -> u64 {
-    u64::from(peers).div_ceil(SNAPSHOT_PACKETS_PER_TICK as u64)
-        * (SNAPSHOT_VISIBILITY_CEILING as u64).div_ceil(SNAPSHOT_ENTITIES_PER_PACKET as u64)
+fn checked_div_ceil(value: u64, divisor: u64) -> Option<u64> {
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
+}
+
+/// Worst-case ticks between advertisements of one player in a recipient's
+/// stable dense selection.
+///
+/// A recipient is considered once per `ceil(peers / packets_per_tick)` round.
+/// Its nominal cadence can only become due on one of those visits, so the
+/// cadence is rounded up to a whole recipient round. The stable selection then
+/// takes `ceil(min(peers - 1, visibility_ceiling) / entities_per_packet)` due
+/// visits to repeat. Every operation is checked even though validated
+/// configuration is much smaller, keeping this proof safe for hostile direct
+/// callers as well as the normal validation path.
+pub(crate) fn snapshot_recurrence_ticks(peers: u32, nominal_cadence_ticks: u64) -> Option<u64> {
+    if peers <= 1 {
+        return Some(0);
+    }
+    if nominal_cadence_ticks == 0 {
+        return None;
+    }
+    let packets_per_tick = u64::try_from(SNAPSHOT_PACKETS_PER_TICK).ok()?;
+    let entities_per_packet = u64::try_from(SNAPSHOT_ENTITIES_PER_PACKET).ok()?;
+    let visibility_ceiling = u64::try_from(SNAPSHOT_VISIBILITY_CEILING).ok()?;
+    let recipient_round = checked_div_ceil(u64::from(peers), packets_per_tick)?;
+    let visible_players = u64::from(peers.checked_sub(1)?).min(visibility_ceiling);
+    let stable_chunks = checked_div_ceil(visible_players, entities_per_packet)?;
+    let aligned_due_interval =
+        checked_div_ceil(nominal_cadence_ticks, recipient_round)?.checked_mul(recipient_round)?;
+    aligned_due_interval.checked_mul(stable_chunks)
 }
 
 /// Highest configurable persistent player-row ceiling. The server still uses
@@ -241,9 +270,26 @@ impl Config {
 
     fn validate(&self) -> anyhow::Result<()> {
         if self.tick_hz == 0 {
-            return Err(anyhow::anyhow!("tick_hz must be > 0"));
+            return Err(anyhow::anyhow!("tick_hz must be in 1..={}", u8::MAX));
         }
-        if self.snapshot_hz == 0 || self.snapshot_hz > self.tick_hz {
+        if Duration::from_secs_f64(1.0 / f64::from(self.tick_hz)).is_zero() {
+            return Err(anyhow::anyhow!(
+                "tick_hz produces a zero fixed-tick duration"
+            ));
+        }
+        if self.tick_hz > u32::from(u8::MAX) {
+            return Err(anyhow::anyhow!(
+                "tick_hz must be faithfully representable on the wire in 1..={}",
+                u8::MAX
+            ));
+        }
+        if self.snapshot_hz == 0 || self.snapshot_hz > u32::from(u8::MAX) {
+            return Err(anyhow::anyhow!(
+                "snapshot_hz must be faithfully representable on the wire in 1..={}",
+                u8::MAX
+            ));
+        }
+        if self.snapshot_hz > self.tick_hz {
             return Err(anyhow::anyhow!("snapshot_hz must be in 1..=tick_hz"));
         }
         if self.aoi_radius_cells == 0 || self.aoi_radius_cells > MAX_AOI_RADIUS_CELLS {
@@ -278,8 +324,12 @@ impl Config {
                 "max_transport_peers must be in 1..={MAX_TRANSPORT_PEERS}"
             ));
         }
-        let recurrence_ticks = snapshot_recurrence_ticks(self.max_transport_peers);
-        let expiry_ticks = u64::from(self.tick_hz) * SNAPSHOT_CLIENT_EXPIRY_SECS;
+        let recurrence_ticks =
+            snapshot_recurrence_ticks(self.max_transport_peers, self.ticks_per_snapshot())
+                .ok_or_else(|| anyhow::anyhow!("snapshot recurrence calculation overflowed"))?;
+        let expiry_ticks = u64::from(self.tick_hz)
+            .checked_mul(SNAPSHOT_CLIENT_EXPIRY_SECS)
+            .ok_or_else(|| anyhow::anyhow!("snapshot expiry calculation overflowed"))?;
         if recurrence_ticks >= expiry_ticks {
             return Err(anyhow::anyhow!(
                 "snapshot recurrence ({recurrence_ticks} ticks) must be strictly less than \
@@ -419,6 +469,17 @@ impl Config {
         (self.tick_hz / self.snapshot_hz).max(1) as u64
     }
 
+    /// Fixed tick rate as the exact handshake representation.
+    pub fn tick_hz_u8(&self) -> u8 {
+        u8::try_from(self.tick_hz).expect("Config::validate guarantees tick_hz fits the wire")
+    }
+
+    /// Snapshot rate as the exact handshake representation.
+    pub fn snapshot_hz_u8(&self) -> u8 {
+        u8::try_from(self.snapshot_hz)
+            .expect("Config::validate guarantees snapshot_hz fits the wire")
+    }
+
     /// Number of ticks between standalone world-clock broadcasts. Uses a
     /// saturating multiply for parity with the other cadence accessors, so the
     /// `tick_hz * clock_broadcast_secs` product can never overflow even if a
@@ -453,9 +514,13 @@ mod tests {
     fn snapshot_recurrence_is_fresh_for_every_accepted_capacity_and_tick_pair() {
         let default = Config::default();
         default.validate().unwrap();
-        assert_eq!(snapshot_recurrence_ticks(default.max_transport_peers), 96);
+        assert_eq!(
+            snapshot_recurrence_ticks(default.max_transport_peers, default.ticks_per_snapshot()),
+            Some(96)
+        );
         assert!(
-            snapshot_recurrence_ticks(default.max_transport_peers)
+            snapshot_recurrence_ticks(default.max_transport_peers, default.ticks_per_snapshot())
+                .unwrap()
                 < u64::from(default.tick_hz) * SNAPSHOT_CLIENT_EXPIRY_SECS
         );
 
@@ -478,15 +543,67 @@ mod tests {
         );
     }
 
+    fn simulate_snapshot_recurrence(peers: u32, nominal_cadence: u64) -> u64 {
+        if peers <= 1 {
+            return 0;
+        }
+        let recipient_round = u64::from(peers).div_ceil(SNAPSHOT_PACKETS_PER_TICK as u64);
+        let stable_chunks = u64::from(peers - 1)
+            .min(SNAPSHOT_VISIBILITY_CEILING as u64)
+            .div_ceil(SNAPSHOT_ENTITIES_PER_PACKET as u64);
+        let mut last_due_tick = 0;
+        let mut chunk = 0;
+        let mut first_target_tick = None;
+
+        for recipient_visit in 0..=nominal_cadence * stable_chunks * 2 {
+            let visit_tick = 1 + recipient_visit * recipient_round;
+            if last_due_tick != 0 && visit_tick - last_due_tick < nominal_cadence {
+                continue;
+            }
+            last_due_tick = visit_tick;
+            if chunk == 0 {
+                if let Some(first) = first_target_tick {
+                    return visit_tick - first;
+                }
+                first_target_tick = Some(visit_tick);
+            }
+            chunk = (chunk + 1) % stable_chunks;
+        }
+        panic!("the bounded scheduler simulation did not repeat its target chunk");
+    }
+
     #[test]
-    fn snapshot_recurrence_formula_tracks_the_scheduler_constants() {
-        for peers in [1, 32, 33, sw_net::DEFAULT_MAX_PEERS as u32] {
-            assert_eq!(
-                snapshot_recurrence_ticks(peers),
-                u64::from(peers).div_ceil(SNAPSHOT_PACKETS_PER_TICK as u64)
-                    * (SNAPSHOT_VISIBILITY_CEILING as u64)
-                        .div_ceil(SNAPSHOT_ENTITIES_PER_PACKET as u64)
-            );
+    fn snapshot_recurrence_formula_matches_scheduler_for_all_accepted_rates_and_boundaries() {
+        let peer_boundaries = [1, 2, 5, 6, 16, 31, 32, 33, 64, 1_023, 1_024];
+        let mut simulated = [[0u64; u8::MAX as usize + 1]; 11];
+        for (peer_index, peers) in peer_boundaries.into_iter().enumerate() {
+            for nominal_cadence in 1..=u64::from(u8::MAX) {
+                simulated[peer_index][nominal_cadence as usize] =
+                    simulate_snapshot_recurrence(peers, nominal_cadence);
+            }
+        }
+
+        for tick_hz in 1..=u32::from(u8::MAX) {
+            for snapshot_hz in 1..=tick_hz {
+                for (peer_index, peers) in peer_boundaries.into_iter().enumerate() {
+                    let cfg = Config {
+                        tick_hz,
+                        snapshot_hz,
+                        max_transport_peers: peers,
+                        max_transport_peers_per_ip: peers.min(32),
+                        ..Config::default()
+                    };
+                    if cfg.validate().is_err() {
+                        continue;
+                    }
+                    let nominal_cadence = cfg.ticks_per_snapshot();
+                    assert_eq!(
+                        snapshot_recurrence_ticks(peers, nominal_cadence),
+                        Some(simulated[peer_index][nominal_cadence as usize]),
+                        "tick_hz={tick_hz}, snapshot_hz={snapshot_hz}, peers={peers}"
+                    );
+                }
+            }
         }
     }
 
@@ -533,9 +650,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_snapshot_rate() {
+    fn wire_rates_are_exactly_one_through_255() {
+        let boundary = Config {
+            tick_hz: u32::from(u8::MAX),
+            snapshot_hz: u32::from(u8::MAX),
+            ..Config::default()
+        };
+        boundary.validate().unwrap();
+
+        for tick_hz in [0, 256, 1_000, u32::MAX] {
+            let cfg = Config {
+                tick_hz,
+                snapshot_hz: 1,
+                ..Config::default()
+            };
+            let error = cfg.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("tick_hz"),
+                "tick_hz={tick_hz} must fail as an unrepresentable wire rate: {error}"
+            );
+        }
+
+        for snapshot_hz in [0, 256, 1_000, u32::MAX] {
+            let cfg = Config {
+                tick_hz: u32::from(u8::MAX),
+                snapshot_hz,
+                ..Config::default()
+            };
+            let error = cfg.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("snapshot_hz"),
+                "snapshot_hz={snapshot_hz} must fail as an unrepresentable wire rate: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_snapshot_rate_above_tick_rate() {
         let cfg = Config {
-            snapshot_hz: 100,
+            tick_hz: 30,
+            snapshot_hz: 31,
             ..Config::default()
         };
         assert!(cfg.validate().is_err());
