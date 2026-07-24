@@ -15,6 +15,9 @@ pub use rusqlite::{Error, Result};
 /// The latest schema version this build knows how to produce.
 pub const SCHEMA_VERSION: i64 = 2;
 
+/// Hard ceiling for one keyset-paginated mooring cell read.
+pub const MAX_MOORINGS_PAGE_ROWS: usize = 8;
+
 /// Embedded schema for `user_version = 1`. Applied once, in a transaction.
 const MIGRATION_V1: &str = r#"
 CREATE TABLE players (
@@ -425,6 +428,52 @@ impl Db {
         rows.collect()
     }
 
+    /// One stable, bounded page of moorings in a cell ordered by `boat_id`.
+    pub fn moorings_in_cell_after(
+        &self,
+        cell_x: i32,
+        cell_z: i32,
+        after_boat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MooringRow>> {
+        if !(1..=MAX_MOORINGS_PAGE_ROWS).contains(&limit) {
+            return Err(Error::InvalidParameterName(format!(
+                "mooring page limit must be in 1..={MAX_MOORINGS_PAGE_ROWS}"
+            )));
+        }
+        let limit = i64::try_from(limit).expect("validated mooring page limit fits i64");
+        let mut rows = Vec::with_capacity(limit as usize);
+        if let Some(after_boat_id) = after_boat_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT boat_id, owner, cell_x, cell_z, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, name, created_at
+                 FROM moorings
+                 WHERE cell_x = ?1 AND cell_z = ?2 AND boat_id > ?3
+                 ORDER BY boat_id
+                 LIMIT ?4",
+            )?;
+            let mapped = stmt.query_map(
+                params![cell_x, cell_z, after_boat_id, limit],
+                mooring_from_row,
+            )?;
+            for row in mapped {
+                rows.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT boat_id, owner, cell_x, cell_z, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, name, created_at
+                 FROM moorings
+                 WHERE cell_x = ?1 AND cell_z = ?2
+                 ORDER BY boat_id
+                 LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(params![cell_x, cell_z, limit], mooring_from_row)?;
+            for row in mapped {
+                rows.push(row?);
+            }
+        }
+        Ok(rows)
+    }
+
     /// Count of all moorings (used in tests / diagnostics).
     pub fn mooring_count(&self) -> Result<i64> {
         self.conn
@@ -811,6 +860,57 @@ mod tests {
         db.upsert_mooring(&m2).unwrap();
         assert_eq!(db.mooring_count().unwrap(), 1);
         assert_eq!(db.moorings_in_cell(3, -2).unwrap()[0].name, "Renamed");
+    }
+
+    #[test]
+    fn mooring_cell_pages_are_bounded_stable_and_keyset_paginated() {
+        let db = Db::open_in_memory().unwrap();
+        for boat_id in [9, 2, 7, 4, 1] {
+            db.upsert_mooring(&sample_mooring(boat_id, 7)).unwrap();
+        }
+        let mut other_cell = sample_mooring(3, 7);
+        other_cell.cell_x = 99;
+        db.upsert_mooring(&other_cell).unwrap();
+
+        let first = db.moorings_in_cell_after(3, -2, None, 2).unwrap();
+        let second = db
+            .moorings_in_cell_after(3, -2, first.last().map(|row| row.boat_id), 2)
+            .unwrap();
+        let third = db
+            .moorings_in_cell_after(3, -2, second.last().map(|row| row.boat_id), 2)
+            .unwrap();
+
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .chain(&third)
+                .map(|row| row.boat_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 7, 9]
+        );
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(third.len(), 1);
+        assert!(db.moorings_in_cell_after(3, -2, None, 0).is_err());
+        assert!(db
+            .moorings_in_cell_after(3, -2, None, MAX_MOORINGS_PAGE_ROWS + 1)
+            .is_err());
+        let query_plan: String = db
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT boat_id FROM moorings
+                 WHERE cell_x = ?1 AND cell_z = ?2 AND boat_id > ?3
+                 ORDER BY boat_id LIMIT ?4",
+                params![3, -2, 2, 2],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            query_plan.contains("idx_moorings_cell"),
+            "keyset page must use the cell index, got: {query_plan}"
+        );
     }
 
     #[test]

@@ -6,9 +6,10 @@ use crate::config::{Config, MAX_PLAYER_ROWS};
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
 use crate::ratelimit::{BoundedRateLimiter, GlobalRateLimiter, RateLimiter};
 use crate::validate;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::net::IpAddr;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,7 +17,7 @@ use sw_contracts::decode_envelope;
 use sw_contracts::sw_proto as p;
 use sw_econ::{Ledger, Market, MarketAck, Trade, Txn};
 use sw_net::{protocol, DisconnectReason, Event, Host, PeerId};
-use sw_persist::{Db, MooringRow, PlayerAdmission};
+use sw_persist::{Db, MooringRow, PlayerAdmission, MAX_MOORINGS_PAGE_ROWS};
 use sw_world::{AoiUpdate, Cell, Subscription, World};
 
 /// LiteNetLib connect key clients must present.
@@ -32,6 +33,28 @@ const KEY_WEATHER_SEED: &str = "weather_seed";
 /// How often dirty player state is flushed to the database.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Global snapshot transport and CPU budgets charged on each snapshot tick.
+const SNAPSHOT_PACKETS_PER_TICK: usize = 8;
+const SNAPSHOT_ENTITY_SCAN_PER_PACKET: usize = 8;
+const SNAPSHOT_ENTITIES_PER_PACKET: usize = 5;
+
+/// Global AoI delivery budget charged on every fixed server tick.
+const AOI_WORK_ITEMS_PER_TICK: usize = 8;
+const AOI_CELLS_PER_UPDATE: usize = 32;
+const CELL_ENTITY_SCAN_PER_WORK: usize = 8;
+const CELL_ENTITIES_PER_PACKET: usize = 5;
+const CELL_MOORINGS_PER_PACKET: usize = 1;
+const MAX_SNAPSHOT_MOORING_NAME_BYTES: usize = 512;
+
+struct CellHydration {
+    cell: Cell,
+    player_cursor: Option<u64>,
+    players_remaining: usize,
+    mooring_cursor: Option<i64>,
+    players_complete: bool,
+    sent_any: bool,
+}
+
 /// Per-connection state, created on ClientHello.
 struct Session {
     peer: PeerId,
@@ -46,6 +69,32 @@ struct Session {
     sub: Subscription,
     cell: Option<Cell>,
     dirty: bool,
+    snapshot_cursor: Option<u64>,
+    snapshot_remaining: usize,
+    published_cells: HashSet<Cell>,
+    hydration_cells: VecDeque<Cell>,
+    hydration_pending: HashSet<Cell>,
+    active_hydration: Option<CellHydration>,
+    aoi_queued: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SnapshotTickWork {
+    recipient_visits: usize,
+    candidates_examined: usize,
+    player_states_encoded: usize,
+    packets: usize,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AoiTickWork {
+    recipient_visits: usize,
+    persisted_queries: usize,
+    packets: usize,
+    cells_completed: usize,
+    moorings_encoded: usize,
+    oversized_moorings_skipped: usize,
 }
 
 /// The server.
@@ -55,6 +104,10 @@ pub struct Server {
     db: Db,
     world: World,
     sessions: HashMap<PeerId, Session>,
+    player_peers: HashMap<u64, PeerId>,
+    player_order: BTreeSet<u64>,
+    snapshot_recipients: VecDeque<PeerId>,
+    aoi_recipients: VecDeque<PeerId>,
     identity_players: HashMap<String, u64>,
     seq: u32,
     snapshot_tick: u32,
@@ -125,6 +178,10 @@ impl Server {
             db,
             world,
             sessions: HashMap::new(),
+            player_peers: HashMap::new(),
+            player_order: BTreeSet::new(),
+            snapshot_recipients: VecDeque::new(),
+            aoi_recipients: VecDeque::new(),
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -168,6 +225,8 @@ impl Server {
                     tracing::warn!(error = %e, "event handling failed");
                 }
             }
+
+            self.process_aoi_work();
 
             if tick % ticks_per_snapshot == 0 {
                 self.broadcast_snapshots();
@@ -402,17 +461,16 @@ impl Server {
         }
 
         // Drop any prior session for this identity (reconnect from a new peer).
-        let stale: Vec<PeerId> = self
-            .sessions
-            .iter()
-            .filter(|(&pp, s)| pp != peer && s.player_id == player_id)
-            .map(|(&pp, _)| pp)
-            .collect();
-        for pp in stale {
+        if let Some(pp) = self
+            .player_peers
+            .get(&player_id)
+            .copied()
+            .filter(|&pp| pp != peer)
+        {
             if self.host.peer_addr(pp).is_some() && !self.host.disconnect(pp) {
                 return Err(anyhow::anyhow!("failed to evict superseded transport peer"));
             }
-            self.sessions.remove(&pp);
+            self.unregister_session(pp);
             self.hello_limiter.clear(u64::from(pp));
         }
 
@@ -421,7 +479,7 @@ impl Server {
         let aoi = sub.recenter(origin);
         self.world.place_in_cell(player_id, origin);
 
-        self.sessions.insert(
+        self.register_session(
             peer,
             Session {
                 peer,
@@ -436,8 +494,15 @@ impl Server {
                 sub,
                 cell: Some(origin),
                 dirty: true,
+                snapshot_cursor: None,
+                snapshot_remaining: 0,
+                published_cells: HashSet::new(),
+                hydration_cells: VecDeque::new(),
+                hydration_pending: HashSet::new(),
+                active_hydration: None,
+                aoi_queued: false,
             },
-        );
+        )?;
 
         tracing::info!(peer, player_id, name = %self.sessions[&peer].display_name, "hello accepted");
 
@@ -530,27 +595,10 @@ impl Server {
         self.emit_aoi(peer, &aoi);
     }
 
-    /// Send an AoI delta to `peer`: the added/removed cell list followed by a
-    /// full [`codec::cell_snapshot`] for each newly entered cell. A no-op when
-    /// the delta is empty (the player stayed in the same cell).
+    /// Schedule a changed AoI for bounded delivery from the fixed-tick loop.
     fn emit_aoi(&mut self, peer: PeerId, aoi: &AoiUpdate) {
-        if aoi.is_empty() {
-            return;
-        }
-
-        let bytes = codec::aoi_update(self.next_seq(), &aoi.added, &aoi.removed);
-        self.send(peer, &bytes);
-
-        for &cell in &aoi.added {
-            let (players, boats, moorings) = match self.gather_cell(cell) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "gather cell failed");
-                    continue;
-                }
-            };
-            let bytes = codec::cell_snapshot(self.next_seq(), cell, &players, &boats, &moorings);
-            self.send(peer, &bytes);
+        if !aoi.is_empty() {
+            self.schedule_aoi(peer);
         }
     }
 
@@ -804,7 +852,7 @@ impl Server {
 
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
         self.hello_limiter.clear(u64::from(peer));
-        if let Some(s) = self.sessions.remove(&peer) {
+        if let Some(s) = self.unregister_session(peer) {
             self.world.remove(s.player_id);
             // Drop session-scoped message throttles. The reconnect cooldown is
             // intentionally retained in its bounded map, otherwise a known
@@ -821,38 +869,382 @@ impl Server {
         Ok(())
     }
 
-    fn broadcast_snapshots(&mut self) {
+    fn register_session(&mut self, peer: PeerId, session: Session) -> anyhow::Result<()> {
+        if self.sessions.contains_key(&peer) {
+            return Err(anyhow::anyhow!("peer already owns a session"));
+        }
+        if let Some(existing_peer) = self.player_peers.get(&session.player_id) {
+            return Err(anyhow::anyhow!(
+                "player already owns session peer {existing_peer}"
+            ));
+        }
+        let player_id = session.player_id;
+        self.sessions.insert(peer, session);
+        self.player_peers.insert(player_id, peer);
+        self.player_order.insert(player_id);
+        self.snapshot_recipients.push_back(peer);
+        self.schedule_aoi(peer);
+        Ok(())
+    }
+
+    fn unregister_session(&mut self, peer: PeerId) -> Option<Session> {
+        let session = self.sessions.remove(&peer)?;
+        if self.player_peers.get(&session.player_id) == Some(&peer) {
+            self.player_peers.remove(&session.player_id);
+            self.player_order.remove(&session.player_id);
+        }
+        self.snapshot_recipients.retain(|&queued| queued != peer);
+        self.aoi_recipients.retain(|&queued| queued != peer);
+        Some(session)
+    }
+
+    fn schedule_aoi(&mut self, peer: PeerId) {
+        let Some(session) = self.sessions.get_mut(&peer) else {
+            return;
+        };
+        if !session.aoi_queued {
+            session.aoi_queued = true;
+            self.aoi_recipients.push_back(peer);
+        }
+    }
+
+    fn broadcast_snapshots(&mut self) -> SnapshotTickWork {
         self.snapshot_tick = self.snapshot_tick.wrapping_add(1);
         let server_tick = self.snapshot_tick;
-
-        let recipients: Vec<(PeerId, u64, Cell)> = self
-            .sessions
-            .values()
-            .filter_map(|s| s.cell.map(|c| (s.peer, s.player_id, c)))
-            .collect();
-
-        for (peer, self_pid, cell) in recipients {
+        let mut work = SnapshotTickWork::default();
+        let recipients = self
+            .snapshot_recipients
+            .len()
+            .min(SNAPSHOT_PACKETS_PER_TICK);
+        for _ in 0..recipients {
+            let Some(peer) = self.snapshot_recipients.pop_front() else {
+                break;
+            };
+            let Some((self_pid, cell, cursor, remaining)) =
+                self.sessions.get(&peer).and_then(|s| {
+                    s.cell
+                        .map(|cell| (s.player_id, cell, s.snapshot_cursor, s.snapshot_remaining))
+                })
+            else {
+                continue;
+            };
+            work.recipient_visits += 1;
+            let remaining = if remaining == 0 {
+                self.player_order.len()
+            } else {
+                remaining
+            };
+            let candidates = self
+                .player_candidates_after(cursor, remaining.min(SNAPSHOT_ENTITY_SCAN_PER_PACKET));
             let mut players = Vec::new();
             let mut boats = Vec::new();
-            for eid in self.players_in_view(cell, self_pid) {
-                if let Some(s) = self.session_by_player(eid) {
-                    players.push(player_snap(s));
-                    if s.aboard_boat != 0 {
-                        boats.push(boat_snap(s));
-                    }
+            let mut last_examined = None;
+            let mut examined = 0usize;
+            for player_id in candidates {
+                last_examined = Some(player_id);
+                examined += 1;
+                work.candidates_examined += 1;
+                if player_id == self_pid {
+                    continue;
+                }
+                let Some(session) = self.session_by_player(player_id) else {
+                    continue;
+                };
+                if !session.cell.is_some_and(|other| {
+                    other.chebyshev_distance(cell) <= self.cfg.aoi_radius_i32()
+                }) {
+                    continue;
+                }
+                players.push(player_snap(session));
+                if session.aboard_boat != 0 {
+                    boats.push(boat_snap(session));
+                }
+                if players.len() == SNAPSHOT_ENTITIES_PER_PACKET {
+                    break;
                 }
             }
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                session.snapshot_cursor = last_examined;
+                session.snapshot_remaining = remaining.saturating_sub(examined);
+            }
+            self.snapshot_recipients.push_back(peer);
             if players.is_empty() && boats.is_empty() {
                 continue;
             }
             let bytes = codec::snapshot_delta(self.next_seq(), server_tick, &players, &boats);
-            self.send(peer, &bytes);
+            work.player_states_encoded += players.len();
+            if self.send_bounded(peer, &bytes, "snapshot delta") {
+                work.packets += 1;
+                work.encoded_bytes += bytes.len();
+            }
         }
+        work
+    }
+
+    fn player_candidates_after(&self, cursor: Option<u64>, limit: usize) -> Vec<u64> {
+        let limit = limit.min(self.player_order.len());
+        let mut candidates = Vec::with_capacity(limit);
+        if let Some(cursor) = cursor {
+            candidates.extend(
+                self.player_order
+                    .range((Excluded(cursor), Unbounded))
+                    .chain(self.player_order.range(..=cursor))
+                    .take(limit)
+                    .copied(),
+            );
+        } else {
+            candidates.extend(self.player_order.iter().take(limit).copied());
+        }
+        candidates
+    }
+
+    fn process_aoi_work(&mut self) -> AoiTickWork {
+        let mut work = AoiTickWork::default();
+        let recipients = self.aoi_recipients.len().min(AOI_WORK_ITEMS_PER_TICK);
+        for _ in 0..recipients {
+            let Some(peer) = self.aoi_recipients.pop_front() else {
+                break;
+            };
+            let Some(session) = self.sessions.get_mut(&peer) else {
+                continue;
+            };
+            session.aoi_queued = false;
+            work.recipient_visits += 1;
+            let needs_more = match self.process_one_aoi_work(peer, &mut work) {
+                Ok(needs_more) => needs_more,
+                Err(error) => {
+                    tracing::warn!(peer, error = %error, "bounded AoI hydration failed");
+                    true
+                }
+            };
+            if needs_more {
+                self.schedule_aoi(peer);
+            }
+        }
+        work
+    }
+
+    fn process_one_aoi_work(
+        &mut self,
+        peer: PeerId,
+        work: &mut AoiTickWork,
+    ) -> anyhow::Result<bool> {
+        if let Some((added, removed)) = self.next_aoi_chunk(peer) {
+            let bytes = codec::aoi_update(self.next_seq(), &added, &removed);
+            if self.send_bounded(peer, &bytes, "AoI update") {
+                work.packets += 1;
+            }
+            return Ok(self.session_has_aoi_work(peer));
+        }
+
+        let active_players = self.player_order.len();
+        let Some((cell, player_cursor, players_remaining, players_complete)) =
+            self.prepare_cell_hydration(peer, active_players)
+        else {
+            return Ok(self.session_has_aoi_work(peer));
+        };
+
+        if !players_complete {
+            let candidates = self.player_candidates_after(
+                player_cursor,
+                players_remaining.min(CELL_ENTITY_SCAN_PER_WORK),
+            );
+            let mut players = Vec::new();
+            let mut boats = Vec::new();
+            let mut examined = 0usize;
+            let mut last_examined = None;
+            for player_id in candidates {
+                examined += 1;
+                last_examined = Some(player_id);
+                let Some(session) = self.session_by_player(player_id) else {
+                    continue;
+                };
+                if session.cell != Some(cell) {
+                    continue;
+                }
+                players.push(player_snap(session));
+                if session.aboard_boat != 0 {
+                    boats.push(boat_snap(session));
+                }
+                if players.len() == CELL_ENTITIES_PER_PACKET {
+                    break;
+                }
+            }
+
+            let mut completed_scan = false;
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                if let Some(hydration) = session.active_hydration.as_mut() {
+                    hydration.player_cursor = last_examined.or(hydration.player_cursor);
+                    hydration.players_remaining =
+                        hydration.players_remaining.saturating_sub(examined);
+                    if hydration.players_remaining == 0 || examined == 0 {
+                        hydration.players_complete = true;
+                        completed_scan = true;
+                    }
+                }
+            }
+
+            if !players.is_empty() || !boats.is_empty() {
+                let bytes = codec::cell_snapshot(self.next_seq(), cell, &players, &boats, &[]);
+                if self.send_bounded(peer, &bytes, "cell player snapshot") {
+                    work.packets += 1;
+                    if let Some(session) = self.sessions.get_mut(&peer) {
+                        if let Some(hydration) = session.active_hydration.as_mut() {
+                            hydration.sent_any = true;
+                        }
+                    }
+                }
+            }
+            if !completed_scan {
+                return Ok(true);
+            }
+            return Ok(self.session_has_aoi_work(peer));
+        }
+
+        let mooring_cursor = self
+            .sessions
+            .get(&peer)
+            .and_then(|session| session.active_hydration.as_ref())
+            .and_then(|hydration| hydration.mooring_cursor);
+        let rows = self.db.moorings_in_cell_after(
+            cell.cx,
+            cell.cz,
+            mooring_cursor,
+            CELL_MOORINGS_PER_PACKET.min(MAX_MOORINGS_PAGE_ROWS),
+        )?;
+        work.persisted_queries += 1;
+        if let Some(row) = rows.into_iter().next() {
+            let next_cursor = row.boat_id;
+            let snapshot =
+                (row.name.len() <= MAX_SNAPSHOT_MOORING_NAME_BYTES).then(|| mooring_snap(row));
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                if let Some(hydration) = session.active_hydration.as_mut() {
+                    hydration.mooring_cursor = Some(next_cursor);
+                }
+            }
+            if let Some(snapshot) = snapshot {
+                let bytes = codec::cell_snapshot(self.next_seq(), cell, &[], &[], &[snapshot]);
+                if self.send_bounded(peer, &bytes, "cell mooring snapshot") {
+                    work.packets += 1;
+                    work.moorings_encoded += 1;
+                    if let Some(session) = self.sessions.get_mut(&peer) {
+                        if let Some(hydration) = session.active_hydration.as_mut() {
+                            hydration.sent_any = true;
+                        }
+                    }
+                }
+            } else {
+                work.oversized_moorings_skipped += 1;
+            }
+            return Ok(true);
+        }
+
+        let sent_any = self
+            .sessions
+            .get(&peer)
+            .and_then(|session| session.active_hydration.as_ref())
+            .is_some_and(|hydration| hydration.sent_any);
+        if !sent_any {
+            let bytes = codec::cell_snapshot(self.next_seq(), cell, &[], &[], &[]);
+            if self.send_bounded(peer, &bytes, "empty cell snapshot") {
+                work.packets += 1;
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(&peer) {
+            session.active_hydration = None;
+        }
+        work.cells_completed += 1;
+        Ok(self.session_has_aoi_work(peer))
+    }
+
+    fn next_aoi_chunk(&mut self, peer: PeerId) -> Option<(Vec<Cell>, Vec<Cell>)> {
+        let session = self.sessions.get_mut(&peer)?;
+        let mut removed: Vec<Cell> = session
+            .published_cells
+            .difference(session.sub.cells())
+            .copied()
+            .collect();
+        removed.sort_by_key(|cell| (cell.cz, cell.cx));
+        removed.truncate(AOI_CELLS_PER_UPDATE);
+
+        let remaining = AOI_CELLS_PER_UPDATE - removed.len();
+        let mut added: Vec<Cell> = session
+            .sub
+            .cells()
+            .difference(&session.published_cells)
+            .copied()
+            .collect();
+        added.sort_by_key(|cell| (cell.cz, cell.cx));
+        added.truncate(remaining);
+        if added.is_empty() && removed.is_empty() {
+            return None;
+        }
+
+        for cell in &removed {
+            session.published_cells.remove(cell);
+            session.hydration_pending.remove(cell);
+        }
+        for &cell in &added {
+            session.published_cells.insert(cell);
+            if session.hydration_pending.insert(cell) {
+                session.hydration_cells.push_back(cell);
+            }
+        }
+        Some((added, removed))
+    }
+
+    fn prepare_cell_hydration(
+        &mut self,
+        peer: PeerId,
+        active_players: usize,
+    ) -> Option<(Cell, Option<u64>, usize, bool)> {
+        let session = self.sessions.get_mut(&peer)?;
+        if let Some(active) = session.active_hydration.as_ref() {
+            if !session.sub.contains(active.cell) || !session.published_cells.contains(&active.cell)
+            {
+                session.hydration_pending.remove(&active.cell);
+                session.active_hydration = None;
+                return None;
+            }
+        }
+        if session.active_hydration.is_none() {
+            let cell = session.hydration_cells.pop_front()?;
+            if !session.hydration_pending.remove(&cell)
+                || !session.sub.contains(cell)
+                || !session.published_cells.contains(&cell)
+            {
+                return None;
+            }
+            session.active_hydration = Some(CellHydration {
+                cell,
+                player_cursor: None,
+                players_remaining: active_players,
+                mooring_cursor: None,
+                players_complete: active_players == 0,
+                sent_any: false,
+            });
+        }
+        let hydration = session.active_hydration.as_ref()?;
+        Some((
+            hydration.cell,
+            hydration.player_cursor,
+            hydration.players_remaining,
+            hydration.players_complete,
+        ))
+    }
+
+    fn session_has_aoi_work(&self, peer: PeerId) -> bool {
+        self.sessions.get(&peer).is_some_and(|session| {
+            session.published_cells != *session.sub.cells()
+                || session.active_hydration.is_some()
+                || !session.hydration_cells.is_empty()
+        })
     }
 
     /// Entity ids visible to a viewer centred on `cell`: everything within the
     /// configured AoI radius, minus the viewer itself. This bounds a
     /// recipient's snapshot to AoI density, never the global population.
+    #[cfg(test)]
     fn players_in_view(&self, cell: Cell, self_pid: u64) -> Vec<u64> {
         self.world
             .entities_in_radius(cell, self.cfg.aoi_radius_i32())
@@ -871,29 +1263,6 @@ impl Server {
             let bytes = codec::world_clock(self.next_seq(), clock);
             self.send(peer, &bytes);
         }
-    }
-
-    fn gather_cell(
-        &self,
-        cell: Cell,
-    ) -> anyhow::Result<(Vec<PlayerSnap>, Vec<BoatSnap>, Vec<MooringSnap>)> {
-        let mut players = Vec::new();
-        let mut boats = Vec::new();
-        for eid in self.world.entities_in(cell) {
-            if let Some(s) = self.session_by_player(eid) {
-                players.push(player_snap(s));
-                if s.aboard_boat != 0 {
-                    boats.push(boat_snap(s));
-                }
-            }
-        }
-        let moorings = self
-            .db
-            .moorings_in_cell(cell.cx, cell.cz)?
-            .into_iter()
-            .map(mooring_snap)
-            .collect();
-        Ok((players, boats, moorings))
     }
 
     fn flush_dirty(&mut self) -> anyhow::Result<()> {
@@ -923,7 +1292,10 @@ impl Server {
     }
 
     fn session_by_player(&self, player_id: u64) -> Option<&Session> {
-        self.sessions.values().find(|s| s.player_id == player_id)
+        let peer = self.player_peers.get(&player_id)?;
+        self.sessions
+            .get(peer)
+            .filter(|session| session.player_id == player_id)
     }
 
     fn caps(&self) -> Caps {
@@ -957,6 +1329,20 @@ impl Server {
         if let Err(e) = self.host.send_unreliable(peer, bytes) {
             tracing::warn!(peer, error = %e, "send failed");
         }
+    }
+
+    fn send_bounded(&mut self, peer: PeerId, bytes: &[u8], kind: &'static str) -> bool {
+        if bytes.len() > protocol::MTU - protocol::HEADER_SIZE {
+            tracing::error!(
+                peer,
+                kind,
+                bytes = bytes.len(),
+                "bounded packet encoder exceeded transport payload"
+            );
+            return false;
+        }
+        self.send(peer, bytes);
+        true
     }
 }
 
@@ -1137,6 +1523,10 @@ mod handshake_tests {
             db,
             world,
             sessions: HashMap::new(),
+            player_peers: HashMap::new(),
+            player_order: BTreeSet::new(),
+            snapshot_recipients: VecDeque::new(),
+            aoi_recipients: VecDeque::new(),
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -1962,6 +2352,8 @@ mod handshake_tests {
 
         deliver_hello_at(&mut server, first_peer, &hello, first_admission_ms);
         assert_eq!(receive_server_hello(&first_client), (true, String::new()));
+        let original_player_id = server.sessions[&first_peer].player_id;
+        assert_eq!(server.player_peers[&original_player_id], first_peer);
 
         let (replacement_client, replacement_peer) = connect_peer(&mut server);
         let replacement_admission_ms = first_admission_ms
@@ -1981,7 +2373,24 @@ mod handshake_tests {
         );
         let player_id = server.sessions[&replacement_peer].player_id;
         let world_cell = server.world.cell_of_entity(player_id);
+        assert_eq!(player_id, original_player_id);
+        assert_eq!(server.player_peers[&player_id], replacement_peer);
+        assert_eq!(
+            server.player_order.iter().copied().collect::<Vec<_>>(),
+            vec![player_id]
+        );
+        assert_eq!(
+            server
+                .session_by_player(player_id)
+                .map(|session| session.peer),
+            Some(replacement_peer)
+        );
         assert!(!server.sessions.contains_key(&first_peer));
+        assert!(!server
+            .snapshot_recipients
+            .iter()
+            .any(|&peer| peer == first_peer));
+        assert!(!server.aoi_recipients.iter().any(|&peer| peer == first_peer));
         assert!(
             server.host.peer_addr(first_peer).is_none(),
             "a superseded logical session must be removed from the transport"
@@ -2139,6 +2548,14 @@ mod handshake_tests {
         server
             .on_disconnect(first_peer, DisconnectReason::Remote)
             .unwrap();
+        assert!(!server.player_peers.contains_key(&player_id));
+        assert!(!server.player_order.contains(&player_id));
+        assert!(server.session_by_player(player_id).is_none());
+        assert!(!server
+            .snapshot_recipients
+            .iter()
+            .any(|&peer| peer == first_peer));
+        assert!(!server.aoi_recipients.iter().any(|&peer| peer == first_peer));
         assert_eq!(
             server.reconnect_limiter.tracked_count(),
             1,
@@ -2153,6 +2570,7 @@ mod handshake_tests {
             "source rotation inside the window must not repeat persistence admission"
         );
         assert!(!server.sessions.contains_key(&rotated_peer));
+        assert!(!server.player_peers.contains_key(&player_id));
 
         let after_expiry_ms = first_admission_ms + server.cfg.hello_min_interval_ms_i64() + 1;
         deliver_hello_at(&mut server, rotated_peer, &hello, after_expiry_ms);
@@ -2162,6 +2580,13 @@ mod handshake_tests {
             "the same reconnect must become eligible when the window expires"
         );
         assert_eq!(server.sessions[&rotated_peer].player_id, player_id);
+        assert_eq!(server.player_peers[&player_id], rotated_peer);
+        assert_eq!(
+            server
+                .session_by_player(player_id)
+                .map(|session| session.peer),
+            Some(rotated_peer)
+        );
     }
 
     #[test]
@@ -2679,6 +3104,10 @@ mod aoi_harden_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            player_peers: HashMap::new(),
+            player_order: BTreeSet::new(),
+            snapshot_recipients: VecDeque::new(),
+            aoi_recipients: VecDeque::new(),
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -2842,6 +3271,252 @@ mod aoi_harden_tests {
         assert!(visible.len() < far_ids.len());
     }
 
+    fn insert_dense_session(server: &mut Server, peer: PeerId, cell: Cell) {
+        let player_id = u64::from(peer);
+        let mut sub = Subscription::new(server.cfg.aoi_radius_i32());
+        sub.recenter(cell);
+        server.world.place_in_cell(player_id, cell);
+        server
+            .register_session(
+                peer,
+                Session {
+                    peer,
+                    player_id,
+                    identity_hash: format!("identity-{player_id}"),
+                    display_name: format!("Player {player_id}"),
+                    aboard_boat: player_id,
+                    pos: [0.0, 0.0, 0.0],
+                    rot: [0.0, 0.0, 0.0, 1.0],
+                    vel: [0.0, 0.0, 0.0],
+                    t_ms: 0,
+                    sub,
+                    cell: Some(cell),
+                    dirty: false,
+                    snapshot_cursor: None,
+                    snapshot_remaining: 0,
+                    published_cells: HashSet::new(),
+                    hydration_cells: VecDeque::new(),
+                    hydration_pending: HashSet::new(),
+                    active_hydration: None,
+                    aoi_queued: false,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn dense_snapshot_broadcast_has_a_fixed_global_packet_budget() {
+        const DENSE_SESSIONS: PeerId = 1_024;
+
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        for peer in 1..=DENSE_SESSIONS {
+            insert_dense_session(&mut server, peer, center);
+        }
+
+        let recipient_round = (DENSE_SESSIONS as usize).div_ceil(SNAPSHOT_PACKETS_PER_TICK);
+        for _ in 0..recipient_round {
+            let work = server.broadcast_snapshots();
+            assert!(work.recipient_visits <= SNAPSHOT_PACKETS_PER_TICK);
+            assert!(
+                work.candidates_examined
+                    <= SNAPSHOT_PACKETS_PER_TICK * SNAPSHOT_ENTITY_SCAN_PER_PACKET
+            );
+            assert!(
+                work.player_states_encoded
+                    <= SNAPSHOT_PACKETS_PER_TICK * SNAPSHOT_ENTITIES_PER_PACKET
+            );
+            assert!(work.packets <= SNAPSHOT_PACKETS_PER_TICK);
+            assert!(
+                work.encoded_bytes
+                    <= SNAPSHOT_PACKETS_PER_TICK * (protocol::MTU - protocol::HEADER_SIZE)
+            );
+        }
+        assert!(
+            server
+                .sessions
+                .values()
+                .all(|session| session.snapshot_cursor.is_some()),
+            "one bounded recipient round must eventually visit every session"
+        );
+
+        server.snapshot_recipients = VecDeque::from([1]);
+        {
+            let viewer = server.sessions.get_mut(&1).unwrap();
+            viewer.snapshot_cursor = None;
+            viewer.snapshot_remaining = 0;
+        }
+        let mut encoded_for_viewer = 0usize;
+        let mut viewer_visits = 0usize;
+        loop {
+            let work = server.broadcast_snapshots();
+            assert!(work.candidates_examined <= SNAPSHOT_ENTITY_SCAN_PER_PACKET);
+            assert!(work.packets <= 1);
+            assert!(work.encoded_bytes <= protocol::MTU - protocol::HEADER_SIZE);
+            encoded_for_viewer += work.player_states_encoded;
+            viewer_visits += 1;
+            if server.sessions[&1].snapshot_remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            encoded_for_viewer,
+            DENSE_SESSIONS as usize - 1,
+            "one deterministic entity sweep must eventually emit every other co-located player once"
+        );
+        assert!(
+            viewer_visits <= (DENSE_SESSIONS as usize).div_ceil(SNAPSHOT_ENTITIES_PER_PACKET),
+            "entity cursor must make fixed positive progress on every dense visit"
+        );
+    }
+
+    #[test]
+    fn fixed_snapshot_chunks_fit_the_unreliable_payload() {
+        let players: Vec<PlayerSnap> = (0..SNAPSHOT_ENTITIES_PER_PACKET)
+            .map(|id| PlayerSnap {
+                player_id: id as u64,
+                pos: [f32::MAX; 3],
+                rot: [f32::MAX; 4],
+                aboard_boat: id as u64,
+                t_ms: u32::MAX,
+            })
+            .collect();
+        let boats: Vec<BoatSnap> = (0..SNAPSHOT_ENTITIES_PER_PACKET)
+            .map(|id| BoatSnap {
+                boat_id: id as u64,
+                owner: id as u64,
+                pos: [f32::MAX; 3],
+                rot: [f32::MAX; 4],
+                vel: [f32::MAX; 3],
+                t_ms: u32::MAX,
+            })
+            .collect();
+        let mooring = MooringSnap {
+            boat_id: u64::MAX,
+            owner: u64::MAX,
+            cell: (i32::MIN, i32::MAX),
+            pos: [f32::MAX; 3],
+            rot: [f32::MAX; 4],
+            name: "m".repeat(MAX_SNAPSHOT_MOORING_NAME_BYTES),
+            created_at: u64::MAX,
+        };
+        let added: Vec<Cell> = (0..AOI_CELLS_PER_UPDATE / 2)
+            .map(|cell| Cell::new(cell as i32, i32::MIN))
+            .collect();
+        let removed: Vec<Cell> = (0..AOI_CELLS_PER_UPDATE / 2)
+            .map(|cell| Cell::new(cell as i32, i32::MAX))
+            .collect();
+        let payload_limit = protocol::MTU - protocol::HEADER_SIZE;
+
+        for (kind, bytes) in [
+            (
+                "snapshot delta",
+                codec::snapshot_delta(1, 1, &players, &boats),
+            ),
+            (
+                "cell player snapshot",
+                codec::cell_snapshot(1, Cell::new(0, 0), &players, &boats, &[]),
+            ),
+            (
+                "cell mooring snapshot",
+                codec::cell_snapshot(1, Cell::new(0, 0), &[], &[], &[mooring]),
+            ),
+            ("AoI update", codec::aoi_update(1, &added, &removed)),
+        ] {
+            assert!(
+                bytes.len() <= payload_limit,
+                "{kind} encoded {} bytes beyond the {payload_limit}-byte unreliable payload",
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn radius_sixteen_admission_defers_persisted_cell_hydration() {
+        let mut server = make_server(Config {
+            aoi_radius_cells: 16,
+            ..Config::default()
+        });
+        let hello_bytes = hello_envelope("tok-wide-aoi", "Wide AoI");
+        let hello = decode_envelope(&hello_bytes).unwrap();
+        let seq_before = server.seq;
+
+        server
+            .on_hello(1, hello.payload_as_client_hello().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            server.seq.wrapping_sub(seq_before),
+            1,
+            "admission must send only ServerHello; the 1,089-cell persisted AoI \
+             hydration belongs to the bounded fixed-tick scheduler"
+        );
+    }
+
+    #[test]
+    fn radius_sixteen_hydration_has_fixed_tick_bounds_and_eventual_progress() {
+        let mut server = make_server(Config {
+            aoi_radius_cells: 16,
+            ..Config::default()
+        });
+        let last_cell = Cell::new(16, 16);
+        for (boat_id, name) in [
+            (1, "x".repeat(MAX_SNAPSHOT_MOORING_NAME_BYTES + 1)),
+            (2, "eventual".to_string()),
+        ] {
+            server
+                .db
+                .upsert_mooring(&MooringRow {
+                    boat_id,
+                    owner: 1,
+                    cell_x: last_cell.cx,
+                    cell_z: last_cell.cz,
+                    pos: [0.0; 3],
+                    rot: [0.0, 0.0, 0.0, 1.0],
+                    name,
+                    created_at: 1,
+                })
+                .unwrap();
+        }
+        let hello_bytes = hello_envelope("tok-wide-progress", "Wide Progress");
+        let hello = decode_envelope(&hello_bytes).unwrap();
+        server
+            .on_hello(1, hello.payload_as_client_hello().unwrap())
+            .unwrap();
+
+        let mut total_queries = 0usize;
+        let mut total_completed = 0usize;
+        let mut total_moorings = 0usize;
+        let mut total_oversized_skips = 0usize;
+        for _ in 0..5_000 {
+            let work = server.process_aoi_work();
+            assert!(work.recipient_visits <= AOI_WORK_ITEMS_PER_TICK);
+            assert!(work.persisted_queries <= AOI_WORK_ITEMS_PER_TICK);
+            assert!(work.packets <= AOI_WORK_ITEMS_PER_TICK);
+            total_queries += work.persisted_queries;
+            total_completed += work.cells_completed;
+            total_moorings += work.moorings_encoded;
+            total_oversized_skips += work.oversized_moorings_skipped;
+            if !server.session_has_aoi_work(1) {
+                break;
+            }
+        }
+
+        let session = &server.sessions[&1];
+        assert_eq!(session.published_cells, *session.sub.cells());
+        assert!(!server.session_has_aoi_work(1));
+        assert_eq!(total_completed, 1_089);
+        assert_eq!(
+            total_queries, 1_091,
+            "1,089 cells plus two keyset continuations in the hostile final cell"
+        );
+        assert_eq!(total_oversized_skips, 1);
+        assert_eq!(
+            total_moorings, 1,
+            "the valid row after an oversized legacy row must still progress"
+        );
+    }
+
     #[test]
     fn caps_advertise_configured_aoi() {
         let server = make_server(Config {
@@ -2896,6 +3571,10 @@ mod market_dispatch_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            player_peers: HashMap::new(),
+            player_order: BTreeSet::new(),
+            snapshot_recipients: VecDeque::new(),
+            aoi_recipients: VecDeque::new(),
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3146,6 +3825,10 @@ mod input_hardening_tests {
             db: Db::open_in_memory().unwrap(),
             world,
             sessions: HashMap::new(),
+            player_peers: HashMap::new(),
+            player_order: BTreeSet::new(),
+            snapshot_recipients: VecDeque::new(),
+            aoi_recipients: VecDeque::new(),
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3731,19 +4414,17 @@ mod input_hardening_tests {
         // i.e. the server keeps up with real time at N clients. Timing is
         // wall-clock, so this is `#[ignore]`d out of the required gate (`cargo test`
         // skips it) and run only by the non-blocking load job / `make load-test`.
-        const N: u32 = 200;
+        const N: u32 = 1_024;
         const TICKS: u32 = 60;
         const LOAD_EPOCH_MS: i64 = 1_700_000_000_000;
 
         let cfg = Config::default();
         let tick_dt = Duration::from_secs_f64(1.0 / cfg.tick_hz as f64);
-        let cell = cfg.cell_size_m;
         let mut server = make_server(cfg);
         let session_step_ms = server.cfg.new_session_min_interval_ms_i64();
 
-        // Join N clients, each seeded into a distinct cell on a roughly square
-        // grid so AoI density is realistic and bounded, not all stacked together.
-        let side = (N as f64).sqrt().ceil() as u32;
+        // Hostile-density load: every authenticated session occupies the same
+        // cell. Snapshot work must remain bounded at the transport ceiling.
         for i in 0..N {
             let peer = (i + 1) as PeerId;
             let session_offset_ms = i64::from(i) * session_step_ms;
@@ -3754,14 +4435,12 @@ mod input_hardening_tests {
                 1_000 + session_offset_ms,
                 LOAD_EPOCH_MS + session_offset_ms,
             );
-            let cx = (i % side) as f32;
-            let cz = (i / side) as f32;
             // The seed time advances per client so the client-state throttle never
             // drops a placement.
             send_state(
                 &mut server,
                 peer,
-                &motion_envelope(cx * cell + 1.0, 0.0, cz * cell + 1.0, 0.0, 0.0, 0.0),
+                &motion_envelope(1.0, 0.0, 1.0, 0.0, 0.0, 0.0),
                 1_000 + i as i64,
             );
         }
@@ -3777,20 +4456,11 @@ mod input_hardening_tests {
             let now = 10_000 + (t as i64) * step_ms;
             for i in 0..N {
                 let peer = (i + 1) as PeerId;
-                let cx = (i % side) as f32;
-                let cz = (i / side) as f32;
                 let jitter = (t % 8) as f32; // small in-cell movement
                 send_state(
                     &mut server,
                     peer,
-                    &motion_envelope(
-                        cx * cell + 1.0 + jitter,
-                        0.0,
-                        cz * cell + 1.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ),
+                    &motion_envelope(1.0 + jitter, 0.0, 1.0, 0.0, 0.0, 0.0),
                     now,
                 );
             }
