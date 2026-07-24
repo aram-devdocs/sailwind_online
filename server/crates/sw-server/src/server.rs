@@ -33,10 +33,29 @@ const KEY_WEATHER_SEED: &str = "weather_seed";
 /// How often dirty player state is flushed to the database.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Global snapshot transport and CPU budgets charged on each snapshot tick.
-const SNAPSHOT_PACKETS_PER_TICK: usize = 8;
-const SNAPSHOT_ENTITY_SCAN_PER_PACKET: usize = 8;
+/// Global snapshot transport and CPU budgets charged on every fixed server tick.
+///
+/// At the supported 1,024-session ceiling, 32 recipient visits make one round
+/// in 32 ticks. A dense recipient's stable 15-player selection takes three
+/// five-player packets, so every elected player recurs in at most 96 ticks
+/// (3.2 seconds at the production 30 Hz), strictly before the client's
+/// five-second stale-sample eviction.
+const SNAPSHOT_PACKETS_PER_TICK: usize = 32;
+const SNAPSHOT_ENTITY_SCAN_PER_PACKET: usize = sw_net::DEFAULT_MAX_PEERS;
 const SNAPSHOT_ENTITIES_PER_PACKET: usize = 5;
+const SNAPSHOT_VISIBILITY_CEILING: usize = 15;
+
+/// Queued population fanout budgets. Chat is FIFO and rejects new accepted
+/// work at the fixed queue boundary; clock state has one coalescing latest-value
+/// slot. Both share this fixed per-tick transport budget.
+const CHAT_QUEUE_ITEMS: usize = 256;
+const CHAT_QUEUE_BYTES: usize = CHAT_QUEUE_ITEMS * (protocol::MTU - protocol::HEADER_SIZE);
+const FANOUT_RECIPIENT_SCANS_PER_TICK: usize = sw_net::DEFAULT_MAX_PEERS;
+const FANOUT_SENDS_PER_TICK: usize = sw_net::DEFAULT_MAX_PEERS;
+
+/// Persistence work is spread across fixed ticks after each five-second flush
+/// boundary. At 1,024 sessions this drains in 128 ticks (about 4.27 seconds).
+const DIRTY_DB_UPDATES_PER_TICK: usize = 8;
 
 /// Global AoI delivery budget charged on every fixed server tick.
 const AOI_WORK_ITEMS_PER_TICK: usize = 8;
@@ -61,9 +80,15 @@ struct CellHydration {
     sent_any: bool,
 }
 
+struct FanoutJob {
+    bytes: Vec<u8>,
+    sender_cell: Option<Cell>,
+    recipient_cursor: Option<PeerId>,
+    recipients_remaining: usize,
+}
+
 /// Per-connection state, created on ClientHello.
 struct Session {
-    peer: PeerId,
     player_id: u64,
     identity_hash: String,
     display_name: String,
@@ -77,9 +102,10 @@ struct Session {
     dirty: bool,
     snapshot_cursor: Option<u64>,
     snapshot_remaining: usize,
+    snapshot_last_visit_tick: u32,
     published_cells: HashSet<Cell>,
-    hydration_cells: VecDeque<Cell>,
-    hydration_pending: HashSet<Cell>,
+    hydration_cells: HashSet<Cell>,
+    hydration_cursor: Option<Cell>,
     active_hydration: Option<CellHydration>,
 }
 
@@ -90,6 +116,8 @@ struct SnapshotTickWork {
     player_states_encoded: usize,
     packets: usize,
     encoded_bytes: usize,
+    #[cfg(test)]
+    advertised: Vec<(PeerId, u64)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -105,6 +133,19 @@ struct AoiTickWork {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RecipientIndexWork {
     recipient_index_operations: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FanoutTickWork {
+    recipient_scans: usize,
+    sends: usize,
+    encoded_bytes: usize,
+    jobs_completed: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DirtyFlushTickWork {
+    db_updates: usize,
 }
 
 impl RecipientIndexWork {
@@ -127,6 +168,13 @@ pub struct Server {
     snapshot_recipient_cursor: Option<PeerId>,
     aoi_recipients: BTreeSet<PeerId>,
     aoi_recipient_cursor: Option<PeerId>,
+    chat_fanout: VecDeque<FanoutJob>,
+    chat_fanout_bytes: usize,
+    clock_fanout: Option<FanoutJob>,
+    fanout_prefer_clock: bool,
+    dirty_sessions: BTreeSet<PeerId>,
+    flush_sessions: BTreeSet<PeerId>,
+    flush_paused: bool,
     identity_players: HashMap<String, u64>,
     seq: u32,
     snapshot_tick: u32,
@@ -203,6 +251,13 @@ impl Server {
             snapshot_recipient_cursor: None,
             aoi_recipients: BTreeSet::new(),
             aoi_recipient_cursor: None,
+            chat_fanout: VecDeque::new(),
+            chat_fanout_bytes: 0,
+            clock_fanout: None,
+            fanout_prefer_clock: true,
+            dirty_sessions: BTreeSet::new(),
+            flush_sessions: BTreeSet::new(),
+            flush_paused: false,
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -229,10 +284,14 @@ impl Server {
         // Readiness line on stdout (the protocol-smoke harness waits for this).
         println!("listening on {addr}");
         std::io::stdout().flush().ok();
-        tracing::info!(%addr, server = %self.cfg.server_name, "server started");
+        tracing::info!(
+            %addr,
+            server = %self.cfg.server_name,
+            nominal_snapshot_cadence_ticks = self.cfg.ticks_per_snapshot(),
+            "server started"
+        );
 
         let tick_dt = Duration::from_secs_f64(1.0 / self.cfg.tick_hz as f64);
-        let ticks_per_snapshot = self.cfg.ticks_per_snapshot();
         let ticks_per_clock_broadcast = self.cfg.ticks_per_clock_broadcast();
         let mut tick: u64 = 0;
         let mut last_flush = Instant::now();
@@ -248,9 +307,10 @@ impl Server {
             }
 
             self.process_aoi_work();
-
-            if tick % ticks_per_snapshot == 0 {
-                self.broadcast_snapshots();
+            self.broadcast_snapshots();
+            self.process_fanout_work();
+            if let Err(e) = self.process_dirty_flush_at(now_ms()) {
+                tracing::warn!(error = %e, "bounded dirty flush paused until next cadence");
             }
 
             if tick % ticks_per_clock_broadcast == 0 {
@@ -258,9 +318,7 @@ impl Server {
             }
 
             if frame_start.duration_since(last_flush) >= FLUSH_INTERVAL {
-                if let Err(e) = self.flush_dirty() {
-                    tracing::warn!(error = %e, "dirty flush failed");
-                }
+                self.begin_dirty_flush();
                 last_flush = frame_start;
             }
 
@@ -503,7 +561,6 @@ impl Server {
         self.register_session(
             peer,
             Session {
-                peer,
                 player_id,
                 identity_hash,
                 display_name: name,
@@ -517,9 +574,10 @@ impl Server {
                 dirty: true,
                 snapshot_cursor: None,
                 snapshot_remaining: 0,
+                snapshot_last_visit_tick: 0,
                 published_cells: HashSet::new(),
-                hydration_cells: VecDeque::new(),
-                hydration_pending: HashSet::new(),
+                hydration_cells: HashSet::new(),
+                hydration_cursor: None,
                 active_hydration: None,
             },
         )?;
@@ -611,6 +669,7 @@ impl Server {
             aoi = s.sub.recenter(cell);
             s.cell = Some(cell);
         }
+        self.dirty_sessions.insert(peer);
 
         self.emit_aoi(peer, &aoi);
     }
@@ -847,9 +906,14 @@ impl Server {
         if !validate::string_within_limit(text, self.cfg.max_wire_string_len_usize()) {
             return;
         }
+        if self.chat_fanout.len() >= CHAT_QUEUE_ITEMS
+            || self.chat_fanout_bytes > CHAT_QUEUE_BYTES - (protocol::MTU - protocol::HEADER_SIZE)
+        {
+            return;
+        }
 
         // Per-player chat throttle: a flood beyond the configured rate is dropped
-        // before it fans out to every AoI subscriber.
+        // before it enters the bounded fanout queue.
         if !self.chat_limiter.allow(sender_player, now_ms) {
             return;
         }
@@ -863,17 +927,13 @@ impl Server {
             return;
         }
 
-        // Deliver to every session whose AoI currently includes the sender's cell.
-        let recipients: Vec<PeerId> = self
-            .sessions
-            .values()
-            .filter(|r| r.sub.contains(cell))
-            .map(|r| r.peer)
-            .collect();
-
-        for target in recipients {
-            self.send(target, &bytes);
-        }
+        self.chat_fanout_bytes += bytes.len();
+        self.chat_fanout.push_back(FanoutJob {
+            bytes,
+            sender_cell: Some(cell),
+            recipient_cursor: None,
+            recipients_remaining: self.snapshot_recipients.len(),
+        });
     }
 
     fn on_disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> anyhow::Result<()> {
@@ -905,10 +965,14 @@ impl Server {
             ));
         }
         let player_id = session.player_id;
+        let dirty = session.dirty;
         self.sessions.insert(peer, session);
         self.player_peers.insert(player_id, peer);
         self.player_order.insert(player_id);
         self.snapshot_recipients.insert(peer);
+        if dirty {
+            self.dirty_sessions.insert(peer);
+        }
         self.schedule_aoi(peer);
         Ok(())
     }
@@ -930,6 +994,8 @@ impl Server {
         let mut work = RecipientIndexWork::default();
         work.remove(&mut self.snapshot_recipients, peer);
         work.remove(&mut self.aoi_recipients, peer);
+        self.dirty_sessions.remove(&peer);
+        self.flush_sessions.remove(&peer);
         Some((session, work))
     }
 
@@ -953,52 +1019,80 @@ impl Server {
             self.snapshot_recipient_cursor = Some(last);
         }
         for peer in recipients {
-            let Some((self_pid, cell, cursor, remaining)) =
+            let Some((self_pid, cell, cursor, remaining, last_visit_tick)) =
                 self.sessions.get(&peer).and_then(|s| {
-                    s.cell
-                        .map(|cell| (s.player_id, cell, s.snapshot_cursor, s.snapshot_remaining))
+                    s.cell.map(|cell| {
+                        (
+                            s.player_id,
+                            cell,
+                            s.snapshot_cursor,
+                            s.snapshot_remaining,
+                            s.snapshot_last_visit_tick,
+                        )
+                    })
                 })
             else {
                 continue;
             };
+            let nominal_cadence = self.cfg.ticks_per_snapshot().min(u64::from(u32::MAX)) as u32;
+            if last_visit_tick != 0 && server_tick.wrapping_sub(last_visit_tick) < nominal_cadence {
+                continue;
+            }
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                session.snapshot_last_visit_tick = server_tick;
+            }
             work.recipient_visits += 1;
-            let remaining = if remaining == 0 {
-                self.player_order.len()
+            let candidates =
+                self.player_candidates_after(Some(self_pid), SNAPSHOT_ENTITY_SCAN_PER_PACKET);
+            work.candidates_examined += candidates.len();
+            let selected: Vec<u64> = candidates
+                .into_iter()
+                .filter(|&player_id| player_id != self_pid)
+                .filter(|&player_id| {
+                    self.session_by_player(player_id)
+                        .and_then(|session| session.cell)
+                        .is_some_and(|other| {
+                            other.chebyshev_distance(cell) <= self.cfg.aoi_radius_i32()
+                        })
+                })
+                .take(SNAPSHOT_VISIBILITY_CEILING)
+                .collect();
+            if selected.is_empty() {
+                if let Some(session) = self.sessions.get_mut(&peer) {
+                    session.snapshot_cursor = None;
+                    session.snapshot_remaining = 0;
+                }
+                continue;
+            }
+
+            let cursor_position = cursor
+                .and_then(|cursor| selected.iter().position(|&player_id| player_id == cursor));
+            let remaining = if remaining == 0 || cursor_position.is_none() {
+                selected.len()
             } else {
-                remaining
+                remaining.min(selected.len())
             };
-            let candidates = self
-                .player_candidates_after(cursor, remaining.min(SNAPSHOT_ENTITY_SCAN_PER_PACKET));
+            let start = cursor_position.map_or(0, |position| (position + 1) % selected.len());
+            let emit_count = remaining.min(SNAPSHOT_ENTITIES_PER_PACKET);
             let mut players = Vec::new();
             let mut boats = Vec::new();
             let mut last_examined = None;
-            let mut examined = 0usize;
-            for player_id in candidates {
+            for offset in 0..emit_count {
+                let player_id = selected[(start + offset) % selected.len()];
                 last_examined = Some(player_id);
-                examined += 1;
-                work.candidates_examined += 1;
-                if player_id == self_pid {
-                    continue;
-                }
                 let Some(session) = self.session_by_player(player_id) else {
                     continue;
                 };
-                if !session.cell.is_some_and(|other| {
-                    other.chebyshev_distance(cell) <= self.cfg.aoi_radius_i32()
-                }) {
-                    continue;
-                }
                 players.push(player_snap(session));
                 if session.aboard_boat != 0 {
                     boats.push(boat_snap(session));
                 }
-                if players.len() == SNAPSHOT_ENTITIES_PER_PACKET {
-                    break;
-                }
+                #[cfg(test)]
+                work.advertised.push((peer, player_id));
             }
             if let Some(session) = self.sessions.get_mut(&peer) {
                 session.snapshot_cursor = last_examined;
-                session.snapshot_remaining = remaining.saturating_sub(examined);
+                session.snapshot_remaining = remaining.saturating_sub(emit_count);
             }
             if players.is_empty() && boats.is_empty() {
                 continue;
@@ -1224,13 +1318,18 @@ impl Server {
 
         for cell in &removed {
             session.published_cells.remove(cell);
-            session.hydration_pending.remove(cell);
+            session.hydration_cells.remove(cell);
+            if session
+                .active_hydration
+                .as_ref()
+                .is_some_and(|active| active.cell == *cell)
+            {
+                session.active_hydration = None;
+            }
         }
         for &cell in &added {
             session.published_cells.insert(cell);
-            if session.hydration_pending.insert(cell) {
-                session.hydration_cells.push_back(cell);
-            }
+            session.hydration_cells.insert(cell);
         }
         Some((added, removed))
     }
@@ -1244,19 +1343,13 @@ impl Server {
         if let Some(active) = session.active_hydration.as_ref() {
             if !session.sub.contains(active.cell) || !session.published_cells.contains(&active.cell)
             {
-                session.hydration_pending.remove(&active.cell);
                 session.active_hydration = None;
-                return None;
             }
         }
         if session.active_hydration.is_none() {
-            let cell = session.hydration_cells.pop_front()?;
-            if !session.hydration_pending.remove(&cell)
-                || !session.sub.contains(cell)
-                || !session.published_cells.contains(&cell)
-            {
-                return None;
-            }
+            let cell = next_hydration_cell(&session.hydration_cells, session.hydration_cursor)?;
+            session.hydration_cells.remove(&cell);
+            session.hydration_cursor = Some(cell);
             session.active_hydration = Some(CellHydration {
                 cell,
                 player_cursor: None,
@@ -1295,33 +1388,123 @@ impl Server {
             .collect()
     }
 
-    /// Broadcast the current world clock to every connected session. The clock
-    /// is derived authority (see [`clock_from_epoch`]); the weather seed is
-    /// join-only in `ServerHello` and is deliberately not rebroadcast here.
+    /// Queue the current derived world clock for bounded delivery. Repeated
+    /// cadence events coalesce to the latest clock instead of accumulating one
+    /// population-wide job per cadence.
     fn broadcast_clock(&mut self) {
         let clock = self.clock_now();
-        let peers: Vec<PeerId> = self.sessions.keys().copied().collect();
-        for peer in peers {
-            let bytes = codec::world_clock(self.next_seq(), clock);
-            self.send(peer, &bytes);
+        let bytes = codec::world_clock(self.next_seq(), clock);
+        if self.snapshot_recipients.is_empty() {
+            self.clock_fanout = None;
+            return;
+        }
+        self.clock_fanout = Some(FanoutJob {
+            bytes,
+            sender_cell: None,
+            recipient_cursor: None,
+            recipients_remaining: self.snapshot_recipients.len(),
+        });
+    }
+
+    fn process_fanout_work(&mut self) -> FanoutTickWork {
+        let mut work = FanoutTickWork::default();
+        while work.recipient_scans < FANOUT_RECIPIENT_SCANS_PER_TICK
+            && work.sends < FANOUT_SENDS_PER_TICK
+        {
+            let from_clock = self.clock_fanout.is_some()
+                && (self.fanout_prefer_clock || self.chat_fanout.is_empty());
+            let Some(mut job) = (if from_clock {
+                self.clock_fanout.take()
+            } else {
+                self.chat_fanout.pop_front()
+            }) else {
+                if self.clock_fanout.is_none() && self.chat_fanout.is_empty() {
+                    break;
+                }
+                self.fanout_prefer_clock = !self.fanout_prefer_clock;
+                continue;
+            };
+
+            while job.recipients_remaining > 0
+                && work.recipient_scans < FANOUT_RECIPIENT_SCANS_PER_TICK
+                && work.sends < FANOUT_SENDS_PER_TICK
+            {
+                let Some(peer) = next_peer_after(&self.snapshot_recipients, job.recipient_cursor)
+                else {
+                    job.recipients_remaining = 0;
+                    break;
+                };
+                job.recipient_cursor = Some(peer);
+                job.recipients_remaining -= 1;
+                work.recipient_scans += 1;
+
+                let should_send = job.sender_cell.is_none_or(|cell| {
+                    self.sessions
+                        .get(&peer)
+                        .is_some_and(|session| session.sub.contains(cell))
+                });
+                if should_send {
+                    self.send(peer, &job.bytes);
+                    work.sends += 1;
+                    work.encoded_bytes += job.bytes.len();
+                }
+            }
+
+            if job.recipients_remaining == 0 {
+                work.jobs_completed += 1;
+                if from_clock {
+                    self.fanout_prefer_clock = false;
+                } else {
+                    self.chat_fanout_bytes = self.chat_fanout_bytes.saturating_sub(job.bytes.len());
+                    self.fanout_prefer_clock = true;
+                }
+            } else {
+                if from_clock {
+                    self.clock_fanout = Some(job);
+                } else {
+                    self.chat_fanout.push_front(job);
+                }
+                break;
+            }
+        }
+        work
+    }
+
+    fn begin_dirty_flush(&mut self) {
+        self.flush_paused = false;
+        if self.flush_sessions.is_empty() {
+            std::mem::swap(&mut self.flush_sessions, &mut self.dirty_sessions);
         }
     }
 
-    fn flush_dirty(&mut self) -> anyhow::Result<()> {
-        let now = now_ms();
-        let dirty: Vec<(PeerId, u64)> = self
-            .sessions
+    fn process_dirty_flush_at(&mut self, now: i64) -> anyhow::Result<DirtyFlushTickWork> {
+        let mut work = DirtyFlushTickWork::default();
+        if self.flush_paused {
+            return Ok(work);
+        }
+        let peers: Vec<PeerId> = self
+            .flush_sessions
             .iter()
-            .filter(|(_, s)| s.dirty)
-            .map(|(&peer, s)| (peer, s.player_id))
+            .take(DIRTY_DB_UPDATES_PER_TICK)
+            .copied()
             .collect();
-        for (peer, player_id) in dirty {
-            self.db.touch_last_seen(player_id as i64, now)?;
-            if let Some(s) = self.sessions.get_mut(&peer) {
-                s.dirty = false;
+        for peer in peers {
+            let Some(player_id) = self.sessions.get(&peer).map(|session| session.player_id) else {
+                self.flush_sessions.remove(&peer);
+                continue;
+            };
+            if let Err(error) = self.db.touch_last_seen(player_id as i64, now) {
+                self.flush_paused = true;
+                return Err(error.into());
+            }
+            self.flush_sessions.remove(&peer);
+            work.db_updates += 1;
+            let still_dirty = self.dirty_sessions.contains(&peer);
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                session.dirty = still_dirty;
             }
         }
-        Ok(())
+        Ok(work)
     }
 
     fn flush_all(&mut self) -> anyhow::Result<()> {
@@ -1436,6 +1619,30 @@ fn mooring_snap(row: MooringRow) -> MooringSnap {
         name: row.name,
         created_at: row.created_at as u64,
     }
+}
+
+fn next_peer_after(peers: &BTreeSet<PeerId>, cursor: Option<PeerId>) -> Option<PeerId> {
+    match cursor {
+        Some(cursor) => peers
+            .range((Excluded(cursor), Unbounded))
+            .next()
+            .or_else(|| peers.iter().next())
+            .copied(),
+        None => peers.iter().next().copied(),
+    }
+}
+
+fn next_hydration_cell(cells: &HashSet<Cell>, cursor: Option<Cell>) -> Option<Cell> {
+    let key = |cell: &Cell| (cell.cz, cell.cx);
+    cursor
+        .and_then(|cursor| {
+            cells
+                .iter()
+                .filter(|cell| key(cell) > key(&cursor))
+                .min_by_key(|cell| key(cell))
+                .copied()
+        })
+        .or_else(|| cells.iter().min_by_key(|cell| key(cell)).copied())
 }
 
 fn vec3_of(v: Option<&p::Vec3>) -> [f32; 3] {
@@ -1588,6 +1795,13 @@ mod handshake_tests {
             snapshot_recipient_cursor: None,
             aoi_recipients: BTreeSet::new(),
             aoi_recipient_cursor: None,
+            chat_fanout: VecDeque::new(),
+            chat_fanout_bytes: 0,
+            clock_fanout: None,
+            fanout_prefer_clock: true,
+            dirty_sessions: BTreeSet::new(),
+            flush_sessions: BTreeSet::new(),
+            flush_paused: false,
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -2337,6 +2551,10 @@ mod handshake_tests {
             .unwrap();
 
         assert_eq!(server.seq, seq_before_chat.wrapping_add(1));
+        let fanout = server.process_fanout_work();
+        assert_eq!(fanout.recipient_scans, 2);
+        assert_eq!(fanout.sends, 2);
+        assert_eq!(fanout.jobs_completed, 1);
         let sender_payload = receive_payload(&sender, p::Payload::ChatBroadcast);
         let observer_payload = receive_payload(&observer, p::Payload::ChatBroadcast);
         assert_eq!(
@@ -2443,8 +2661,8 @@ mod handshake_tests {
         assert_eq!(
             server
                 .session_by_player(player_id)
-                .map(|session| session.peer),
-            Some(replacement_peer)
+                .map(|session| session.player_id),
+            Some(player_id)
         );
         assert!(!server.sessions.contains_key(&first_peer));
         assert!(!server
@@ -2645,8 +2863,8 @@ mod handshake_tests {
         assert_eq!(
             server
                 .session_by_player(player_id)
-                .map(|session| session.peer),
-            Some(rotated_peer)
+                .map(|session| session.player_id),
+            Some(player_id)
         );
     }
 
@@ -3133,7 +3351,7 @@ mod handshake_tests {
 mod aoi_harden_tests {
     use super::*;
     use flatbuffers::FlatBufferBuilder;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use sw_contracts::{decode_envelope, finish_envelope};
     use sw_world::{cells_in_radius, EntityId, Grid};
 
@@ -3171,6 +3389,13 @@ mod aoi_harden_tests {
             snapshot_recipient_cursor: None,
             aoi_recipients: BTreeSet::new(),
             aoi_recipient_cursor: None,
+            chat_fanout: VecDeque::new(),
+            chat_fanout_bytes: 0,
+            clock_fanout: None,
+            fanout_prefer_clock: true,
+            dirty_sessions: BTreeSet::new(),
+            flush_sessions: BTreeSet::new(),
+            flush_paused: false,
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3343,7 +3568,6 @@ mod aoi_harden_tests {
             .register_session(
                 peer,
                 Session {
-                    peer,
                     player_id,
                     identity_hash: format!("identity-{player_id}"),
                     display_name: format!("Player {player_id}"),
@@ -3357,9 +3581,10 @@ mod aoi_harden_tests {
                     dirty: false,
                     snapshot_cursor: None,
                     snapshot_remaining: 0,
+                    snapshot_last_visit_tick: 0,
                     published_cells: HashSet::new(),
-                    hydration_cells: VecDeque::new(),
-                    hydration_pending: HashSet::new(),
+                    hydration_cells: HashSet::new(),
+                    hydration_cursor: None,
                     active_hydration: None,
                 },
             )
@@ -3408,6 +3633,7 @@ mod aoi_harden_tests {
             let viewer = server.sessions.get_mut(&1).unwrap();
             viewer.snapshot_cursor = None;
             viewer.snapshot_remaining = 0;
+            viewer.snapshot_last_visit_tick = 0;
         }
         let mut encoded_for_viewer = 0usize;
         let mut viewer_visits = 0usize;
@@ -3417,20 +3643,96 @@ mod aoi_harden_tests {
             assert!(work.packets <= 1);
             assert!(work.encoded_bytes <= protocol::MTU - protocol::HEADER_SIZE);
             encoded_for_viewer += work.player_states_encoded;
-            viewer_visits += 1;
+            viewer_visits += work.recipient_visits;
             if server.sessions[&1].snapshot_remaining == 0 {
                 break;
             }
         }
         assert_eq!(
             encoded_for_viewer,
-            DENSE_SESSIONS as usize - 1,
-            "one deterministic entity sweep must eventually emit every other co-located player once"
+            SNAPSHOT_VISIBILITY_CEILING,
+            "one deterministic entity sweep must emit the recipient's stable dense visibility ceiling"
         );
         assert!(
-            viewer_visits <= (DENSE_SESSIONS as usize).div_ceil(SNAPSHOT_ENTITIES_PER_PACKET),
+            viewer_visits <= SNAPSHOT_VISIBILITY_CEILING.div_ceil(SNAPSHOT_ENTITIES_PER_PACKET),
             "entity cursor must make fixed positive progress on every dense visit"
         );
+    }
+
+    #[test]
+    fn dense_snapshot_elected_visibility_refreshes_before_client_expiry() {
+        const DENSE_SESSIONS: PeerId = 1_024;
+        const CLIENT_STALE_MS: usize = 5_000;
+        const SIMULATION_TICKS: usize = 600;
+
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        for peer in 1..=DENSE_SESSIONS {
+            insert_dense_session(&mut server, peer, center);
+        }
+
+        let stale_ticks = CLIENT_STALE_MS * server.cfg.tick_hz as usize / 1_000;
+        let mut last_advertised = HashMap::<(PeerId, u64), usize>::new();
+        let mut elected = HashMap::<PeerId, HashSet<u64>>::new();
+        let mut repeated = 0usize;
+
+        for tick in 0..SIMULATION_TICKS {
+            let work = server.broadcast_snapshots();
+            assert!(work.recipient_visits <= SNAPSHOT_PACKETS_PER_TICK);
+            assert!(
+                work.candidates_examined
+                    <= SNAPSHOT_PACKETS_PER_TICK * SNAPSHOT_ENTITY_SCAN_PER_PACKET
+            );
+            assert!(work.packets <= SNAPSHOT_PACKETS_PER_TICK);
+            assert!(
+                work.encoded_bytes
+                    <= SNAPSHOT_PACKETS_PER_TICK * (protocol::MTU - protocol::HEADER_SIZE)
+            );
+
+            for &(peer, player_id) in &work.advertised {
+                elected.entry(peer).or_default().insert(player_id);
+                if let Some(previous) = last_advertised.insert((peer, player_id), tick) {
+                    repeated += 1;
+                    assert!(
+                        tick - previous < stale_ticks,
+                        "peer {peer}'s elected player {player_id} went {} ticks without a refresh, \
+                         but the real client expires it after {stale_ticks} production ticks",
+                        tick - previous
+                    );
+                }
+            }
+        }
+
+        assert_eq!(elected.len(), DENSE_SESSIONS as usize);
+        assert!(
+            elected
+                .values()
+                .all(|players| players.len() == SNAPSHOT_VISIBILITY_CEILING),
+            "every dense recipient must retain one stable, full visibility ceiling"
+        );
+        assert!(
+            repeated >= DENSE_SESSIONS as usize * SNAPSHOT_VISIBILITY_CEILING,
+            "every elected pair must be observed often enough to prove recurrence"
+        );
+    }
+
+    #[test]
+    fn sparse_snapshots_keep_the_configured_nominal_cadence() {
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        insert_dense_session(&mut server, 1, center);
+        insert_dense_session(&mut server, 2, center);
+
+        let cadence = server.cfg.ticks_per_snapshot() as usize;
+        let mut packet_ticks = Vec::new();
+        for tick in 0..=cadence * 3 {
+            let work = server.broadcast_snapshots();
+            if work.packets != 0 {
+                assert_eq!(work.packets, 2);
+                packet_ticks.push(tick);
+            }
+        }
+        assert_eq!(packet_ticks, vec![0, cadence, cadence * 2, cadence * 3]);
     }
 
     #[test]
@@ -3462,6 +3764,160 @@ mod aoi_harden_tests {
             server.aoi_recipients.len(),
             DENSE_SESSIONS as usize,
             "unfinished per-session hydration remains one deduplicated work item per live peer"
+        );
+    }
+
+    #[test]
+    fn hostile_movement_churn_cannot_accumulate_stale_hydration_cells() {
+        const MOVES: usize = 20_000;
+
+        let mut server = make_server(Config::default());
+        insert_dense_session(&mut server, 1, Cell::new(0, 0));
+
+        for step in 0..MOVES {
+            let x = if step % 2 == 0 { 10_000.0 } else { 0.0 };
+            let cell = server.world.grid().cell_of(x, 0.0);
+            let aoi = {
+                let session = server.sessions.get_mut(&1).unwrap();
+                let update = session.sub.recenter(cell);
+                session.cell = Some(cell);
+                update
+            };
+            server.emit_aoi(1, &aoi);
+            server.process_aoi_work();
+
+            let session = &server.sessions[&1];
+            assert!(
+                session.hydration_cells.len() + usize::from(session.active_hydration.is_some())
+                    <= session.published_cells.len(),
+                "stale movement history escaped the current published-interest bound"
+            );
+            assert!(
+                session
+                    .hydration_cells
+                    .iter()
+                    .all(|cell| session.published_cells.contains(cell)),
+                "removed cells must leave hydration storage immediately"
+            );
+        }
+
+        let final_cell = Cell::new(0, 0);
+        let final_update = {
+            let session = server.sessions.get_mut(&1).unwrap();
+            let update = session.sub.recenter(final_cell);
+            session.cell = Some(final_cell);
+            update
+        };
+        server.emit_aoi(1, &final_update);
+
+        let max_visits = server.sessions[&1].sub.cells().len() * 3 + 2;
+        for _ in 0..max_visits {
+            server.process_aoi_work();
+            if !server.session_has_aoi_work(1) {
+                break;
+            }
+        }
+        assert!(
+            !server.session_has_aoi_work(1),
+            "current desired cells must hydrate within a fixed number of visits independent of movement history"
+        );
+    }
+
+    #[test]
+    fn hostile_population_fanout_and_flush_stay_capped_and_make_progress() {
+        const DENSE_SESSIONS: PeerId = 1_024;
+        const SIMULATION_TICKS: usize = 603;
+        const FLUSH_TICKS: usize = 5 * 30;
+        const CLOCK_TICKS: usize = 10 * 30;
+
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        for peer in 1..=DENSE_SESSIONS {
+            insert_dense_session(&mut server, peer, center);
+            let session = server.sessions.get_mut(&peer).unwrap();
+            session.dirty = true;
+            server.dirty_sessions.insert(peer);
+        }
+
+        let seq_before_chat = server.seq;
+        for peer in 1..=DENSE_SESSIONS {
+            let mut fbb = FlatBufferBuilder::new();
+            let text = fbb.create_string("transport-sized hostile batch");
+            let chat = p::ChatSend::create(
+                &mut fbb,
+                &p::ChatSendArgs {
+                    text: Some(text),
+                    channel: 0,
+                },
+            );
+            let bytes = finish_envelope(&mut fbb, 1, p::Payload::ChatSend, chat.as_union_value());
+            let envelope = decode_envelope(&bytes).unwrap();
+            server.on_chat(
+                peer,
+                envelope.payload_as_chat_send().unwrap(),
+                i64::from(peer),
+            );
+        }
+        assert_eq!(
+            server.seq.wrapping_sub(seq_before_chat) as usize,
+            CHAT_QUEUE_ITEMS,
+            "one real maximum transport batch is accepted and excess distinct-player chat is rejected"
+        );
+        assert_eq!(server.chat_fanout.len(), CHAT_QUEUE_ITEMS);
+        assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+
+        let mut total_jobs_completed = 0usize;
+        let mut total_db_updates = 0usize;
+        for tick in 0..SIMULATION_TICKS {
+            let fanout = server.process_fanout_work();
+            assert!(fanout.recipient_scans <= FANOUT_RECIPIENT_SCANS_PER_TICK);
+            assert!(fanout.sends <= FANOUT_SENDS_PER_TICK);
+            assert!(
+                fanout.encoded_bytes
+                    <= FANOUT_SENDS_PER_TICK * (protocol::MTU - protocol::HEADER_SIZE)
+            );
+            total_jobs_completed += fanout.jobs_completed;
+
+            let flush = server.process_dirty_flush_at(1_700_000_000_000 + tick as i64);
+            let flush = flush.unwrap();
+            assert!(flush.db_updates <= DIRTY_DB_UPDATES_PER_TICK);
+            total_db_updates += flush.db_updates;
+
+            if tick > 0 && tick % FLUSH_TICKS == 0 {
+                server.begin_dirty_flush();
+            }
+            if tick % CLOCK_TICKS == 0 {
+                server.broadcast_clock();
+                server.broadcast_clock();
+                assert!(
+                    server.clock_fanout.is_some(),
+                    "repeated clock cadence coalesces into one latest-value job"
+                );
+            }
+
+            assert!(server.chat_fanout.len() <= CHAT_QUEUE_ITEMS);
+            assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+            assert!(server.clock_fanout.iter().count() <= 1);
+            assert!(server.dirty_sessions.len() <= server.sessions.len());
+            assert!(server.flush_sessions.len() <= server.sessions.len());
+            assert!(
+                server.dirty_sessions.len() + server.flush_sessions.len()
+                    <= server.sessions.len() * 2
+            );
+        }
+
+        assert!(server.chat_fanout.is_empty());
+        assert_eq!(server.chat_fanout_bytes, 0);
+        assert!(
+            server.clock_fanout.is_none(),
+            "the last coalesced clock must eventually reach its bounded audience"
+        );
+        assert!(server.dirty_sessions.is_empty());
+        assert!(server.flush_sessions.is_empty());
+        assert_eq!(total_db_updates, DENSE_SESSIONS as usize);
+        assert!(
+            total_jobs_completed >= CHAT_QUEUE_ITEMS + 3,
+            "all accepted chats and the three coalesced clock jobs must complete fairly"
         );
     }
 
@@ -3730,6 +4186,13 @@ mod market_dispatch_tests {
             snapshot_recipient_cursor: None,
             aoi_recipients: BTreeSet::new(),
             aoi_recipient_cursor: None,
+            chat_fanout: VecDeque::new(),
+            chat_fanout_bytes: 0,
+            clock_fanout: None,
+            fanout_prefer_clock: true,
+            dirty_sessions: BTreeSet::new(),
+            flush_sessions: BTreeSet::new(),
+            flush_paused: false,
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3986,6 +4449,13 @@ mod input_hardening_tests {
             snapshot_recipient_cursor: None,
             aoi_recipients: BTreeSet::new(),
             aoi_recipient_cursor: None,
+            chat_fanout: VecDeque::new(),
+            chat_fanout_bytes: 0,
+            clock_fanout: None,
+            fanout_prefer_clock: true,
+            dirty_sessions: BTreeSet::new(),
+            flush_sessions: BTreeSet::new(),
+            flush_paused: false,
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -4405,7 +4875,6 @@ mod input_hardening_tests {
             let session = server.sessions.get_mut(&peer).unwrap();
             session.published_cells = session.sub.cells().clone();
             session.hydration_cells.clear();
-            session.hydration_pending.clear();
             session.active_hydration = Some(CellHydration {
                 cell,
                 player_cursor: None,
@@ -4729,14 +5198,14 @@ mod input_hardening_tests {
     #[test]
     #[ignore = "load/perf test: wall-clock timed; run via `make load-test` or the non-blocking CI load job"]
     fn load_n_clients_stay_within_the_tick_budget() {
-        // Headless load: N simulated clients drive the *real* client-state handler
-        // and snapshot broadcast every tick against the in-memory server. The
-        // per-tick server work must stay under the fixed-tick budget (1 / tick_hz),
-        // i.e. the server keeps up with real time at N clients. Timing is
-        // wall-clock, so this is `#[ignore]`d out of the required gate (`cargo test`
-        // skips it) and run only by the non-blocking load job / `make load-test`.
+        // Headless load: N simulated clients drive the real client-state, AoI,
+        // snapshot, chat/clock fanout, and persistence-flush paths. The per-tick
+        // server work must stay under the fixed-tick budget (1 / tick_hz), i.e.
+        // the server keeps up with real time at N clients. Timing is wall-clock,
+        // so this is `#[ignore]`d out of the required gate (`cargo test` skips it)
+        // and run only by the non-blocking load job / `make load-test`.
         const N: u32 = 1_024;
-        const TICKS: u32 = 60;
+        const TICKS: u32 = 450;
         const LOAD_EPOCH_MS: i64 = 1_700_000_000_000;
 
         let cfg = Config::default();
@@ -4768,6 +5237,19 @@ mod input_hardening_tests {
         assert_eq!(server.sessions.len(), N as usize);
         assert_eq!(server.world.len(), N as usize);
 
+        // One maximum transport poll worth of accepted dense chat fanout; the
+        // remaining distinct-player inputs are rejected at the fixed queue cap.
+        for peer in 1..=N as PeerId {
+            send_chat(
+                &mut server,
+                peer,
+                "release hostile fanout",
+                100_000 + i64::from(peer),
+            );
+        }
+        assert_eq!(server.chat_fanout.len(), CHAT_QUEUE_ITEMS);
+        assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+
         // Drive TICKS simulated ticks and measure the wall-clock server work. The
         // simulated clock advances by a full tick each round so every client's
         // per-tick update clears the throttle window (worst-case load).
@@ -4785,10 +5267,46 @@ mod input_hardening_tests {
                     now,
                 );
             }
-            server.broadcast_snapshots();
+            let aoi = server.process_aoi_work();
+            assert!(aoi.recipient_visits <= AOI_WORK_ITEMS_PER_TICK);
+            let snapshots = server.broadcast_snapshots();
+            assert!(snapshots.recipient_visits <= SNAPSHOT_PACKETS_PER_TICK);
+            assert!(
+                snapshots.candidates_examined
+                    <= SNAPSHOT_PACKETS_PER_TICK * SNAPSHOT_ENTITY_SCAN_PER_PACKET
+            );
+            let fanout = server.process_fanout_work();
+            assert!(fanout.recipient_scans <= FANOUT_RECIPIENT_SCANS_PER_TICK);
+            assert!(fanout.sends <= FANOUT_SENDS_PER_TICK);
+            assert!(
+                fanout.encoded_bytes
+                    <= FANOUT_SENDS_PER_TICK * (protocol::MTU - protocol::HEADER_SIZE)
+            );
+            let flush = server
+                .process_dirty_flush_at(LOAD_EPOCH_MS + i64::from(t))
+                .unwrap();
+            assert!(flush.db_updates <= DIRTY_DB_UPDATES_PER_TICK);
+
+            if t > 0 && t % (server.cfg.tick_hz * FLUSH_INTERVAL.as_secs() as u32) == 0 {
+                server.begin_dirty_flush();
+            }
+            if t % server.cfg.ticks_per_clock_broadcast() as u32 == 0 {
+                server.broadcast_clock();
+                server.broadcast_clock();
+                assert!(server.clock_fanout.is_some());
+            }
+            assert!(server.chat_fanout.len() <= CHAT_QUEUE_ITEMS);
+            assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+            assert!(server.clock_fanout.iter().count() <= 1);
+            assert!(server.dirty_sessions.len() <= server.sessions.len());
+            assert!(server.flush_sessions.len() <= server.sessions.len());
         }
         let elapsed = start.elapsed();
         let per_tick = elapsed / TICKS;
+
+        assert!(server.chat_fanout.is_empty());
+        assert_eq!(server.chat_fanout_bytes, 0);
+        assert!(server.clock_fanout.is_none());
 
         println!(
             "load: {N} clients x {TICKS} ticks in {elapsed:?} => {per_tick:?}/tick (real-time budget {tick_dt:?})"
