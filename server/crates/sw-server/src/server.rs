@@ -1000,7 +1000,7 @@ impl Server {
                 "player already owns session peer {existing_peer}"
             ));
         }
-        session.generation = self.allocate_session_generation();
+        session.generation = self.allocate_session_generation()?;
         let player_id = session.player_id;
         let dirty = session.dirty;
         self.sessions.insert(peer, session);
@@ -1036,13 +1036,50 @@ impl Server {
         Some((session, work))
     }
 
-    fn allocate_session_generation(&mut self) -> u64 {
+    fn allocate_session_generation(&mut self) -> anyhow::Result<u64> {
         if self.next_session_generation == u64::MAX {
-            self.invalidate_fanout_jobs();
-            self.next_session_generation = 0;
+            self.rekey_live_session_generations()?;
         }
-        self.next_session_generation += 1;
-        self.next_session_generation
+        self.next_session_generation = self
+            .next_session_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("session generation exhausted"))?;
+        Ok(self.next_session_generation)
+    }
+
+    fn rekey_live_session_generations(&mut self) -> anyhow::Result<()> {
+        let live_session_count = self.sessions.len();
+        if live_session_count > self.cfg.max_transport_peers_usize() {
+            return Err(anyhow::anyhow!(
+                "live session count exceeds configured transport limit"
+            ));
+        }
+
+        let mut peers: Vec<_> = self.sessions.keys().copied().collect();
+        peers.sort_unstable();
+        let rekeyed: Vec<_> = peers
+            .into_iter()
+            .enumerate()
+            .map(|(index, peer)| {
+                let generation = u64::try_from(index)
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| anyhow::anyhow!("live session generation overflow"))?;
+                Ok((peer, generation))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let next_generation = u64::try_from(live_session_count)
+            .map_err(|_| anyhow::anyhow!("live session count exceeds generation range"))?;
+
+        self.invalidate_fanout_jobs();
+        for (peer, generation) in rekeyed {
+            self.sessions
+                .get_mut(&peer)
+                .ok_or_else(|| anyhow::anyhow!("live session disappeared during re-key"))?
+                .generation = generation;
+        }
+        self.next_session_generation = next_generation;
+        Ok(())
     }
 
     fn invalidate_fanout_jobs(&mut self) {
@@ -4069,6 +4106,114 @@ mod aoi_harden_tests {
         );
         assert_eq!(server.chat_fanout_bytes, 0);
         assert_eq!(server.retained_fanout_audience_entries(), 0);
+    }
+
+    #[test]
+    fn post_wrap_fanout_never_reaches_a_replacement_with_a_colliding_generation() {
+        let mut server = make_server(Config {
+            chat_min_interval_ms: 0,
+            ..Config::default()
+        });
+        let center = Cell::new(0, 0);
+        insert_dense_session(&mut server, 1, center);
+        insert_dense_session(&mut server, 2, center);
+        assert_eq!(server.sessions[&1].generation, 1);
+        assert_eq!(server.sessions[&2].generation, 2);
+
+        server.next_session_generation = u64::MAX;
+        insert_dense_session(&mut server, 3, center);
+
+        let bytes = chat_bytes("post-wrap audience");
+        let envelope = decode_envelope(&bytes).unwrap();
+        server.on_chat(1, envelope.payload_as_chat_send().unwrap(), 1_000);
+        server.broadcast_clock();
+        let captured_generation = server.sessions[&2].generation;
+
+        let departed = server.unregister_session(2).unwrap();
+        server.world.remove(departed.player_id);
+        insert_dense_session_for_player(&mut server, 2, 22, center);
+        let replacement_generation = server.sessions[&2].generation;
+        assert_ne!(
+            replacement_generation, captured_generation,
+            "a replacement must never reuse a live identity captured after generation wrap"
+        );
+
+        let work = server.process_fanout_work_with_budget(6, 6);
+        assert_eq!(work.recipient_scans, 6);
+        assert_eq!(work.sends, 4);
+        assert_eq!(work.jobs_completed, 2);
+        let delivered_peers: Vec<_> = work
+            .delivered
+            .iter()
+            .map(|(peer, _generation)| *peer)
+            .collect();
+        assert_eq!(
+            delivered_peers.iter().filter(|&&peer| peer == 1).count(),
+            2,
+            "the first captured connection must receive chat and clock"
+        );
+        assert_eq!(
+            delivered_peers.iter().filter(|&&peer| peer == 3).count(),
+            2,
+            "the post-wrap connection must receive chat and clock"
+        );
+        assert!(
+            delivered_peers.iter().all(|&peer| peer != 2),
+            "the replacement must receive neither stale chat nor stale clock"
+        );
+    }
+
+    #[test]
+    fn repeated_generation_wraps_rekey_all_1024_live_sessions_without_index_drift() {
+        const WRAPS: PeerId = 3;
+        const MAX_SESSIONS: PeerId = sw_net::DEFAULT_MAX_PEERS as PeerId;
+
+        let mut server = make_server(Config::default());
+        assert_eq!(
+            server.cfg.max_transport_peers_usize(),
+            MAX_SESSIONS as usize
+        );
+        let center = Cell::new(0, 0);
+        for peer in 1..=(MAX_SESSIONS - WRAPS) {
+            insert_dense_session(&mut server, peer, center);
+        }
+
+        for peer in (MAX_SESSIONS - WRAPS + 1)..=MAX_SESSIONS {
+            server.next_session_generation = u64::MAX;
+            insert_dense_session(&mut server, peer, center);
+
+            let generations: BTreeSet<_> = server
+                .sessions
+                .values()
+                .map(|session| session.generation)
+                .collect();
+            assert_eq!(generations.len(), server.sessions.len());
+            assert!(!generations.contains(&0));
+            assert_eq!(server.next_session_generation, server.sessions.len() as u64);
+            for expected_peer in 1..=peer {
+                let session = &server.sessions[&expected_peer];
+                assert_eq!(
+                    session.generation,
+                    u64::from(expected_peer),
+                    "wrap re-keying must be deterministic in PeerId order"
+                );
+                assert_eq!(
+                    server.player_peers.get(&session.player_id),
+                    Some(&expected_peer)
+                );
+                assert!(server.player_order.contains(&session.player_id));
+                assert!(server.snapshot_recipients.contains(&expected_peer));
+                assert!(server.aoi_recipients.contains(&expected_peer));
+                assert_eq!(server.world.cell_of_entity(session.player_id), Some(center));
+            }
+        }
+
+        assert_eq!(server.sessions.len(), MAX_SESSIONS as usize);
+        assert_eq!(server.player_peers.len(), MAX_SESSIONS as usize);
+        assert_eq!(server.player_order.len(), MAX_SESSIONS as usize);
+        assert_eq!(server.snapshot_recipients.len(), MAX_SESSIONS as usize);
+        assert_eq!(server.aoi_recipients.len(), MAX_SESSIONS as usize);
+        assert_eq!(server.world.len(), MAX_SESSIONS as usize);
     }
 
     #[test]
