@@ -44,7 +44,13 @@ const AOI_CELLS_PER_UPDATE: usize = 32;
 const CELL_ENTITY_SCAN_PER_WORK: usize = 8;
 const CELL_ENTITIES_PER_PACKET: usize = 5;
 const CELL_MOORINGS_PER_PACKET: usize = 1;
-const MAX_SNAPSHOT_MOORING_NAME_BYTES: usize = 512;
+/// Largest UTF-8 mooring name that fits both unreliable record responses.
+///
+/// `mooring_name_limit_is_the_largest_mtu_safe_record_name` derives this value
+/// through the real codecs and proves that the next byte exceeds the 1,023-byte
+/// LiteNetLib payload in at least one of `MoorAck` or `CellSnapshot`.
+const MAX_MOORING_NAME_BYTES: usize = 835;
+const MOOR_NAME_TOO_LONG_REASON: &str = "mooring name exceeds server limit";
 
 struct CellHydration {
     cell: Cell,
@@ -75,7 +81,6 @@ struct Session {
     hydration_cells: VecDeque<Cell>,
     hydration_pending: HashSet<Cell>,
     active_hydration: Option<CellHydration>,
-    aoi_queued: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -94,7 +99,19 @@ struct AoiTickWork {
     packets: usize,
     cells_completed: usize,
     moorings_encoded: usize,
-    oversized_moorings_skipped: usize,
+    corrupt_moorings_skipped: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RecipientIndexWork {
+    recipient_index_operations: usize,
+}
+
+impl RecipientIndexWork {
+    fn remove(&mut self, recipients: &mut BTreeSet<PeerId>, peer: PeerId) {
+        self.recipient_index_operations += 1;
+        recipients.remove(&peer);
+    }
 }
 
 /// The server.
@@ -106,8 +123,10 @@ pub struct Server {
     sessions: HashMap<PeerId, Session>,
     player_peers: HashMap<u64, PeerId>,
     player_order: BTreeSet<u64>,
-    snapshot_recipients: VecDeque<PeerId>,
-    aoi_recipients: VecDeque<PeerId>,
+    snapshot_recipients: BTreeSet<PeerId>,
+    snapshot_recipient_cursor: Option<PeerId>,
+    aoi_recipients: BTreeSet<PeerId>,
+    aoi_recipient_cursor: Option<PeerId>,
     identity_players: HashMap<String, u64>,
     seq: u32,
     snapshot_tick: u32,
@@ -180,8 +199,10 @@ impl Server {
             sessions: HashMap::new(),
             player_peers: HashMap::new(),
             player_order: BTreeSet::new(),
-            snapshot_recipients: VecDeque::new(),
-            aoi_recipients: VecDeque::new(),
+            snapshot_recipients: BTreeSet::new(),
+            snapshot_recipient_cursor: None,
+            aoi_recipients: BTreeSet::new(),
+            aoi_recipient_cursor: None,
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -500,7 +521,6 @@ impl Server {
                 hydration_cells: VecDeque::new(),
                 hydration_pending: HashSet::new(),
                 active_hydration: None,
-                aoi_queued: false,
             },
         )?;
 
@@ -752,7 +772,13 @@ impl Server {
         let pos = motion.pos;
         let rot = motion.rot;
         let name = req.name().unwrap_or("mooring");
-        if !validate::string_within_limit(name, self.cfg.max_wire_string_len_usize()) {
+        let name_limit = self
+            .cfg
+            .max_wire_string_len_usize()
+            .min(MAX_MOORING_NAME_BYTES);
+        if !validate::string_within_limit(name, name_limit) {
+            let bytes = codec::moor_ack(self.next_seq(), false, None, MOOR_NAME_TOO_LONG_REASON);
+            self.send_bounded(peer, &bytes, "moor rejection");
             return Ok(());
         }
         let name = name.to_string();
@@ -882,44 +908,51 @@ impl Server {
         self.sessions.insert(peer, session);
         self.player_peers.insert(player_id, peer);
         self.player_order.insert(player_id);
-        self.snapshot_recipients.push_back(peer);
+        self.snapshot_recipients.insert(peer);
         self.schedule_aoi(peer);
         Ok(())
     }
 
     fn unregister_session(&mut self, peer: PeerId) -> Option<Session> {
+        self.unregister_session_with_work(peer)
+            .map(|(session, _)| session)
+    }
+
+    fn unregister_session_with_work(
+        &mut self,
+        peer: PeerId,
+    ) -> Option<(Session, RecipientIndexWork)> {
         let session = self.sessions.remove(&peer)?;
         if self.player_peers.get(&session.player_id) == Some(&peer) {
             self.player_peers.remove(&session.player_id);
             self.player_order.remove(&session.player_id);
         }
-        self.snapshot_recipients.retain(|&queued| queued != peer);
-        self.aoi_recipients.retain(|&queued| queued != peer);
-        Some(session)
+        let mut work = RecipientIndexWork::default();
+        work.remove(&mut self.snapshot_recipients, peer);
+        work.remove(&mut self.aoi_recipients, peer);
+        Some((session, work))
     }
 
     fn schedule_aoi(&mut self, peer: PeerId) {
-        let Some(session) = self.sessions.get_mut(&peer) else {
+        if !self.sessions.contains_key(&peer) {
             return;
-        };
-        if !session.aoi_queued {
-            session.aoi_queued = true;
-            self.aoi_recipients.push_back(peer);
         }
+        self.aoi_recipients.insert(peer);
     }
 
     fn broadcast_snapshots(&mut self) -> SnapshotTickWork {
         self.snapshot_tick = self.snapshot_tick.wrapping_add(1);
         let server_tick = self.snapshot_tick;
         let mut work = SnapshotTickWork::default();
-        let recipients = self
-            .snapshot_recipients
-            .len()
-            .min(SNAPSHOT_PACKETS_PER_TICK);
-        for _ in 0..recipients {
-            let Some(peer) = self.snapshot_recipients.pop_front() else {
-                break;
-            };
+        let recipients = ordered_peers_after(
+            &self.snapshot_recipients,
+            self.snapshot_recipient_cursor,
+            SNAPSHOT_PACKETS_PER_TICK,
+        );
+        if let Some(&last) = recipients.last() {
+            self.snapshot_recipient_cursor = Some(last);
+        }
+        for peer in recipients {
             let Some((self_pid, cell, cursor, remaining)) =
                 self.sessions.get(&peer).and_then(|s| {
                     s.cell
@@ -967,7 +1000,6 @@ impl Server {
                 session.snapshot_cursor = last_examined;
                 session.snapshot_remaining = remaining.saturating_sub(examined);
             }
-            self.snapshot_recipients.push_back(peer);
             if players.is_empty() && boats.is_empty() {
                 continue;
             }
@@ -1000,15 +1032,19 @@ impl Server {
 
     fn process_aoi_work(&mut self) -> AoiTickWork {
         let mut work = AoiTickWork::default();
-        let recipients = self.aoi_recipients.len().min(AOI_WORK_ITEMS_PER_TICK);
-        for _ in 0..recipients {
-            let Some(peer) = self.aoi_recipients.pop_front() else {
-                break;
-            };
-            let Some(session) = self.sessions.get_mut(&peer) else {
+        let recipients = ordered_peers_after(
+            &self.aoi_recipients,
+            self.aoi_recipient_cursor,
+            AOI_WORK_ITEMS_PER_TICK,
+        );
+        if let Some(&last) = recipients.last() {
+            self.aoi_recipient_cursor = Some(last);
+        }
+        for peer in recipients {
+            self.aoi_recipients.remove(&peer);
+            if !self.sessions.contains_key(&peer) {
                 continue;
-            };
-            session.aoi_queued = false;
+            }
             work.recipient_visits += 1;
             let needs_more = match self.process_one_aoi_work(peer, &mut work) {
                 Ok(needs_more) => needs_more,
@@ -1115,8 +1151,8 @@ impl Server {
         work.persisted_queries += 1;
         if let Some(row) = rows.into_iter().next() {
             let next_cursor = row.boat_id;
-            let snapshot =
-                (row.name.len() <= MAX_SNAPSHOT_MOORING_NAME_BYTES).then(|| mooring_snap(row));
+            let corrupt_name_len = row.name.len();
+            let snapshot = (corrupt_name_len <= MAX_MOORING_NAME_BYTES).then(|| mooring_snap(row));
             if let Some(session) = self.sessions.get_mut(&peer) {
                 if let Some(hydration) = session.active_hydration.as_mut() {
                     hydration.mooring_cursor = Some(next_cursor);
@@ -1134,7 +1170,13 @@ impl Server {
                     }
                 }
             } else {
-                work.oversized_moorings_skipped += 1;
+                work.corrupt_moorings_skipped += 1;
+                tracing::warn!(
+                    boat_id = next_cursor,
+                    name_bytes = corrupt_name_len,
+                    max_name_bytes = MAX_MOORING_NAME_BYTES,
+                    "legacy mooring row exceeds the protocol field limit"
+                );
             }
             return Ok(true);
         }
@@ -1346,6 +1388,23 @@ impl Server {
     }
 }
 
+fn ordered_peers_after(
+    peers: &BTreeSet<PeerId>,
+    cursor: Option<PeerId>,
+    limit: usize,
+) -> Vec<PeerId> {
+    let limit = limit.min(peers.len());
+    match cursor {
+        Some(cursor) => peers
+            .range((Excluded(cursor), Unbounded))
+            .chain(peers.range(..=cursor))
+            .take(limit)
+            .copied()
+            .collect(),
+        None => peers.iter().take(limit).copied().collect(),
+    }
+}
+
 fn player_snap(s: &Session) -> PlayerSnap {
     PlayerSnap {
         player_id: s.player_id,
@@ -1525,8 +1584,10 @@ mod handshake_tests {
             sessions: HashMap::new(),
             player_peers: HashMap::new(),
             player_order: BTreeSet::new(),
-            snapshot_recipients: VecDeque::new(),
-            aoi_recipients: VecDeque::new(),
+            snapshot_recipients: BTreeSet::new(),
+            snapshot_recipient_cursor: None,
+            aoi_recipients: BTreeSet::new(),
+            aoi_recipient_cursor: None,
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -3106,8 +3167,10 @@ mod aoi_harden_tests {
             sessions: HashMap::new(),
             player_peers: HashMap::new(),
             player_order: BTreeSet::new(),
-            snapshot_recipients: VecDeque::new(),
-            aoi_recipients: VecDeque::new(),
+            snapshot_recipients: BTreeSet::new(),
+            snapshot_recipient_cursor: None,
+            aoi_recipients: BTreeSet::new(),
+            aoi_recipient_cursor: None,
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3298,7 +3361,6 @@ mod aoi_harden_tests {
                     hydration_cells: VecDeque::new(),
                     hydration_pending: HashSet::new(),
                     active_hydration: None,
-                    aoi_queued: false,
                 },
             )
             .unwrap();
@@ -3340,7 +3402,8 @@ mod aoi_harden_tests {
             "one bounded recipient round must eventually visit every session"
         );
 
-        server.snapshot_recipients = VecDeque::from([1]);
+        server.snapshot_recipients = BTreeSet::from([1]);
+        server.snapshot_recipient_cursor = None;
         {
             let viewer = server.sessions.get_mut(&1).unwrap();
             viewer.snapshot_cursor = None;
@@ -3371,6 +3434,93 @@ mod aoi_harden_tests {
     }
 
     #[test]
+    fn dense_aoi_scheduler_visits_all_1024_recipients_in_one_bounded_round() {
+        const DENSE_SESSIONS: PeerId = 1_024;
+
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        for peer in 1..=DENSE_SESSIONS {
+            insert_dense_session(&mut server, peer, center);
+        }
+
+        let recipient_round = (DENSE_SESSIONS as usize).div_ceil(AOI_WORK_ITEMS_PER_TICK);
+        for _ in 0..recipient_round {
+            let work = server.process_aoi_work();
+            assert!(work.recipient_visits <= AOI_WORK_ITEMS_PER_TICK);
+            assert!(work.persisted_queries <= AOI_WORK_ITEMS_PER_TICK);
+            assert!(work.packets <= AOI_WORK_ITEMS_PER_TICK);
+        }
+
+        assert!(
+            server
+                .sessions
+                .values()
+                .all(|session| session.published_cells == *session.sub.cells()),
+            "the ordered cursor must visit every dirty recipient before wrapping"
+        );
+        assert_eq!(
+            server.aoi_recipients.len(),
+            DENSE_SESSIONS as usize,
+            "unfinished per-session hydration remains one deduplicated work item per live peer"
+        );
+    }
+
+    #[test]
+    fn reconnect_churn_keeps_recipient_indexes_bounded_without_linear_cleanup() {
+        const LIVE_PEERS: PeerId = 1_024;
+        const CHURN_EVENTS: PeerId = 4_096;
+
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        let mut live = VecDeque::new();
+        for peer in 1..=LIVE_PEERS {
+            insert_dense_session(&mut server, peer, center);
+            live.push_back(peer);
+        }
+
+        for event in 0..CHURN_EVENTS {
+            let departed = live.pop_front().unwrap();
+            let (_, work) = server
+                .unregister_session_with_work(departed)
+                .expect("the selected live session must unregister");
+            server.world.remove(u64::from(departed));
+            assert_eq!(
+                work.recipient_index_operations, 2,
+                "disconnect cleanup must perform a fixed pair of ordered-index removals"
+            );
+
+            let replacement = LIVE_PEERS + event + 1;
+            insert_dense_session(&mut server, replacement, center);
+            live.push_back(replacement);
+
+            assert_eq!(server.sessions.len(), LIVE_PEERS as usize);
+            assert_eq!(
+                server.snapshot_recipients.len(),
+                server.sessions.len(),
+                "the snapshot index must contain exactly the live peers"
+            );
+            assert!(
+                server.aoi_recipients.len() <= server.sessions.len(),
+                "the dirty AoI index must never exceed the live peers"
+            );
+            assert!(
+                server
+                    .snapshot_recipients
+                    .iter()
+                    .all(|peer| server.sessions.contains_key(peer)),
+                "disconnect/reconnect churn must not accumulate stale snapshot work"
+            );
+            assert!(
+                server
+                    .aoi_recipients
+                    .iter()
+                    .all(|peer| server.sessions.contains_key(peer)),
+                "disconnect/reconnect churn must not accumulate stale AoI work"
+            );
+        }
+    }
+
+    #[test]
     fn fixed_snapshot_chunks_fit_the_unreliable_payload() {
         let players: Vec<PlayerSnap> = (0..SNAPSHOT_ENTITIES_PER_PACKET)
             .map(|id| PlayerSnap {
@@ -3397,7 +3547,7 @@ mod aoi_harden_tests {
             cell: (i32::MIN, i32::MAX),
             pos: [f32::MAX; 3],
             rot: [f32::MAX; 4],
-            name: "m".repeat(MAX_SNAPSHOT_MOORING_NAME_BYTES),
+            name: "m".repeat(MAX_MOORING_NAME_BYTES),
             created_at: u64::MAX,
         };
         let added: Vec<Cell> = (0..AOI_CELLS_PER_UPDATE / 2)
@@ -3461,7 +3611,7 @@ mod aoi_harden_tests {
         });
         let last_cell = Cell::new(16, 16);
         for (boat_id, name) in [
-            (1, "x".repeat(MAX_SNAPSHOT_MOORING_NAME_BYTES + 1)),
+            (1, "x".repeat(MAX_MOORING_NAME_BYTES + 1)),
             (2, "eventual".to_string()),
         ] {
             server
@@ -3487,7 +3637,7 @@ mod aoi_harden_tests {
         let mut total_queries = 0usize;
         let mut total_completed = 0usize;
         let mut total_moorings = 0usize;
-        let mut total_oversized_skips = 0usize;
+        let mut total_corrupt_skips = 0usize;
         for _ in 0..5_000 {
             let work = server.process_aoi_work();
             assert!(work.recipient_visits <= AOI_WORK_ITEMS_PER_TICK);
@@ -3496,7 +3646,7 @@ mod aoi_harden_tests {
             total_queries += work.persisted_queries;
             total_completed += work.cells_completed;
             total_moorings += work.moorings_encoded;
-            total_oversized_skips += work.oversized_moorings_skipped;
+            total_corrupt_skips += work.corrupt_moorings_skipped;
             if !server.session_has_aoi_work(1) {
                 break;
             }
@@ -3510,7 +3660,10 @@ mod aoi_harden_tests {
             total_queries, 1_091,
             "1,089 cells plus two keyset continuations in the hostile final cell"
         );
-        assert_eq!(total_oversized_skips, 1);
+        assert_eq!(
+            total_corrupt_skips, 1,
+            "a directly injected legacy row above the protocol limit is corruption, not accepted content"
+        );
         assert_eq!(
             total_moorings, 1,
             "the valid row after an oversized legacy row must still progress"
@@ -3573,8 +3726,10 @@ mod market_dispatch_tests {
             sessions: HashMap::new(),
             player_peers: HashMap::new(),
             player_order: BTreeSet::new(),
-            snapshot_recipients: VecDeque::new(),
-            aoi_recipients: VecDeque::new(),
+            snapshot_recipients: BTreeSet::new(),
+            snapshot_recipient_cursor: None,
+            aoi_recipients: BTreeSet::new(),
+            aoi_recipient_cursor: None,
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3827,8 +3982,10 @@ mod input_hardening_tests {
             sessions: HashMap::new(),
             player_peers: HashMap::new(),
             player_order: BTreeSet::new(),
-            snapshot_recipients: VecDeque::new(),
-            aoi_recipients: VecDeque::new(),
+            snapshot_recipients: BTreeSet::new(),
+            snapshot_recipient_cursor: None,
+            aoi_recipients: BTreeSet::new(),
+            aoi_recipient_cursor: None,
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -4173,6 +4330,170 @@ mod input_hardening_tests {
         server.on_chat(peer, env.payload_as_chat_send().unwrap(), 1_000);
         // The over-long chat was refused before it reached the limiter.
         assert_eq!(server.chat_limiter.tracked_count(), 0);
+    }
+
+    #[test]
+    fn mooring_name_snapshot_boundary_is_enforced_before_persistence() {
+        let mut server = make_server(Config {
+            max_wire_string_len: 4_096,
+            moor_min_interval_ms: 0,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-moor-name-boundary");
+        let cell = server.world.grid().cell_of(0.0, 0.0);
+
+        let too_long = "x".repeat(MAX_MOORING_NAME_BYTES + 1);
+        let seq_before_rejection = server.seq;
+        send_moor(
+            &mut server,
+            peer,
+            &moor_envelope(0.0, 0.0, &too_long),
+            1_000,
+        );
+        assert_eq!(
+            server.seq,
+            seq_before_rejection.wrapping_add(1),
+            "the invalid request must receive a bounded MoorAck rejection"
+        );
+        assert!(
+            server
+                .db
+                .moorings_in_cell(cell.cx, cell.cz)
+                .unwrap()
+                .is_empty(),
+            "a name that cannot hydrate in one unreliable CellSnapshot must never persist"
+        );
+        assert_eq!(
+            server.moor_limiter.tracked_count(),
+            0,
+            "field validation must run before the persistent-write rate limiter"
+        );
+
+        let boundary = "b".repeat(MAX_MOORING_NAME_BYTES);
+        send_moor(
+            &mut server,
+            peer,
+            &moor_envelope(0.0, 0.0, &boundary),
+            1_001,
+        );
+        let persisted = server
+            .db
+            .moorings_in_cell(cell.cx, cell.cz)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the exact field boundary must persist");
+        assert_eq!(persisted.name, boundary);
+
+        let snapshot = mooring_snap(persisted);
+        let cell_payload = codec::cell_snapshot(1, cell, &[], &[], &[snapshot]);
+        assert!(
+            cell_payload.len() <= protocol::MTU - protocol::HEADER_SIZE,
+            "the exact persisted boundary must hydrate in one unreliable CellSnapshot"
+        );
+        let envelope = decode_envelope(&cell_payload).unwrap();
+        let hydrated = envelope
+            .payload_as_cell_snapshot()
+            .unwrap()
+            .moorings()
+            .unwrap()
+            .get(0);
+        assert_eq!(hydrated.name(), Some(boundary.as_str()));
+
+        {
+            let session = server.sessions.get_mut(&peer).unwrap();
+            session.published_cells = session.sub.cells().clone();
+            session.hydration_cells.clear();
+            session.hydration_pending.clear();
+            session.active_hydration = Some(CellHydration {
+                cell,
+                player_cursor: None,
+                players_remaining: 0,
+                mooring_cursor: None,
+                players_complete: true,
+                sent_any: false,
+            });
+        }
+        server.schedule_aoi(peer);
+        let hydration_work = server.process_aoi_work();
+        assert_eq!(hydration_work.persisted_queries, 1);
+        assert_eq!(hydration_work.moorings_encoded, 1);
+        assert_eq!(hydration_work.corrupt_moorings_skipped, 0);
+
+        let rejection = codec::moor_ack(2, false, None, MOOR_NAME_TOO_LONG_REASON);
+        assert!(
+            rejection.len() <= protocol::MTU - protocol::HEADER_SIZE,
+            "the field-specific rejection must itself stay transport bounded"
+        );
+    }
+
+    #[test]
+    fn mooring_name_keeps_the_lower_configured_wire_limit() {
+        let mut server = make_server(Config {
+            max_wire_string_len: 16,
+            moor_min_interval_ms: 0,
+            ..Config::default()
+        });
+        let peer: PeerId = 1;
+        join(&mut server, peer, "tok-config");
+        let cell = server.world.grid().cell_of(0.0, 0.0);
+
+        send_moor(
+            &mut server,
+            peer,
+            &moor_envelope(0.0, 0.0, &"x".repeat(17)),
+            1_000,
+        );
+        assert!(
+            server
+                .db
+                .moorings_in_cell(cell.cx, cell.cz)
+                .unwrap()
+                .is_empty(),
+            "the field-specific MTU cap must not weaken a lower configured wire cap"
+        );
+    }
+
+    #[test]
+    fn mooring_name_limit_is_the_largest_mtu_safe_record_name() {
+        let payload_limit = protocol::MTU - protocol::HEADER_SIZE;
+        let cell = Cell::new(i32::MIN, i32::MAX);
+        let encoded_lengths = |name_len: usize| {
+            let make_snapshot = || MooringSnap {
+                boat_id: u64::MAX,
+                owner: u64::MAX,
+                cell: (i32::MIN, i32::MAX),
+                pos: [f32::MAX; 3],
+                rot: [f32::MAX; 4],
+                name: "n".repeat(name_len),
+                created_at: u64::MAX,
+            };
+            (
+                codec::cell_snapshot(1, cell, &[], &[], &[make_snapshot()]).len(),
+                codec::moor_ack(1, true, Some(&make_snapshot()), "").len(),
+            )
+        };
+        let derived_limit = (0..=4_096)
+            .take_while(|&name_len| {
+                let (cell_len, ack_len) = encoded_lengths(name_len);
+                cell_len <= payload_limit && ack_len <= payload_limit
+            })
+            .last()
+            .unwrap();
+
+        assert_eq!(
+            MAX_MOORING_NAME_BYTES, derived_limit,
+            "the field limit must be derived from both unreliable record encodings"
+        );
+        let (boundary_cell_len, boundary_ack_len) = encoded_lengths(derived_limit);
+        assert!(boundary_cell_len <= payload_limit);
+        assert!(boundary_ack_len <= payload_limit);
+        let (over_cell_len, over_ack_len) = encoded_lengths(derived_limit + 1);
+        assert!(
+            over_cell_len > payload_limit || over_ack_len > payload_limit,
+            "the next byte must exceed at least one unreliable record encoding"
+        );
     }
 
     // ---- PART 1b: per-class rate limits ----
