@@ -148,6 +148,13 @@ struct DirtyFlushTickWork {
     db_updates: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DirtyFlushTestHook {
+    failures_remaining: usize,
+    attempts: usize,
+}
+
 impl RecipientIndexWork {
     fn remove(&mut self, recipients: &mut BTreeSet<PeerId>, peer: PeerId) {
         self.recipient_index_operations += 1;
@@ -175,6 +182,8 @@ pub struct Server {
     dirty_sessions: BTreeSet<PeerId>,
     flush_sessions: BTreeSet<PeerId>,
     flush_paused: bool,
+    #[cfg(test)]
+    dirty_flush_test: DirtyFlushTestHook,
     identity_players: HashMap<String, u64>,
     seq: u32,
     snapshot_tick: u32,
@@ -258,6 +267,8 @@ impl Server {
             dirty_sessions: BTreeSet::new(),
             flush_sessions: BTreeSet::new(),
             flush_paused: false,
+            #[cfg(test)]
+            dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -1472,9 +1483,7 @@ impl Server {
 
     fn begin_dirty_flush(&mut self) {
         self.flush_paused = false;
-        if self.flush_sessions.is_empty() {
-            std::mem::swap(&mut self.flush_sessions, &mut self.dirty_sessions);
-        }
+        self.flush_sessions.append(&mut self.dirty_sessions);
     }
 
     fn process_dirty_flush_at(&mut self, now: i64) -> anyhow::Result<DirtyFlushTickWork> {
@@ -1493,9 +1502,9 @@ impl Server {
                 self.flush_sessions.remove(&peer);
                 continue;
             };
-            if let Err(error) = self.db.touch_last_seen(player_id as i64, now) {
+            if let Err(error) = self.touch_last_seen_for_flush(player_id as i64, now) {
                 self.flush_paused = true;
-                return Err(error.into());
+                return Err(error);
             }
             self.flush_sessions.remove(&peer);
             work.db_updates += 1;
@@ -1505,6 +1514,29 @@ impl Server {
             }
         }
         Ok(work)
+    }
+
+    fn touch_last_seen_for_flush(&mut self, player_id: i64, now: i64) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            self.dirty_flush_test.attempts += 1;
+            if self.dirty_flush_test.failures_remaining > 0 {
+                self.dirty_flush_test.failures_remaining -= 1;
+                return Err(anyhow::anyhow!("injected dirty flush failure"));
+            }
+        }
+        self.db.touch_last_seen(player_id, now)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_dirty_flush_failures(&mut self, failures: usize) {
+        self.dirty_flush_test.failures_remaining = failures;
+    }
+
+    #[cfg(test)]
+    fn dirty_flush_attempts(&self) -> usize {
+        self.dirty_flush_test.attempts
     }
 
     fn flush_all(&mut self) -> anyhow::Result<()> {
@@ -1802,6 +1834,7 @@ mod handshake_tests {
             dirty_sessions: BTreeSet::new(),
             flush_sessions: BTreeSet::new(),
             flush_paused: false,
+            dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players,
             seq: 0,
             snapshot_tick: 0,
@@ -1974,6 +2007,19 @@ mod handshake_tests {
             },
         );
         finish_envelope(&mut fbb, 2, p::Payload::ClientState, state.as_union_value())
+    }
+
+    fn chat_envelope(seq: u32, text: &str, channel: u8) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::new();
+        let text = fbb.create_string(text);
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text),
+                channel,
+            },
+        );
+        finish_envelope(&mut fbb, seq, p::Payload::ChatSend, chat.as_union_value())
     }
 
     fn deliver_hello(server: &mut Server, peer: PeerId, bytes: &[u8]) {
@@ -2498,7 +2544,7 @@ mod handshake_tests {
     }
 
     #[test]
-    fn valid_chat_is_preencoded_once_and_fanned_out_through_connected_peers() {
+    fn valid_chat_is_preencoded_once_and_fanned_out_fifo_through_connected_peers() {
         let mut server = make_server();
         let (sender, sender_peer) = connect_peer(&mut server);
         let (observer, observer_peer) = connect_peer(&mut server);
@@ -2534,41 +2580,110 @@ mod handshake_tests {
         assert_eq!(receive_server_hello(&observer), (true, String::new()));
 
         let sender_player = server.sessions[&sender_peer].player_id;
-        let mut fbb = FlatBufferBuilder::new();
-        let text = fbb.create_string("fair winds");
-        let chat = p::ChatSend::create(
-            &mut fbb,
-            &p::ChatSendArgs {
-                text: Some(text),
-                channel: 2,
-            },
-        );
-        let bytes = finish_envelope(&mut fbb, 3, p::Payload::ChatSend, chat.as_union_value());
+        let expected = [("first watch", 1), ("second watch", 2), ("third watch", 3)];
         let seq_before_chat = server.seq;
 
-        server
-            .handle_data_at(sender_peer, &bytes, 1_000, 1_000)
-            .unwrap();
+        for (index, &(text, channel)) in expected.iter().enumerate() {
+            let bytes = chat_envelope(index as u32 + 3, text, channel);
+            let admission_ms = 1_000 + index as i64 * server.cfg.chat_min_interval_ms_i64();
+            server
+                .handle_data_at(sender_peer, &bytes, admission_ms, admission_ms)
+                .unwrap();
+        }
 
-        assert_eq!(server.seq, seq_before_chat.wrapping_add(1));
-        let fanout = server.process_fanout_work();
-        assert_eq!(fanout.recipient_scans, 2);
-        assert_eq!(fanout.sends, 2);
-        assert_eq!(fanout.jobs_completed, 1);
-        let sender_payload = receive_payload(&sender, p::Payload::ChatBroadcast);
-        let observer_payload = receive_payload(&observer, p::Payload::ChatBroadcast);
         assert_eq!(
-            sender_payload, observer_payload,
-            "every recipient must receive the one pre-encoded broadcast"
+            server.seq,
+            seq_before_chat.wrapping_add(expected.len() as u32)
         );
+        let fanout = server.process_fanout_work();
+        assert_eq!(fanout.recipient_scans, expected.len() * 2);
+        assert_eq!(fanout.sends, expected.len() * 2);
+        assert_eq!(fanout.jobs_completed, expected.len());
+        assert!(fanout.recipient_scans <= FANOUT_RECIPIENT_SCANS_PER_TICK);
+        assert!(fanout.sends <= FANOUT_SENDS_PER_TICK);
 
-        let env = decode_envelope(&sender_payload).unwrap();
-        assert_eq!(env.seq(), seq_before_chat.wrapping_add(1));
-        let broadcast = env.payload_as_chat_broadcast().unwrap();
-        assert_eq!(broadcast.player_id(), sender_player);
-        assert_eq!(broadcast.display_name(), Some("Skipper"));
-        assert_eq!(broadcast.text(), Some("fair winds"));
-        assert_eq!(broadcast.channel(), 2);
+        for (index, &(expected_text, expected_channel)) in expected.iter().enumerate() {
+            let sender_payload = receive_payload(&sender, p::Payload::ChatBroadcast);
+            let observer_payload = receive_payload(&observer, p::Payload::ChatBroadcast);
+            assert_eq!(
+                sender_payload, observer_payload,
+                "every recipient must receive the same pre-encoded FIFO item"
+            );
+
+            let env = decode_envelope(&observer_payload).unwrap();
+            assert_eq!(env.seq(), seq_before_chat.wrapping_add(index as u32 + 1));
+            let broadcast = env.payload_as_chat_broadcast().unwrap();
+            assert_eq!(broadcast.player_id(), sender_player);
+            assert_eq!(broadcast.display_name(), Some("Skipper"));
+            assert_eq!(broadcast.text(), Some(expected_text));
+            assert_eq!(broadcast.channel(), expected_channel);
+        }
+    }
+
+    #[test]
+    fn chat_queue_accepts_exactly_256_fifo_items_and_rejects_only_over_cap_inputs() {
+        assert_eq!(CHAT_QUEUE_ITEMS, 256);
+        let mut server = make_server_with_config(Config {
+            chat_min_interval_ms: 0,
+            ..Config::default()
+        });
+        let hello = hello_envelope(
+            "queue-boundary-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, 1, &hello, 1_000);
+        let seq_before_chat = server.seq;
+
+        for index in 0..CHAT_QUEUE_ITEMS {
+            let message = format!("queue-{index:03}");
+            let bytes = chat_envelope(index as u32 + 1, &message, 4);
+            server
+                .handle_data_at(1, &bytes, 2_000 + index as i64, 2_000 + index as i64)
+                .unwrap();
+            assert_eq!(server.seq, seq_before_chat.wrapping_add(index as u32 + 1));
+            assert_eq!(server.chat_fanout.len(), index + 1);
+        }
+
+        let mut decoded_bytes = 0usize;
+        for (index, job) in server.chat_fanout.iter().enumerate() {
+            decoded_bytes += job.bytes.len();
+            let envelope = decode_envelope(&job.bytes).unwrap();
+            assert_eq!(
+                envelope.seq(),
+                seq_before_chat.wrapping_add(index as u32 + 1)
+            );
+            let broadcast = envelope.payload_as_chat_broadcast().unwrap();
+            assert_eq!(broadcast.text(), Some(format!("queue-{index:03}").as_str()));
+        }
+        assert_eq!(server.chat_fanout.len(), CHAT_QUEUE_ITEMS);
+        assert_eq!(
+            server.chat_fanout_bytes, decoded_bytes,
+            "the byte counter must exactly equal all accepted FIFO payloads"
+        );
+        assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+
+        let boundary = (
+            server.seq,
+            server.chat_fanout.len(),
+            server.chat_fanout_bytes,
+        );
+        for index in CHAT_QUEUE_ITEMS..CHAT_QUEUE_ITEMS + 3 {
+            let message = format!("queue-{index:03}");
+            let bytes = chat_envelope(index as u32 + 1, &message, 4);
+            server
+                .handle_data_at(1, &bytes, 2_000 + index as i64, 2_000 + index as i64)
+                .unwrap();
+            assert_eq!(
+                (
+                    server.seq,
+                    server.chat_fanout.len(),
+                    server.chat_fanout_bytes,
+                ),
+                boundary,
+                "the first and every later over-cap input must not consume a sequence or grow either queue bound"
+            );
+        }
     }
 
     #[test]
@@ -3396,6 +3511,7 @@ mod aoi_harden_tests {
             dirty_sessions: BTreeSet::new(),
             flush_sessions: BTreeSet::new(),
             flush_paused: false,
+            dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -3662,7 +3778,6 @@ mod aoi_harden_tests {
     #[test]
     fn dense_snapshot_elected_visibility_refreshes_before_client_expiry() {
         const DENSE_SESSIONS: PeerId = 1_024;
-        const CLIENT_STALE_MS: usize = 5_000;
         const SIMULATION_TICKS: usize = 600;
 
         let mut server = make_server(Config::default());
@@ -3671,10 +3786,14 @@ mod aoi_harden_tests {
             insert_dense_session(&mut server, peer, center);
         }
 
-        let stale_ticks = CLIENT_STALE_MS * server.cfg.tick_hz as usize / 1_000;
+        let recipient_round_ticks = (DENSE_SESSIONS as usize).div_ceil(SNAPSHOT_PACKETS_PER_TICK);
+        let elected_packets = SNAPSHOT_VISIBILITY_CEILING.div_ceil(SNAPSHOT_ENTITIES_PER_PACKET);
+        let exact_recurrence_bound = recipient_round_ticks * elected_packets;
+        assert_eq!(exact_recurrence_bound, 96);
         let mut last_advertised = HashMap::<(PeerId, u64), usize>::new();
         let mut elected = HashMap::<PeerId, HashSet<u64>>::new();
         let mut repeated = 0usize;
+        let mut maximum_recurrence_gap = 0usize;
 
         for tick in 0..SIMULATION_TICKS {
             let work = server.broadcast_snapshots();
@@ -3693,10 +3812,11 @@ mod aoi_harden_tests {
                 elected.entry(peer).or_default().insert(player_id);
                 if let Some(previous) = last_advertised.insert((peer, player_id), tick) {
                     repeated += 1;
+                    maximum_recurrence_gap = maximum_recurrence_gap.max(tick - previous);
                     assert!(
-                        tick - previous < stale_ticks,
+                        tick - previous <= exact_recurrence_bound,
                         "peer {peer}'s elected player {player_id} went {} ticks without a refresh, \
-                         but the real client expires it after {stale_ticks} production ticks",
+                         exceeding the scheduler's derived {exact_recurrence_bound}-tick bound",
                         tick - previous
                     );
                 }
@@ -3713,6 +3833,10 @@ mod aoi_harden_tests {
         assert!(
             repeated >= DENSE_SESSIONS as usize * SNAPSHOT_VISIBILITY_CEILING,
             "every elected pair must be observed often enough to prove recurrence"
+        );
+        assert_eq!(
+            maximum_recurrence_gap, exact_recurrence_bound,
+            "the dense proof must observe the exact worst-case gap, not merely a looser expiry threshold"
         );
     }
 
@@ -3820,6 +3944,143 @@ mod aoi_harden_tests {
         assert!(
             !server.session_has_aoi_work(1),
             "current desired cells must hydrate within a fixed number of visits independent of movement history"
+        );
+    }
+
+    #[test]
+    fn dirty_flush_error_preserves_old_and_new_work_until_the_next_cadence() {
+        const INITIAL_LAST_SEEN: i64 = 100;
+        const FAILED_FLUSH_AT: i64 = 1_000;
+        const RECOVERED_FLUSH_AT: i64 = 6_000;
+
+        let mut server = make_server(Config::default());
+        for peer in 1..=2 {
+            let player = server
+                .db
+                .upsert_player_by_token(
+                    &format!("{peer:016x}"),
+                    &format!("Player {peer}"),
+                    INITIAL_LAST_SEEN,
+                )
+                .unwrap();
+            assert_eq!(player.id, i64::from(peer));
+            insert_dense_session(&mut server, peer, Cell::new(0, 0));
+        }
+
+        let first_state = state_envelope(1.0, 1.0);
+        let envelope = decode_envelope(&first_state).unwrap();
+        server.on_client_state(
+            1,
+            envelope.payload_as_client_state().unwrap(),
+            FAILED_FLUSH_AT,
+        );
+        server.begin_dirty_flush();
+        assert_eq!(server.flush_sessions, BTreeSet::from([1]));
+        assert!(server.dirty_sessions.is_empty());
+
+        server.inject_dirty_flush_failures(1);
+        let error = server.process_dirty_flush_at(FAILED_FLUSH_AT).unwrap_err();
+        assert!(error.to_string().contains("injected dirty flush failure"));
+        assert_eq!(server.dirty_flush_attempts(), 1);
+        assert!(server.flush_paused);
+        assert_eq!(server.flush_sessions, BTreeSet::from([1]));
+        assert!(server.sessions[&1].dirty);
+
+        let second_state = state_envelope(2.0, 2.0);
+        let envelope = decode_envelope(&second_state).unwrap();
+        server.on_client_state(
+            2,
+            envelope.payload_as_client_state().unwrap(),
+            FAILED_FLUSH_AT + 1,
+        );
+        assert_eq!(server.flush_sessions, BTreeSet::from([1]));
+        assert_eq!(server.dirty_sessions, BTreeSet::from([2]));
+        assert!(server.sessions[&2].dirty);
+
+        for tick in 0..100 {
+            assert_eq!(
+                server
+                    .process_dirty_flush_at(FAILED_FLUSH_AT + tick)
+                    .unwrap(),
+                DirtyFlushTickWork::default(),
+                "paused ticks must neither retry nor report persistence work"
+            );
+        }
+        assert_eq!(
+            server.dirty_flush_attempts(),
+            1,
+            "one database error must produce one failed attempt until the next five-second cadence"
+        );
+        for player_id in 1..=2 {
+            assert_eq!(
+                server.db.player(player_id).unwrap().unwrap().last_seen,
+                INITIAL_LAST_SEEN
+            );
+        }
+
+        server.begin_dirty_flush();
+        assert!(!server.flush_paused);
+        assert_eq!(
+            server.flush_sessions,
+            BTreeSet::from([1, 2]),
+            "the recovery cadence must preserve the active retry and merge newly dirty work"
+        );
+        assert!(server.dirty_sessions.is_empty());
+
+        let recovered = server.process_dirty_flush_at(RECOVERED_FLUSH_AT).unwrap();
+        assert_eq!(recovered.db_updates, 2);
+        assert!(recovered.db_updates <= DIRTY_DB_UPDATES_PER_TICK);
+        assert_eq!(server.dirty_flush_attempts(), 3);
+        assert!(server.flush_sessions.is_empty());
+        assert!(server.dirty_sessions.is_empty());
+        for player_id in 1..=2 {
+            assert_eq!(
+                server.db.player(player_id).unwrap().unwrap().last_seen,
+                RECOVERED_FLUSH_AT
+            );
+            assert!(!server.sessions[&(player_id as PeerId)].dirty);
+        }
+    }
+
+    #[test]
+    fn dirty_flush_disconnect_and_shutdown_paths_still_persist_live_sessions() {
+        const INITIAL_LAST_SEEN: i64 = 100;
+
+        let mut server = make_server(Config::default());
+        for peer in 1..=2 {
+            let player = server
+                .db
+                .upsert_player_by_token(
+                    &format!("{peer:016x}"),
+                    &format!("Player {peer}"),
+                    INITIAL_LAST_SEEN,
+                )
+                .unwrap();
+            assert_eq!(player.id, i64::from(peer));
+            insert_dense_session(&mut server, peer, Cell::new(0, 0));
+            let state = state_envelope(peer as f32, peer as f32);
+            let envelope = decode_envelope(&state).unwrap();
+            server.on_client_state(
+                peer,
+                envelope.payload_as_client_state().unwrap(),
+                i64::from(peer),
+            );
+        }
+        server.begin_dirty_flush();
+        assert_eq!(server.flush_sessions, BTreeSet::from([1, 2]));
+
+        server.on_disconnect(1, DisconnectReason::Remote).unwrap();
+        assert!(!server.flush_sessions.contains(&1));
+        assert!(!server.sessions.contains_key(&1));
+        assert!(
+            server.db.player(1).unwrap().unwrap().last_seen > INITIAL_LAST_SEEN,
+            "disconnect must synchronously persist the departing session"
+        );
+
+        server.flush_all().unwrap();
+        assert!(
+            server.db.player(2).unwrap().unwrap().last_seen > INITIAL_LAST_SEEN,
+            "shutdown flush must synchronously persist every remaining live session"
         );
     }
 
@@ -4193,6 +4454,7 @@ mod market_dispatch_tests {
             dirty_sessions: BTreeSet::new(),
             flush_sessions: BTreeSet::new(),
             flush_paused: false,
+            dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
@@ -4456,6 +4718,7 @@ mod input_hardening_tests {
             dirty_sessions: BTreeSet::new(),
             flush_sessions: BTreeSet::new(),
             flush_paused: false,
+            dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players: HashMap::new(),
             seq: 0,
             snapshot_tick: 0,
