@@ -45,8 +45,24 @@ const MIN_HELLO_MIN_INTERVAL_MS: u32 = 1;
 /// operator misconfiguration from wedging fresh identities indefinitely.
 pub const MAX_NEW_SESSION_MIN_INTERVAL_MS: u32 = 1_000;
 
-/// Highest configurable live transport-peer ceiling.
-pub const MAX_TRANSPORT_PEERS: u32 = 65_535;
+/// Highest configurable live transport-peer ceiling. This is the single
+/// population ceiling exercised by the transport, scheduler, load, and
+/// recurrence tests.
+pub const MAX_TRANSPORT_PEERS: u32 = sw_net::DEFAULT_MAX_PEERS as u32;
+
+/// Snapshot scheduler constants. Configuration validation and the production
+/// scheduler share these values so the freshness proof cannot drift from the
+/// code that performs the work.
+pub(crate) const SNAPSHOT_PACKETS_PER_TICK: usize = 32;
+pub(crate) const SNAPSHOT_ENTITIES_PER_PACKET: usize = 5;
+pub(crate) const SNAPSHOT_VISIBILITY_CEILING: usize = 15;
+pub(crate) const SNAPSHOT_CLIENT_EXPIRY_SECS: u64 = 5;
+
+/// Worst-case ticks between advertisements of one elected dense player.
+pub(crate) fn snapshot_recurrence_ticks(peers: u32) -> u64 {
+    u64::from(peers).div_ceil(SNAPSHOT_PACKETS_PER_TICK as u64)
+        * (SNAPSHOT_VISIBILITY_CEILING as u64).div_ceil(SNAPSHOT_ENTITIES_PER_PACKET as u64)
+}
 
 /// Highest configurable persistent player-row ceiling. The server still uses
 /// the operator's lower configured value; this only prevents an accidental
@@ -262,6 +278,14 @@ impl Config {
                 "max_transport_peers must be in 1..={MAX_TRANSPORT_PEERS}"
             ));
         }
+        let recurrence_ticks = snapshot_recurrence_ticks(self.max_transport_peers);
+        let expiry_ticks = u64::from(self.tick_hz) * SNAPSHOT_CLIENT_EXPIRY_SECS;
+        if recurrence_ticks >= expiry_ticks {
+            return Err(anyhow::anyhow!(
+                "snapshot recurrence ({recurrence_ticks} ticks) must be strictly less than \
+                 the {SNAPSHOT_CLIENT_EXPIRY_SECS}-second client expiry ({expiry_ticks} ticks)"
+            ));
+        }
         if self.max_transport_peers_per_ip == 0
             || self.max_transport_peers_per_ip > self.max_transport_peers
         {
@@ -423,6 +447,60 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:38455");
         assert_eq!(cfg.ticks_per_snapshot(), 30 / 4);
+    }
+
+    #[test]
+    fn snapshot_recurrence_is_fresh_for_every_accepted_capacity_and_tick_pair() {
+        let default = Config::default();
+        default.validate().unwrap();
+        assert_eq!(snapshot_recurrence_ticks(default.max_transport_peers), 96);
+        assert!(
+            snapshot_recurrence_ticks(default.max_transport_peers)
+                < u64::from(default.tick_hz) * SNAPSHOT_CLIENT_EXPIRY_SECS
+        );
+
+        let boundary = Config {
+            tick_hz: 20,
+            max_transport_peers: sw_net::DEFAULT_MAX_PEERS as u32,
+            ..Config::default()
+        };
+        boundary.validate().unwrap();
+
+        let stale = Config {
+            tick_hz: 19,
+            max_transport_peers: sw_net::DEFAULT_MAX_PEERS as u32,
+            ..Config::default()
+        };
+        let error = stale.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("snapshot recurrence"),
+            "low-tick rejection must explain the freshness invariant: {error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_recurrence_formula_tracks_the_scheduler_constants() {
+        for peers in [1, 32, 33, sw_net::DEFAULT_MAX_PEERS as u32] {
+            assert_eq!(
+                snapshot_recurrence_ticks(peers),
+                u64::from(peers).div_ceil(SNAPSHOT_PACKETS_PER_TICK as u64)
+                    * (SNAPSHOT_VISIBILITY_CEILING as u64)
+                        .div_ceil(SNAPSHOT_ENTITIES_PER_PACKET as u64)
+            );
+        }
+    }
+
+    #[test]
+    fn transport_capacity_above_the_tested_scheduler_ceiling_is_rejected() {
+        let cfg = Config {
+            max_transport_peers: 2_048,
+            ..Config::default()
+        };
+        let error = cfg.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("max_transport_peers"),
+            "capacity rejection must name the offending setting: {error}"
+        );
     }
 
     #[test]
@@ -775,7 +853,7 @@ mod tests {
     fn parses_new_hardening_keys() {
         let toml_text = r#"
             new_session_min_interval_ms = 125
-            max_transport_peers = 2048
+            max_transport_peers = 512
             max_transport_peers_per_ip = 24
             max_player_rows = 5000
             client_state_min_interval_ms = 33
@@ -786,7 +864,7 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(cfg.new_session_min_interval_ms, 125);
-        assert_eq!(cfg.max_transport_peers, 2048);
+        assert_eq!(cfg.max_transport_peers, 512);
         assert_eq!(cfg.max_transport_peers_per_ip, 24);
         assert_eq!(cfg.max_player_rows, 5000);
         assert_eq!(cfg.client_state_min_interval_ms, 33);

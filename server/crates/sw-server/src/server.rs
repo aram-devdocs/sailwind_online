@@ -2,7 +2,12 @@
 
 use crate::clock::{clock_from_epoch, WorldClock};
 use crate::codec::{self, BoatSnap, Caps, MooringSnap, PlayerSnap};
-use crate::config::{Config, MAX_PLAYER_ROWS};
+#[cfg(test)]
+use crate::config::snapshot_recurrence_ticks;
+use crate::config::{
+    Config, MAX_PLAYER_ROWS, SNAPSHOT_ENTITIES_PER_PACKET, SNAPSHOT_PACKETS_PER_TICK,
+    SNAPSHOT_VISIBILITY_CEILING,
+};
 use crate::econ_store::{DbLedgerStore, DbMarketStore};
 use crate::ratelimit::{BoundedRateLimiter, GlobalRateLimiter, RateLimiter};
 use crate::validate;
@@ -40,22 +45,22 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// five-player packets, so every elected player recurs in at most 96 ticks
 /// (3.2 seconds at the production 30 Hz), strictly before the client's
 /// five-second stale-sample eviction.
-const SNAPSHOT_PACKETS_PER_TICK: usize = 32;
 const SNAPSHOT_ENTITY_SCAN_PER_PACKET: usize = sw_net::DEFAULT_MAX_PEERS;
-const SNAPSHOT_ENTITIES_PER_PACKET: usize = 5;
-const SNAPSHOT_VISIBILITY_CEILING: usize = 15;
 
 /// Queued population fanout budgets. Chat is FIFO and rejects new accepted
 /// work at the fixed queue boundary; clock state has one coalescing latest-value
 /// slot. Both share this fixed per-tick transport budget.
 const CHAT_QUEUE_ITEMS: usize = 256;
 const CHAT_QUEUE_BYTES: usize = CHAT_QUEUE_ITEMS * (protocol::MTU - protocol::HEADER_SIZE);
+const CHAT_QUEUE_RECIPIENTS: usize = CHAT_QUEUE_ITEMS * sw_net::DEFAULT_MAX_PEERS;
+const FANOUT_QUEUE_RECIPIENTS: usize = CHAT_QUEUE_RECIPIENTS + sw_net::DEFAULT_MAX_PEERS;
 const FANOUT_RECIPIENT_SCANS_PER_TICK: usize = sw_net::DEFAULT_MAX_PEERS;
 const FANOUT_SENDS_PER_TICK: usize = sw_net::DEFAULT_MAX_PEERS;
 
 /// Persistence work is spread across fixed ticks after each five-second flush
 /// boundary. At 1,024 sessions this drains in 128 ticks (about 4.27 seconds).
 const DIRTY_DB_UPDATES_PER_TICK: usize = 8;
+const SHUTDOWN_FLUSH_ATTEMPTS: usize = 3;
 
 /// Global AoI delivery budget charged on every fixed server tick.
 const AOI_WORK_ITEMS_PER_TICK: usize = 8;
@@ -83,12 +88,13 @@ struct CellHydration {
 struct FanoutJob {
     bytes: Vec<u8>,
     sender_cell: Option<Cell>,
-    recipient_cursor: Option<PeerId>,
-    recipients_remaining: usize,
+    recipients: Vec<(PeerId, u64)>,
+    next_recipient: usize,
 }
 
 /// Per-connection state, created on ClientHello.
 struct Session {
+    generation: u64,
     player_id: u64,
     identity_hash: String,
     display_name: String,
@@ -141,6 +147,8 @@ struct FanoutTickWork {
     sends: usize,
     encoded_bytes: usize,
     jobs_completed: usize,
+    #[cfg(test)]
+    delivered: Vec<(PeerId, u64)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -177,14 +185,16 @@ pub struct Server {
     aoi_recipient_cursor: Option<PeerId>,
     chat_fanout: VecDeque<FanoutJob>,
     chat_fanout_bytes: usize,
+    chat_fanout_recipients: usize,
     clock_fanout: Option<FanoutJob>,
     fanout_prefer_clock: bool,
-    dirty_sessions: BTreeSet<PeerId>,
-    flush_sessions: BTreeSet<PeerId>,
+    dirty_players: BTreeSet<u64>,
+    flush_players: BTreeSet<u64>,
     flush_paused: bool,
     #[cfg(test)]
     dirty_flush_test: DirtyFlushTestHook,
     identity_players: HashMap<String, u64>,
+    next_session_generation: u64,
     seq: u32,
     snapshot_tick: u32,
     boot: Instant,
@@ -262,14 +272,16 @@ impl Server {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
+            chat_fanout_recipients: 0,
             clock_fanout: None,
             fanout_prefer_clock: true,
-            dirty_sessions: BTreeSet::new(),
-            flush_sessions: BTreeSet::new(),
+            dirty_players: BTreeSet::new(),
+            flush_players: BTreeSet::new(),
             flush_paused: false,
             #[cfg(test)]
             dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players,
+            next_session_generation: 0,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -341,9 +353,9 @@ impl Server {
         }
 
         tracing::info!("shutting down");
-        self.flush_all()?;
+        let flush_result = self.flush_all();
         let _ = self.host.shutdown();
-        Ok(())
+        flush_result
     }
 
     fn handle_event(&mut self, ev: Event) -> anyhow::Result<()> {
@@ -572,6 +584,7 @@ impl Server {
         self.register_session(
             peer,
             Session {
+                generation: 0,
                 player_id,
                 identity_hash,
                 display_name: name,
@@ -680,7 +693,7 @@ impl Server {
             aoi = s.sub.recenter(cell);
             s.cell = Some(cell);
         }
-        self.dirty_sessions.insert(peer);
+        self.dirty_players.insert(player_id);
 
         self.emit_aoi(peer, &aoi);
     }
@@ -937,13 +950,28 @@ impl Server {
         if bytes.len() > protocol::MTU - protocol::HEADER_SIZE {
             return;
         }
+        let recipients = self.capture_fanout_recipients();
+        if recipients.is_empty()
+            || recipients.len() > CHAT_QUEUE_RECIPIENTS - self.chat_fanout_recipients
+        {
+            return;
+        }
 
         self.chat_fanout_bytes += bytes.len();
+        self.chat_fanout_recipients += recipients.len();
+        debug_assert!(
+            self.chat_fanout_recipients
+                + self
+                    .clock_fanout
+                    .as_ref()
+                    .map_or(0, |job| job.recipients.len())
+                <= FANOUT_QUEUE_RECIPIENTS
+        );
         self.chat_fanout.push_back(FanoutJob {
             bytes,
             sender_cell: Some(cell),
-            recipient_cursor: None,
-            recipients_remaining: self.snapshot_recipients.len(),
+            recipients,
+            next_recipient: 0,
         });
     }
 
@@ -960,13 +988,19 @@ impl Server {
             self.chat_limiter.clear(s.player_id);
             self.econ_limiter.clear(s.player_id);
             self.moor_limiter.clear(s.player_id);
-            self.db.touch_last_seen(s.player_id as i64, now_ms())?;
+            self.flush_players.insert(s.player_id);
+            if let Err(error) = self.touch_last_seen_for_flush(s.player_id as i64, now_ms()) {
+                self.flush_paused = true;
+                return Err(error);
+            }
+            self.flush_players.remove(&s.player_id);
+            self.dirty_players.remove(&s.player_id);
             tracing::info!(peer, player_id = s.player_id, ?reason, "peer disconnected");
         }
         Ok(())
     }
 
-    fn register_session(&mut self, peer: PeerId, session: Session) -> anyhow::Result<()> {
+    fn register_session(&mut self, peer: PeerId, mut session: Session) -> anyhow::Result<()> {
         if self.sessions.contains_key(&peer) {
             return Err(anyhow::anyhow!("peer already owns a session"));
         }
@@ -975,6 +1009,7 @@ impl Server {
                 "player already owns session peer {existing_peer}"
             ));
         }
+        session.generation = self.allocate_session_generation();
         let player_id = session.player_id;
         let dirty = session.dirty;
         self.sessions.insert(peer, session);
@@ -982,7 +1017,7 @@ impl Server {
         self.player_order.insert(player_id);
         self.snapshot_recipients.insert(peer);
         if dirty {
-            self.dirty_sessions.insert(peer);
+            self.dirty_players.insert(player_id);
         }
         self.schedule_aoi(peer);
         Ok(())
@@ -1005,9 +1040,23 @@ impl Server {
         let mut work = RecipientIndexWork::default();
         work.remove(&mut self.snapshot_recipients, peer);
         work.remove(&mut self.aoi_recipients, peer);
-        self.dirty_sessions.remove(&peer);
-        self.flush_sessions.remove(&peer);
         Some((session, work))
+    }
+
+    fn allocate_session_generation(&mut self) -> u64 {
+        if self.next_session_generation == u64::MAX {
+            self.invalidate_fanout_jobs();
+            self.next_session_generation = 0;
+        }
+        self.next_session_generation += 1;
+        self.next_session_generation
+    }
+
+    fn invalidate_fanout_jobs(&mut self) {
+        self.chat_fanout.clear();
+        self.chat_fanout_bytes = 0;
+        self.chat_fanout_recipients = 0;
+        self.clock_fanout = None;
     }
 
     fn schedule_aoi(&mut self, peer: PeerId) {
@@ -1405,23 +1454,43 @@ impl Server {
     fn broadcast_clock(&mut self) {
         let clock = self.clock_now();
         let bytes = codec::world_clock(self.next_seq(), clock);
-        if self.snapshot_recipients.is_empty() {
+        let recipients = self.capture_fanout_recipients();
+        if recipients.is_empty() {
             self.clock_fanout = None;
             return;
         }
+        debug_assert!(self.chat_fanout_recipients + recipients.len() <= FANOUT_QUEUE_RECIPIENTS);
         self.clock_fanout = Some(FanoutJob {
             bytes,
             sender_cell: None,
-            recipient_cursor: None,
-            recipients_remaining: self.snapshot_recipients.len(),
+            recipients,
+            next_recipient: 0,
         });
     }
 
+    fn capture_fanout_recipients(&self) -> Vec<(PeerId, u64)> {
+        self.snapshot_recipients
+            .iter()
+            .filter_map(|&peer| {
+                self.sessions
+                    .get(&peer)
+                    .map(|session| (peer, session.generation))
+            })
+            .take(self.cfg.max_transport_peers_usize())
+            .collect()
+    }
+
     fn process_fanout_work(&mut self) -> FanoutTickWork {
+        self.process_fanout_work_with_budget(FANOUT_RECIPIENT_SCANS_PER_TICK, FANOUT_SENDS_PER_TICK)
+    }
+
+    fn process_fanout_work_with_budget(
+        &mut self,
+        recipient_scan_budget: usize,
+        send_budget: usize,
+    ) -> FanoutTickWork {
         let mut work = FanoutTickWork::default();
-        while work.recipient_scans < FANOUT_RECIPIENT_SCANS_PER_TICK
-            && work.sends < FANOUT_SENDS_PER_TICK
-        {
+        while work.recipient_scans < recipient_scan_budget && work.sends < send_budget {
             let from_clock = self.clock_fanout.is_some()
                 && (self.fanout_prefer_clock || self.chat_fanout.is_empty());
             let Some(mut job) = (if from_clock {
@@ -1436,37 +1505,38 @@ impl Server {
                 continue;
             };
 
-            while job.recipients_remaining > 0
-                && work.recipient_scans < FANOUT_RECIPIENT_SCANS_PER_TICK
-                && work.sends < FANOUT_SENDS_PER_TICK
+            while job.next_recipient < job.recipients.len()
+                && work.recipient_scans < recipient_scan_budget
+                && work.sends < send_budget
             {
-                let Some(peer) = next_peer_after(&self.snapshot_recipients, job.recipient_cursor)
-                else {
-                    job.recipients_remaining = 0;
-                    break;
-                };
-                job.recipient_cursor = Some(peer);
-                job.recipients_remaining -= 1;
+                let (peer, generation) = job.recipients[job.next_recipient];
+                job.next_recipient += 1;
                 work.recipient_scans += 1;
 
-                let should_send = job.sender_cell.is_none_or(|cell| {
-                    self.sessions
-                        .get(&peer)
-                        .is_some_and(|session| session.sub.contains(cell))
+                let should_send = self.sessions.get(&peer).is_some_and(|session| {
+                    session.generation == generation
+                        && job
+                            .sender_cell
+                            .is_none_or(|cell| session.sub.contains(cell))
                 });
                 if should_send {
                     self.send(peer, &job.bytes);
                     work.sends += 1;
                     work.encoded_bytes += job.bytes.len();
+                    #[cfg(test)]
+                    work.delivered.push((peer, generation));
                 }
             }
 
-            if job.recipients_remaining == 0 {
+            if job.next_recipient == job.recipients.len() {
                 work.jobs_completed += 1;
                 if from_clock {
                     self.fanout_prefer_clock = false;
                 } else {
                     self.chat_fanout_bytes = self.chat_fanout_bytes.saturating_sub(job.bytes.len());
+                    self.chat_fanout_recipients = self
+                        .chat_fanout_recipients
+                        .saturating_sub(job.recipients.len());
                     self.fanout_prefer_clock = true;
                 }
             } else {
@@ -1483,7 +1553,7 @@ impl Server {
 
     fn begin_dirty_flush(&mut self) {
         self.flush_paused = false;
-        self.flush_sessions.append(&mut self.dirty_sessions);
+        self.flush_players.append(&mut self.dirty_players);
     }
 
     fn process_dirty_flush_at(&mut self, now: i64) -> anyhow::Result<DirtyFlushTickWork> {
@@ -1491,26 +1561,26 @@ impl Server {
         if self.flush_paused {
             return Ok(work);
         }
-        let peers: Vec<PeerId> = self
-            .flush_sessions
+        let player_ids: Vec<u64> = self
+            .flush_players
             .iter()
             .take(DIRTY_DB_UPDATES_PER_TICK)
             .copied()
             .collect();
-        for peer in peers {
-            let Some(player_id) = self.sessions.get(&peer).map(|session| session.player_id) else {
-                self.flush_sessions.remove(&peer);
-                continue;
-            };
+        for player_id in player_ids {
             if let Err(error) = self.touch_last_seen_for_flush(player_id as i64, now) {
                 self.flush_paused = true;
                 return Err(error);
             }
-            self.flush_sessions.remove(&peer);
+            self.flush_players.remove(&player_id);
             work.db_updates += 1;
-            let still_dirty = self.dirty_sessions.contains(&peer);
-            if let Some(session) = self.sessions.get_mut(&peer) {
-                session.dirty = still_dirty;
+            let still_dirty = self.dirty_players.contains(&player_id);
+            if let Some(peer) = self.player_peers.get(&player_id).copied() {
+                if let Some(session) = self.sessions.get_mut(&peer) {
+                    if session.player_id == player_id {
+                        session.dirty = still_dirty;
+                    }
+                }
             }
         }
         Ok(work)
@@ -1541,11 +1611,45 @@ impl Server {
 
     fn flush_all(&mut self) -> anyhow::Result<()> {
         let now = now_ms();
-        let ids: Vec<u64> = self.sessions.values().map(|s| s.player_id).collect();
-        for player_id in ids {
-            self.db.touch_last_seen(player_id as i64, now)?;
+        let mut pending: BTreeSet<u64> = self.sessions.values().map(|s| s.player_id).collect();
+        pending.extend(self.dirty_players.iter().copied());
+        pending.extend(self.flush_players.iter().copied());
+        self.flush_players.extend(pending.iter().copied());
+
+        let mut last_error = None;
+        for _ in 0..SHUTDOWN_FLUSH_ATTEMPTS {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let attempt: Vec<u64> = pending.iter().copied().collect();
+            for player_id in attempt {
+                match self.touch_last_seen_for_flush(player_id as i64, now) {
+                    Ok(()) => {
+                        pending.remove(&player_id);
+                        self.flush_players.remove(&player_id);
+                        self.dirty_players.remove(&player_id);
+                        if let Some(peer) = self.player_peers.get(&player_id).copied() {
+                            if let Some(session) = self.sessions.get_mut(&peer) {
+                                if session.player_id == player_id {
+                                    session.dirty = false;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                    }
+                }
+            }
         }
-        Ok(())
+        let failed = pending.len();
+        let error = last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown persistence failure".to_string());
+        Err(anyhow::anyhow!(
+            "shutdown persistence failed for {failed} player(s) after \
+             {SHUTDOWN_FLUSH_ATTEMPTS} attempts: {error}"
+        ))
     }
 
     fn session_by_player(&self, player_id: u64) -> Option<&Session> {
@@ -1650,17 +1754,6 @@ fn mooring_snap(row: MooringRow) -> MooringSnap {
         rot: row.rot,
         name: row.name,
         created_at: row.created_at as u64,
-    }
-}
-
-fn next_peer_after(peers: &BTreeSet<PeerId>, cursor: Option<PeerId>) -> Option<PeerId> {
-    match cursor {
-        Some(cursor) => peers
-            .range((Excluded(cursor), Unbounded))
-            .next()
-            .or_else(|| peers.iter().next())
-            .copied(),
-        None => peers.iter().next().copied(),
     }
 }
 
@@ -1829,13 +1922,15 @@ mod handshake_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
+            chat_fanout_recipients: 0,
             clock_fanout: None,
             fanout_prefer_clock: true,
-            dirty_sessions: BTreeSet::new(),
-            flush_sessions: BTreeSet::new(),
+            dirty_players: BTreeSet::new(),
+            flush_players: BTreeSet::new(),
             flush_paused: false,
             dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players,
+            next_session_generation: 0,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -3417,6 +3512,41 @@ mod handshake_tests {
     }
 
     #[test]
+    fn permanent_shutdown_flush_failure_still_sends_transport_shutdown() {
+        let mut server = make_server();
+        let (client, peer) = connect_peer(&mut server);
+        let hello = hello_envelope(
+            "shutdown-failure-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        deliver_hello_at(&mut server, peer, &hello, 1_000);
+        assert_eq!(receive_server_hello(&client), (true, String::new()));
+
+        server.inject_dirty_flush_failures(usize::MAX);
+        server.running.store(false, Ordering::SeqCst);
+        let error = server.run().unwrap_err();
+        assert!(
+            error.to_string().contains("injected dirty flush failure"),
+            "the bounded persistence failure must be returned after shutdown: {error}"
+        );
+        let player_id = server.sessions[&peer].player_id;
+        assert!(
+            server.flush_players.contains(&player_id) && server.dirty_players.contains(&player_id),
+            "a permanent shutdown failure must retain the dirty player id for diagnosis or retry"
+        );
+
+        loop {
+            let mut packet = [0u8; protocol::MTU];
+            let received = client.recv(&mut packet).unwrap();
+            if protocol::Header::from_byte(packet[0]).property == protocol::property::DISCONNECT {
+                assert_eq!(received, protocol::DISCONNECT_SIZE);
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn same_peer_cannot_replace_an_established_session_with_a_different_identity() {
         let mut server = make_server();
         let (client, peer) = connect_peer(&mut server);
@@ -3506,13 +3636,15 @@ mod aoi_harden_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
+            chat_fanout_recipients: 0,
             clock_fanout: None,
             fanout_prefer_clock: true,
-            dirty_sessions: BTreeSet::new(),
-            flush_sessions: BTreeSet::new(),
+            dirty_players: BTreeSet::new(),
+            flush_players: BTreeSet::new(),
             flush_paused: false,
             dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players: HashMap::new(),
+            next_session_generation: 0,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -3676,7 +3808,15 @@ mod aoi_harden_tests {
     }
 
     fn insert_dense_session(server: &mut Server, peer: PeerId, cell: Cell) {
-        let player_id = u64::from(peer);
+        insert_dense_session_for_player(server, peer, u64::from(peer), cell);
+    }
+
+    fn insert_dense_session_for_player(
+        server: &mut Server,
+        peer: PeerId,
+        player_id: u64,
+        cell: Cell,
+    ) {
         let mut sub = Subscription::new(server.cfg.aoi_radius_i32());
         sub.recenter(cell);
         server.world.place_in_cell(player_id, cell);
@@ -3684,6 +3824,7 @@ mod aoi_harden_tests {
             .register_session(
                 peer,
                 Session {
+                    generation: 0,
                     player_id,
                     identity_hash: format!("identity-{player_id}"),
                     display_name: format!("Player {player_id}"),
@@ -3705,6 +3846,109 @@ mod aoi_harden_tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn queued_fanout_never_wraps_or_delivers_to_a_reused_connection_identity() {
+        const RECIPIENTS: PeerId = sw_net::DEFAULT_MAX_PEERS as PeerId;
+
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        for peer in 1..=RECIPIENTS {
+            insert_dense_session(&mut server, peer, center);
+        }
+        let original_last_generation = server.sessions[&RECIPIENTS].generation;
+
+        let mut fbb = FlatBufferBuilder::new();
+        let text = fbb.create_string("captured audience");
+        let chat = p::ChatSend::create(
+            &mut fbb,
+            &p::ChatSendArgs {
+                text: Some(text),
+                channel: 0,
+            },
+        );
+        let bytes = finish_envelope(&mut fbb, 1, p::Payload::ChatSend, chat.as_union_value());
+        let envelope = decode_envelope(&bytes).unwrap();
+        server.on_chat(1, envelope.payload_as_chat_send().unwrap(), 1_000);
+
+        let first = server
+            .process_fanout_work_with_budget(RECIPIENTS as usize - 1, RECIPIENTS as usize - 1);
+        assert_eq!(first.delivered.len(), RECIPIENTS as usize - 1);
+
+        let departed = server.unregister_session(RECIPIENTS).unwrap();
+        server.world.remove(departed.player_id);
+        insert_dense_session_for_player(
+            &mut server,
+            RECIPIENTS,
+            u64::from(RECIPIENTS) + 10_000,
+            center,
+        );
+        let replacement_generation = server.sessions[&RECIPIENTS].generation;
+        assert_ne!(replacement_generation, original_last_generation);
+
+        let last = server.process_fanout_work_with_budget(1, 1);
+        assert_eq!(last.recipient_scans, 1);
+        assert!(last.delivered.is_empty());
+        assert_eq!(last.jobs_completed, 1);
+
+        let delivered: HashSet<_> = first.delivered.iter().copied().collect();
+        assert_eq!(delivered.len(), RECIPIENTS as usize - 1);
+        for peer in 1..RECIPIENTS {
+            assert!(
+                delivered
+                    .iter()
+                    .any(|(delivered_peer, _)| *delivered_peer == peer),
+                "each remaining original recipient must receive exactly once"
+            );
+        }
+        assert!(
+            !delivered
+                .iter()
+                .any(|(peer, generation)| *peer == RECIPIENTS
+                    && *generation == replacement_generation),
+            "a queued message must never reach a later connection reusing the peer slot"
+        );
+    }
+
+    #[test]
+    fn clock_fanout_uses_the_same_captured_connection_identity_path() {
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        for peer in 1..=2 {
+            insert_dense_session(&mut server, peer, center);
+        }
+        server.broadcast_clock();
+        let first = server.process_fanout_work_with_budget(1, 1);
+        assert_eq!(first.delivered.len(), 1);
+
+        let old_generation = server.sessions[&2].generation;
+        let departed = server.unregister_session(2).unwrap();
+        server.world.remove(departed.player_id);
+        insert_dense_session_for_player(&mut server, 2, 22, center);
+        assert_ne!(server.sessions[&2].generation, old_generation);
+
+        let last = server.process_fanout_work_with_budget(1, 1);
+        assert!(last.delivered.is_empty());
+        assert_eq!(last.jobs_completed, 1);
+    }
+
+    #[test]
+    fn fanout_generation_wrap_invalidates_every_queued_identity() {
+        let mut server = make_server(Config::default());
+        let center = Cell::new(0, 0);
+        insert_dense_session(&mut server, 1, center);
+        server.broadcast_clock();
+        server.next_session_generation = u64::MAX;
+
+        insert_dense_session(&mut server, 2, center);
+
+        assert!(
+            server.clock_fanout.is_none() && server.chat_fanout.is_empty(),
+            "generation wrap must invalidate all captured pre-wrap identities"
+        );
+        assert_eq!(server.chat_fanout_bytes, 0);
+        assert_eq!(server.chat_fanout_recipients, 0);
     }
 
     #[test]
@@ -3789,6 +4033,11 @@ mod aoi_harden_tests {
         let recipient_round_ticks = (DENSE_SESSIONS as usize).div_ceil(SNAPSHOT_PACKETS_PER_TICK);
         let elected_packets = SNAPSHOT_VISIBILITY_CEILING.div_ceil(SNAPSHOT_ENTITIES_PER_PACKET);
         let exact_recurrence_bound = recipient_round_ticks * elected_packets;
+        assert_eq!(
+            exact_recurrence_bound as u64,
+            snapshot_recurrence_ticks(DENSE_SESSIONS),
+            "config validation and the production scheduler must share one recurrence proof"
+        );
         assert_eq!(exact_recurrence_bound, 96);
         let mut last_advertised = HashMap::<(PeerId, u64), usize>::new();
         let mut elected = HashMap::<PeerId, HashSet<u64>>::new();
@@ -3975,15 +4224,15 @@ mod aoi_harden_tests {
             FAILED_FLUSH_AT,
         );
         server.begin_dirty_flush();
-        assert_eq!(server.flush_sessions, BTreeSet::from([1]));
-        assert!(server.dirty_sessions.is_empty());
+        assert_eq!(server.flush_players, BTreeSet::from([1]));
+        assert!(server.dirty_players.is_empty());
 
         server.inject_dirty_flush_failures(1);
         let error = server.process_dirty_flush_at(FAILED_FLUSH_AT).unwrap_err();
         assert!(error.to_string().contains("injected dirty flush failure"));
         assert_eq!(server.dirty_flush_attempts(), 1);
         assert!(server.flush_paused);
-        assert_eq!(server.flush_sessions, BTreeSet::from([1]));
+        assert_eq!(server.flush_players, BTreeSet::from([1]));
         assert!(server.sessions[&1].dirty);
 
         let second_state = state_envelope(2.0, 2.0);
@@ -3993,8 +4242,8 @@ mod aoi_harden_tests {
             envelope.payload_as_client_state().unwrap(),
             FAILED_FLUSH_AT + 1,
         );
-        assert_eq!(server.flush_sessions, BTreeSet::from([1]));
-        assert_eq!(server.dirty_sessions, BTreeSet::from([2]));
+        assert_eq!(server.flush_players, BTreeSet::from([1]));
+        assert_eq!(server.dirty_players, BTreeSet::from([2]));
         assert!(server.sessions[&2].dirty);
 
         for tick in 0..100 {
@@ -4021,18 +4270,18 @@ mod aoi_harden_tests {
         server.begin_dirty_flush();
         assert!(!server.flush_paused);
         assert_eq!(
-            server.flush_sessions,
+            server.flush_players,
             BTreeSet::from([1, 2]),
             "the recovery cadence must preserve the active retry and merge newly dirty work"
         );
-        assert!(server.dirty_sessions.is_empty());
+        assert!(server.dirty_players.is_empty());
 
         let recovered = server.process_dirty_flush_at(RECOVERED_FLUSH_AT).unwrap();
         assert_eq!(recovered.db_updates, 2);
         assert!(recovered.db_updates <= DIRTY_DB_UPDATES_PER_TICK);
         assert_eq!(server.dirty_flush_attempts(), 3);
-        assert!(server.flush_sessions.is_empty());
-        assert!(server.dirty_sessions.is_empty());
+        assert!(server.flush_players.is_empty());
+        assert!(server.dirty_players.is_empty());
         for player_id in 1..=2 {
             assert_eq!(
                 server.db.player(player_id).unwrap().unwrap().last_seen,
@@ -4067,10 +4316,10 @@ mod aoi_harden_tests {
             );
         }
         server.begin_dirty_flush();
-        assert_eq!(server.flush_sessions, BTreeSet::from([1, 2]));
+        assert_eq!(server.flush_players, BTreeSet::from([1, 2]));
 
         server.on_disconnect(1, DisconnectReason::Remote).unwrap();
-        assert!(!server.flush_sessions.contains(&1));
+        assert!(!server.flush_players.contains(&1));
         assert!(!server.sessions.contains_key(&1));
         assert!(
             server.db.player(1).unwrap().unwrap().last_seen > INITIAL_LAST_SEEN,
@@ -4082,6 +4331,88 @@ mod aoi_harden_tests {
             server.db.player(2).unwrap().unwrap().last_seen > INITIAL_LAST_SEEN,
             "shutdown flush must synchronously persist every remaining live session"
         );
+    }
+
+    #[test]
+    fn failed_disconnect_persistence_retries_the_player_id_after_peer_reuse() {
+        const INITIAL_LAST_SEEN: i64 = 100;
+        const RETRY_AT: i64 = 6_000;
+
+        let mut server = make_server(Config::default());
+        for player_id in 1..=2 {
+            server
+                .db
+                .upsert_player_by_token(
+                    &format!("{player_id:016x}"),
+                    &format!("Player {player_id}"),
+                    INITIAL_LAST_SEEN,
+                )
+                .unwrap();
+        }
+        insert_dense_session_for_player(&mut server, 1, 1, Cell::new(0, 0));
+
+        server.inject_dirty_flush_failures(1);
+        let error = server
+            .on_disconnect(1, DisconnectReason::Remote)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected dirty flush failure"));
+        assert_eq!(server.flush_players, BTreeSet::from([1]));
+        assert!(server.flush_paused);
+
+        insert_dense_session_for_player(&mut server, 1, 2, Cell::new(0, 0));
+        for tick in 0..100 {
+            assert_eq!(
+                server.process_dirty_flush_at(1_000 + tick).unwrap(),
+                DirtyFlushTickWork::default(),
+                "a disconnect failure must not retry on every server tick"
+            );
+        }
+
+        server.begin_dirty_flush();
+        let work = server.process_dirty_flush_at(RETRY_AT).unwrap();
+        assert_eq!(work.db_updates, 1);
+        assert_eq!(server.db.player(1).unwrap().unwrap().last_seen, RETRY_AT);
+        assert_eq!(
+            server.db.player(2).unwrap().unwrap().last_seen,
+            INITIAL_LAST_SEEN,
+            "peer-slot reuse must not redirect orphaned persistence work"
+        );
+        assert!(server.flush_players.is_empty());
+    }
+
+    #[test]
+    fn shutdown_flush_attempts_all_players_and_retries_only_failures() {
+        const INITIAL_LAST_SEEN: i64 = 100;
+
+        let mut server = make_server(Config::default());
+        for peer in 1..=2 {
+            server
+                .db
+                .upsert_player_by_token(
+                    &format!("{peer:016x}"),
+                    &format!("Player {peer}"),
+                    INITIAL_LAST_SEEN,
+                )
+                .unwrap();
+            insert_dense_session(&mut server, peer, Cell::new(0, 0));
+        }
+        server.inject_dirty_flush_failures(1);
+
+        server.flush_all().unwrap();
+
+        assert_eq!(
+            server.dirty_flush_attempts(),
+            3,
+            "the first pass must continue after row one fails, then retry only that row"
+        );
+        for player_id in 1..=2 {
+            assert!(
+                server.db.player(player_id).unwrap().unwrap().last_seen > INITIAL_LAST_SEEN,
+                "shutdown must persist player {player_id}"
+            );
+        }
+        assert!(server.dirty_players.is_empty());
+        assert!(server.flush_players.is_empty());
     }
 
     #[test]
@@ -4097,7 +4428,7 @@ mod aoi_harden_tests {
             insert_dense_session(&mut server, peer, center);
             let session = server.sessions.get_mut(&peer).unwrap();
             session.dirty = true;
-            server.dirty_sessions.insert(peer);
+            server.dirty_players.insert(session.player_id);
         }
 
         let seq_before_chat = server.seq;
@@ -4126,6 +4457,11 @@ mod aoi_harden_tests {
         );
         assert_eq!(server.chat_fanout.len(), CHAT_QUEUE_ITEMS);
         assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+        assert_eq!(
+            server.chat_fanout_recipients,
+            CHAT_QUEUE_ITEMS * DENSE_SESSIONS as usize
+        );
+        assert!(server.chat_fanout_recipients <= CHAT_QUEUE_RECIPIENTS);
 
         let mut total_jobs_completed = 0usize;
         let mut total_db_updates = 0usize;
@@ -4158,23 +4494,33 @@ mod aoi_harden_tests {
 
             assert!(server.chat_fanout.len() <= CHAT_QUEUE_ITEMS);
             assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+            assert!(server.chat_fanout_recipients <= CHAT_QUEUE_RECIPIENTS);
             assert!(server.clock_fanout.iter().count() <= 1);
-            assert!(server.dirty_sessions.len() <= server.sessions.len());
-            assert!(server.flush_sessions.len() <= server.sessions.len());
             assert!(
-                server.dirty_sessions.len() + server.flush_sessions.len()
-                    <= server.sessions.len() * 2
+                server.chat_fanout_recipients
+                    + server
+                        .clock_fanout
+                        .as_ref()
+                        .map_or(0, |job| job.recipients.len())
+                    <= FANOUT_QUEUE_RECIPIENTS
+            );
+            assert!(server.dirty_players.len() <= server.cfg.max_player_rows_u32() as usize);
+            assert!(server.flush_players.len() <= server.cfg.max_player_rows_u32() as usize);
+            assert!(
+                server.dirty_players.len() + server.flush_players.len()
+                    <= server.cfg.max_player_rows_u32() as usize * 2
             );
         }
 
         assert!(server.chat_fanout.is_empty());
         assert_eq!(server.chat_fanout_bytes, 0);
+        assert_eq!(server.chat_fanout_recipients, 0);
         assert!(
             server.clock_fanout.is_none(),
             "the last coalesced clock must eventually reach its bounded audience"
         );
-        assert!(server.dirty_sessions.is_empty());
-        assert!(server.flush_sessions.is_empty());
+        assert!(server.dirty_players.is_empty());
+        assert!(server.flush_players.is_empty());
         assert_eq!(total_db_updates, DENSE_SESSIONS as usize);
         assert!(
             total_jobs_completed >= CHAT_QUEUE_ITEMS + 3,
@@ -4449,13 +4795,15 @@ mod market_dispatch_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
+            chat_fanout_recipients: 0,
             clock_fanout: None,
             fanout_prefer_clock: true,
-            dirty_sessions: BTreeSet::new(),
-            flush_sessions: BTreeSet::new(),
+            dirty_players: BTreeSet::new(),
+            flush_players: BTreeSet::new(),
             flush_paused: false,
             dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players: HashMap::new(),
+            next_session_generation: 0,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -4713,13 +5061,15 @@ mod input_hardening_tests {
             aoi_recipient_cursor: None,
             chat_fanout: VecDeque::new(),
             chat_fanout_bytes: 0,
+            chat_fanout_recipients: 0,
             clock_fanout: None,
             fanout_prefer_clock: true,
-            dirty_sessions: BTreeSet::new(),
-            flush_sessions: BTreeSet::new(),
+            dirty_players: BTreeSet::new(),
+            flush_players: BTreeSet::new(),
             flush_paused: false,
             dirty_flush_test: DirtyFlushTestHook::default(),
             identity_players: HashMap::new(),
+            next_session_generation: 0,
             seq: 0,
             snapshot_tick: 0,
             boot: Instant::now(),
@@ -5560,15 +5910,25 @@ mod input_hardening_tests {
             }
             assert!(server.chat_fanout.len() <= CHAT_QUEUE_ITEMS);
             assert!(server.chat_fanout_bytes <= CHAT_QUEUE_BYTES);
+            assert!(server.chat_fanout_recipients <= CHAT_QUEUE_RECIPIENTS);
             assert!(server.clock_fanout.iter().count() <= 1);
-            assert!(server.dirty_sessions.len() <= server.sessions.len());
-            assert!(server.flush_sessions.len() <= server.sessions.len());
+            assert!(
+                server.chat_fanout_recipients
+                    + server
+                        .clock_fanout
+                        .as_ref()
+                        .map_or(0, |job| job.recipients.len())
+                    <= FANOUT_QUEUE_RECIPIENTS
+            );
+            assert!(server.dirty_players.len() <= server.cfg.max_player_rows_u32() as usize);
+            assert!(server.flush_players.len() <= server.cfg.max_player_rows_u32() as usize);
         }
         let elapsed = start.elapsed();
         let per_tick = elapsed / TICKS;
 
         assert!(server.chat_fanout.is_empty());
         assert_eq!(server.chat_fanout_bytes, 0);
+        assert_eq!(server.chat_fanout_recipients, 0);
         assert!(server.clock_fanout.is_none());
 
         println!(
