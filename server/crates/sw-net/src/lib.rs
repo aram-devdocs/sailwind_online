@@ -295,6 +295,14 @@ impl Host {
         if header.fragmented {
             return;
         }
+        if header.property != protocol::property::CONNECT_REQUEST {
+            let Some(peer) = self.peers.get(&addr) else {
+                return;
+            };
+            if header.connection_number != peer.connection_number {
+                return;
+            }
+        }
         match header.property {
             protocol::property::CONNECT_REQUEST => {
                 self.handle_connect_request(data, addr, now, events)
@@ -439,7 +447,7 @@ impl Host {
         };
         if let Some(peer) = self.peers.get_mut(&addr) {
             peer.last_recv = now;
-            let pong = protocol::build_pong(seq, dotnet_ticks_now());
+            let pong = protocol::build_pong(peer.connection_number, seq, dotnet_ticks_now());
             let _ = self.socket.send_to(&pong, peer.addr);
         }
     }
@@ -527,7 +535,7 @@ impl Host {
             peer.ping_seq = peer.ping_seq.wrapping_add(1);
             peer.last_ping_sent = now;
             peer.ping_sent_at = Some(now);
-            let ping = protocol::build_ping(peer.ping_seq);
+            let ping = protocol::build_ping(peer.connection_number, peer.ping_seq);
             let _ = self.socket.send_to(&ping, peer.addr);
             work.keepalive_sends += 1;
         }
@@ -547,7 +555,8 @@ impl Host {
         let Some(addr) = self.peer_addr(peer) else {
             return Ok(());
         };
-        let packet = protocol::build_unreliable(bytes);
+        let connection_number = self.peers[&addr].connection_number;
+        let packet = protocol::build_unreliable(connection_number, bytes);
         self.socket.send_to(&packet, addr)?;
         Ok(())
     }
@@ -563,9 +572,10 @@ impl Host {
         let Some(peer) = self.remove_peer_at(addr) else {
             return false;
         };
-        let _ = self
-            .socket
-            .send_to(&protocol::build_disconnect(peer.connect_time), peer.addr);
+        let _ = self.socket.send_to(
+            &protocol::build_disconnect(peer.connection_number, peer.connect_time),
+            peer.addr,
+        );
         true
     }
 
@@ -575,9 +585,10 @@ impl Host {
     pub fn shutdown(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
         for peer in self.peers.values() {
-            let _ = self
-                .socket
-                .send_to(&protocol::build_disconnect(peer.connect_time), peer.addr);
+            let _ = self.socket.send_to(
+                &protocol::build_disconnect(peer.connection_number, peer.connect_time),
+                peer.addr,
+            );
             events.push(Event::Disconnected(peer.id, DisconnectReason::Shutdown));
         }
         self.peers.clear();
@@ -604,9 +615,9 @@ fn dotnet_ticks_now() -> i64 {
 mod tests {
     use super::*;
 
-    fn connect_datagram(connect_time: i64, key: &str) -> Vec<u8> {
+    fn connect_datagram(connection_number: u8, connect_time: i64, key: &str) -> Vec<u8> {
         let data = protocol::write_litenet_string(key);
-        protocol::build_connect_request(0, connect_time, 7, 16, &data)
+        protocol::build_connect_request(connection_number, connect_time, 7, 16, &data)
     }
 
     fn client_from(source_ip: &str, server_addr: SocketAddr) -> UdpSocket {
@@ -632,7 +643,7 @@ mod tests {
         for connect_time in 1..=count {
             let client = client_from("127.0.0.1", server_addr);
             client
-                .send(&connect_datagram(connect_time as i64, "sailwind-online"))
+                .send(&connect_datagram(0, connect_time as i64, "sailwind-online"))
                 .unwrap();
             clients.push(client);
             if connect_time % MAX_POLL_PACKETS == 0 {
@@ -688,13 +699,187 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_connection_numbers_isolate_connected_udp_sessions() {
+        for connection_number in 1..protocol::MAX_CONNECTION_NUMBER {
+            let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = client_from("127.0.0.1", server_addr);
+            let t0 = Instant::now();
+            let connect_time = i64::from(connection_number) + 100;
+
+            client
+                .send(&connect_datagram(
+                    connection_number,
+                    connect_time,
+                    "sailwind-online",
+                ))
+                .unwrap();
+            assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+
+            let accept = drain_packets(&client);
+            assert_eq!(accept.len(), 1);
+            assert_eq!(
+                protocol::Header::from_byte(accept[0][0]).property,
+                protocol::property::CONNECT_ACCEPT
+            );
+            assert_eq!(accept[0][9], connection_number);
+
+            let current_data = protocol::build_unreliable(connection_number, b"current-session");
+            client.send(&current_data).unwrap();
+            assert_eq!(
+                server.poll(t0),
+                vec![Event::Data(1, b"current-session".to_vec())]
+            );
+
+            server.send_unreliable(1, b"server-current").unwrap();
+            let outbound = drain_packets(&client);
+            assert_eq!(outbound.len(), 1);
+            assert_eq!(
+                protocol::Header::from_byte(outbound[0][0]),
+                protocol::Header {
+                    property: protocol::property::UNRELIABLE,
+                    connection_number,
+                    fragmented: false,
+                }
+            );
+
+            let stale_number = (connection_number + protocol::MAX_CONNECTION_NUMBER - 1)
+                % protocol::MAX_CONNECTION_NUMBER;
+            let stale_data = protocol::build_unreliable(stale_number, b"stale-session");
+            client.send(&stale_data).unwrap();
+            assert!(
+                server.poll(t0).is_empty(),
+                "stale-number data must not emit an application event"
+            );
+
+            let stale_ping = protocol::build_ping(stale_number, 0x1234);
+            client.send(&stale_ping).unwrap();
+            assert!(server.poll(t0).is_empty());
+            assert!(
+                drain_packets(&client).is_empty(),
+                "stale-number ping must not amplify into a pong"
+            );
+
+            let keepalive_at = t0 + PING_INTERVAL;
+            assert!(server.poll(keepalive_at).is_empty());
+            let keepalive = drain_packets(&client);
+            assert_eq!(keepalive.len(), 1);
+            let keepalive_header = protocol::Header::from_byte(keepalive[0][0]);
+            assert_eq!(keepalive_header.property, protocol::property::PING);
+            assert_eq!(keepalive_header.connection_number, connection_number);
+            let sequence = protocol::read_sequence(&keepalive[0]).unwrap();
+
+            let stale_pong = protocol::build_pong(stale_number, sequence, 0);
+            client.send(&stale_pong).unwrap();
+            assert!(server.poll(keepalive_at).is_empty());
+            assert_eq!(
+                server.rtt(1),
+                None,
+                "stale-number pong must not mutate RTT state"
+            );
+
+            let stale_disconnect = protocol::build_disconnect(stale_number, connect_time);
+            client.send(&stale_disconnect).unwrap();
+            assert!(server.poll(keepalive_at).is_empty());
+            assert_eq!(server.peer_count(), 1);
+            assert!(
+                drain_packets(&client).is_empty(),
+                "stale-number disconnect must not receive ShutdownOk"
+            );
+
+            let current_disconnect = protocol::build_disconnect(connection_number, connect_time);
+            client.send(&current_disconnect).unwrap();
+            assert_eq!(
+                server.poll(keepalive_at),
+                vec![Event::Disconnected(1, DisconnectReason::Remote)]
+            );
+            assert_eq!(server.peer_count(), 0);
+        }
+    }
+
+    #[test]
+    fn stale_connection_number_cannot_refresh_idle_timeout() {
+        let stale_packets = [
+            protocol::build_unreliable(1, b"stale-data"),
+            protocol::build_ping(1, 7).to_vec(),
+            protocol::build_pong(1, 7, 0).to_vec(),
+            protocol::build_disconnect(1, 20).to_vec(),
+        ];
+
+        for stale in stale_packets {
+            let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = client_from("127.0.0.1", server_addr);
+            let t0 = Instant::now();
+
+            client
+                .send(&connect_datagram(2, 20, "sailwind-online"))
+                .unwrap();
+            assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+            assert_eq!(drain_packets(&client).len(), 1);
+
+            client.send(&stale).unwrap();
+            let expired_at = t0 + DEFAULT_TIMEOUT + Duration::from_millis(1);
+            assert_eq!(
+                server.poll(expired_at),
+                vec![Event::Disconnected(1, DisconnectReason::Timeout)]
+            );
+            assert_eq!(server.peer_count(), 0);
+            assert!(
+                drain_packets(&client).is_empty(),
+                "stale connected traffic must not receive any reply"
+            );
+        }
+    }
+
+    #[test]
+    fn replaced_endpoint_rejects_packets_from_the_retired_connection_number() {
+        let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+        let now = Instant::now();
+
+        client
+            .send(&connect_datagram(1, 10, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&client).len(), 1);
+
+        client
+            .send(&connect_datagram(2, 20, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(now),
+            vec![
+                Event::Disconnected(1, DisconnectReason::Remote),
+                Event::Connected(2),
+            ]
+        );
+        assert_eq!(drain_packets(&client).len(), 1);
+
+        let retired = protocol::build_unreliable(1, b"retired-hello");
+        client.send(&retired).unwrap();
+        assert!(
+            server.poll(now).is_empty(),
+            "a packet from the replaced connection must not execute in the new session"
+        );
+
+        let current = protocol::build_unreliable(2, b"current-hello");
+        client.send(&current).unwrap();
+        assert_eq!(
+            server.poll(now),
+            vec![Event::Data(2, b"current-hello".to_vec())]
+        );
+    }
+
+    #[test]
     fn preauth_data_flood_is_bounded_and_a_queued_payload_progresses() {
         let mut server = Host::bind("127.0.0.1:0", "sailwind-online").unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = client_from("127.0.0.1", server_addr);
 
         client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         let (events, work) = server.poll_with_work(Instant::now());
         assert_bounded_poll(work, &events);
@@ -703,11 +888,11 @@ mod tests {
         let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
         client.recv(&mut accept).unwrap();
 
-        let flood = protocol::build_unreliable(b"flood");
+        let flood = protocol::build_unreliable(0, b"flood");
         for _ in 0..MAX_POLL_PACKETS + 32 {
             client.send(&flood).unwrap();
         }
-        let marker = protocol::build_unreliable(b"legitimate-marker");
+        let marker = protocol::build_unreliable(0, b"legitimate-marker");
         client.send(&marker).unwrap();
 
         let mut saw_marker = false;
@@ -740,7 +925,7 @@ mod tests {
             client.send(&[protocol::property::UNRELIABLE]).unwrap();
         }
         client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
 
         let mut connected = false;
@@ -767,19 +952,19 @@ mod tests {
         let mut next_connect_time = 2;
         for _ in 0..MAX_POLL_PACKETS + 32 {
             client
-                .send(&connect_datagram(next_connect_time, "sailwind-online"))
+                .send(&connect_datagram(0, next_connect_time, "sailwind-online"))
                 .unwrap();
             next_connect_time += 1;
         }
         client
-            .send(&protocol::build_unreliable(b"replacement-marker"))
+            .send(&protocol::build_unreliable(0, b"replacement-marker"))
             .unwrap();
 
         let mut saw_marker = false;
         for _ in 0..8 {
             for _ in 0..MAX_POLL_PACKETS / 4 {
                 client
-                    .send(&connect_datagram(next_connect_time, "sailwind-online"))
+                    .send(&connect_datagram(0, next_connect_time, "sailwind-online"))
                     .unwrap();
                 next_connect_time += 1;
             }
@@ -806,7 +991,7 @@ mod tests {
         let client = client_from("127.0.0.1", server_addr);
 
         client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(1)]);
         let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
@@ -815,7 +1000,7 @@ mod tests {
         let oversized = vec![protocol::property::UNRELIABLE; protocol::MTU + 1];
         client.send(&oversized).unwrap();
         client
-            .send(&protocol::build_unreliable(b"after-oversized"))
+            .send(&protocol::build_unreliable(0, b"after-oversized"))
             .unwrap();
 
         let (events, work) = server.poll_with_work(Instant::now());
@@ -833,7 +1018,7 @@ mod tests {
         for connect_time in 1..=70 {
             let client = client_from("127.0.0.1", server_addr);
             client
-                .send(&connect_datagram(connect_time, "sailwind-online"))
+                .send(&connect_datagram(0, connect_time, "sailwind-online"))
                 .unwrap();
             clients.push(client);
         }
@@ -942,7 +1127,7 @@ mod tests {
 
         for connect_time in 1..=10_000i64 {
             client
-                .send(&connect_datagram(connect_time, "sailwind-online"))
+                .send(&connect_datagram(0, connect_time, "sailwind-online"))
                 .unwrap();
             let events = server.poll(now);
             let connected = events
@@ -974,17 +1159,17 @@ mod tests {
         let now = Instant::now();
 
         old_client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(now), vec![Event::Connected(1)]);
         assert_eq!(drain_packets(&old_client).len(), 1);
 
         old_client
-            .send(&protocol::build_unreliable(b"old-before-disconnect"))
+            .send(&protocol::build_unreliable(0, b"old-before-disconnect"))
             .unwrap();
-        old_client.send(&protocol::build_disconnect(1)).unwrap();
+        old_client.send(&protocol::build_disconnect(0, 1)).unwrap();
         new_client
-            .send(&connect_datagram(2, "sailwind-online"))
+            .send(&connect_datagram(0, 2, "sailwind-online"))
             .unwrap();
 
         let events = server.poll(now);
@@ -1013,7 +1198,7 @@ mod tests {
         );
 
         new_client
-            .send(&connect_datagram(2, "sailwind-online"))
+            .send(&connect_datagram(0, 2, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(now), vec![Event::Connected(1)]);
         assert_eq!(server.peer_addr(1), Some(new_client.local_addr().unwrap()));
@@ -1034,13 +1219,13 @@ mod tests {
         let now = Instant::now();
 
         client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(now), vec![Event::Connected(1)]);
         assert_eq!(drain_packets(&client).len(), 1);
 
         client
-            .send(&connect_datagram(2, "sailwind-online"))
+            .send(&connect_datagram(0, 2, "sailwind-online"))
             .unwrap();
         assert_eq!(
             server.poll(now),
@@ -1051,7 +1236,7 @@ mod tests {
         assert!(drain_packets(&client).is_empty());
 
         client
-            .send(&connect_datagram(2, "sailwind-online"))
+            .send(&connect_datagram(0, 2, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(now), vec![Event::Connected(1)]);
         assert_eq!(server.peer_addr(1), Some(client.local_addr().unwrap()));
@@ -1071,16 +1256,16 @@ mod tests {
         let now = Instant::now();
 
         old_client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(now), vec![Event::Connected(1)]);
         assert_eq!(drain_packets(&old_client).len(), 1);
 
         old_client
-            .send(&protocol::build_unreliable(b"first"))
+            .send(&protocol::build_unreliable(0, b"first"))
             .unwrap();
         old_client
-            .send(&protocol::build_unreliable(b"second"))
+            .send(&protocol::build_unreliable(0, b"second"))
             .unwrap();
         let events = server.poll(now);
         assert_eq!(
@@ -1102,7 +1287,7 @@ mod tests {
         }
 
         retry_client
-            .send(&connect_datagram(2, "sailwind-online"))
+            .send(&connect_datagram(0, 2, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(now), vec![Event::Connected(1)]);
         assert_eq!(
@@ -1135,10 +1320,12 @@ mod tests {
         let first = client_from("127.0.0.1", server_addr);
         let second = client_from("127.0.0.1", server_addr);
 
-        first.send(&connect_datagram(1, "sailwind-online")).unwrap();
+        first
+            .send(&connect_datagram(0, 1, "sailwind-online"))
+            .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(1)]);
         second
-            .send(&connect_datagram(2, "sailwind-online"))
+            .send(&connect_datagram(0, 2, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(2)]);
         assert_eq!(server.peer_count(), 2);
@@ -1146,14 +1333,14 @@ mod tests {
 
         let same_source_excess = client_from("127.0.0.1", server_addr);
         same_source_excess
-            .send(&connect_datagram(3, "sailwind-online"))
+            .send(&connect_datagram(0, 3, "sailwind-online"))
             .unwrap();
         assert!(server.poll(Instant::now()).is_empty());
         assert_eq!(server.peer_count(), 2);
 
         let other_source = client_from("127.0.0.2", server_addr);
         other_source
-            .send(&connect_datagram(4, "sailwind-online"))
+            .send(&connect_datagram(0, 4, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(3)]);
         assert_eq!(server.peer_count(), 3);
@@ -1161,14 +1348,16 @@ mod tests {
 
         let global_excess = client_from("127.0.0.2", server_addr);
         global_excess
-            .send(&connect_datagram(5, "sailwind-online"))
+            .send(&connect_datagram(0, 5, "sailwind-online"))
             .unwrap();
         assert!(server.poll(Instant::now()).is_empty());
         assert_eq!(server.peer_count(), 3);
 
         let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
         first.recv(&mut accept).unwrap();
-        first.send(&connect_datagram(1, "sailwind-online")).unwrap();
+        first
+            .send(&connect_datagram(0, 1, "sailwind-online"))
+            .unwrap();
         assert!(server.poll(Instant::now()).is_empty());
         assert_eq!(
             first.recv(&mut accept).unwrap(),
@@ -1176,7 +1365,9 @@ mod tests {
         );
         assert_eq!(server.peer_count(), 3);
 
-        first.send(&connect_datagram(6, "sailwind-online")).unwrap();
+        first
+            .send(&connect_datagram(0, 6, "sailwind-online"))
+            .unwrap();
         assert_eq!(
             server.poll(Instant::now()),
             vec![Event::Disconnected(1, DisconnectReason::Remote)]
@@ -1186,7 +1377,9 @@ mod tests {
         assert_eq!(server.peer_addr(1), None);
         assert_peer_indices_consistent(&server);
 
-        first.send(&connect_datagram(6, "sailwind-online")).unwrap();
+        first
+            .send(&connect_datagram(0, 6, "sailwind-online"))
+            .unwrap();
         assert_eq!(server.poll(Instant::now()), vec![Event::Connected(1)]);
         assert_eq!(server.peer_count(), 3);
         assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 2);
@@ -1214,7 +1407,7 @@ mod tests {
 
         // 1) Connect.
         client
-            .send(&connect_datagram(0x1234, "sailwind-online"))
+            .send(&connect_datagram(0, 0x1234, "sailwind-online"))
             .unwrap();
         let events = server.poll(Instant::now());
         assert_eq!(events, vec![Event::Connected(1)]);
@@ -1230,7 +1423,7 @@ mod tests {
         );
 
         // 2) Application data over the Unreliable channel.
-        let payload = protocol::build_unreliable(b"hello-server");
+        let payload = protocol::build_unreliable(0, b"hello-server");
         client.send(&payload).unwrap();
         let events = server.poll(Instant::now());
         assert_eq!(events, vec![Event::Data(1, b"hello-server".to_vec())]);
@@ -1238,10 +1431,13 @@ mod tests {
         // 3) Server -> client unreliable send.
         server.send_unreliable(1, b"hello-client").unwrap();
         let n = client.recv(&mut buf).unwrap();
-        assert_eq!(&buf[..n], &protocol::build_unreliable(b"hello-client")[..]);
+        assert_eq!(
+            &buf[..n],
+            &protocol::build_unreliable(0, b"hello-client")[..]
+        );
 
         // 4) Disconnect.
-        client.send(&protocol::build_disconnect(0x1234)).unwrap();
+        client.send(&protocol::build_disconnect(0, 0x1234)).unwrap();
         let events = server.poll(Instant::now());
         assert_eq!(
             events,
@@ -1258,7 +1454,7 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.connect(server_addr).unwrap();
 
-        client.send(&connect_datagram(1, "wrong-key")).unwrap();
+        client.send(&connect_datagram(0, 1, "wrong-key")).unwrap();
         let events = server.poll(Instant::now());
         assert!(events.is_empty());
         assert_eq!(server.peer_count(), 0);
@@ -1298,13 +1494,13 @@ mod tests {
         client.connect(server_addr).unwrap();
 
         client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         server.poll(Instant::now());
         let mut buf = [0u8; 64];
         let _ = client.recv(&mut buf).unwrap(); // drain accept
 
-        client.send(&protocol::build_ping(0x00AB)).unwrap();
+        client.send(&protocol::build_ping(0, 0x00AB)).unwrap();
         server.poll(Instant::now());
         let n = client.recv(&mut buf).unwrap();
         assert_eq!(n, protocol::PONG_SIZE);
@@ -1324,7 +1520,7 @@ mod tests {
 
         let t0 = Instant::now();
         client
-            .send(&connect_datagram(1, "sailwind-online"))
+            .send(&connect_datagram(0, 1, "sailwind-online"))
             .unwrap();
         assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
 

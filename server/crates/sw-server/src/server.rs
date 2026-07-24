@@ -1326,17 +1326,25 @@ mod handshake_tests {
     }
 
     fn connect_peer(server: &mut Server) -> (UdpSocket, PeerId) {
-        connect_peer_from(server, "127.0.0.1")
+        connect_peer_from_with_number(server, "127.0.0.1", 0)
     }
 
     fn connect_peer_from(server: &mut Server, source_ip: &str) -> (UdpSocket, PeerId) {
+        connect_peer_from_with_number(server, source_ip, 0)
+    }
+
+    fn connect_peer_from_with_number(
+        server: &mut Server,
+        source_ip: &str,
+        connection_number: u8,
+    ) -> (UdpSocket, PeerId) {
         let client = UdpSocket::bind((source_ip, 0)).unwrap();
         client.connect(server.host.local_addr().unwrap()).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let connect_data = protocol::write_litenet_string(CONNECT_KEY);
-        let request = protocol::build_connect_request(0, 1, 1, 16, &connect_data);
+        let request = protocol::build_connect_request(connection_number, 1, 1, 16, &connect_data);
         client.send(&request).unwrap();
 
         let peer = match server.host.poll(Instant::now()).as_slice() {
@@ -1345,6 +1353,7 @@ mod handshake_tests {
         };
         let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
         client.recv(&mut accept).unwrap();
+        assert_eq!(accept[9], connection_number);
         (client, peer)
     }
 
@@ -1392,6 +1401,100 @@ mod handshake_tests {
                 return payload;
             }
         }
+    }
+
+    #[test]
+    fn nonzero_transport_session_round_trips_hello_with_its_connection_number() {
+        for connection_number in 1..protocol::MAX_CONNECTION_NUMBER {
+            let mut server = make_server();
+            let (client, peer) =
+                connect_peer_from_with_number(&mut server, "127.0.0.1", connection_number);
+            let hello = hello_envelope(
+                &format!("nonzero-session-{connection_number}"),
+                sw_contracts::PROTOCOL_VERSION,
+                Some("surface-hash"),
+            );
+
+            client
+                .send(&protocol::build_unreliable(connection_number, &hello))
+                .unwrap();
+            let events = server.host.poll(Instant::now());
+            assert_eq!(events, vec![Event::Data(peer, hello)]);
+            for event in events {
+                server.handle_event(event).unwrap();
+            }
+
+            let mut packet = [0u8; protocol::MTU];
+            let received = client.recv(&mut packet).unwrap();
+            assert_eq!(
+                protocol::Header::from_byte(packet[0]),
+                protocol::Header {
+                    property: protocol::property::UNRELIABLE,
+                    connection_number,
+                    fragmented: false,
+                }
+            );
+            let envelope = decode_envelope(&packet[protocol::HEADER_SIZE..received]).unwrap();
+            let server_hello = envelope.payload_as_server_hello().unwrap();
+            assert!(server_hello.accepted());
+            assert_eq!(server_hello.reason(), Some(""));
+        }
+    }
+
+    #[test]
+    fn retired_connection_number_cannot_authenticate_replacement_endpoint() {
+        let mut server = make_server();
+        let (client, first_peer) = connect_peer_from_with_number(&mut server, "127.0.0.1", 1);
+        let connect_data = protocol::write_litenet_string(CONNECT_KEY);
+        let replacement_request = protocol::build_connect_request(2, 2, 1, 16, &connect_data);
+        client.send(&replacement_request).unwrap();
+
+        let events = server.host.poll(Instant::now());
+        assert_eq!(
+            events,
+            vec![
+                Event::Disconnected(first_peer, DisconnectReason::Remote),
+                Event::Connected(2),
+            ]
+        );
+        for event in events {
+            server.handle_event(event).unwrap();
+        }
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        assert_eq!(
+            client.recv(&mut accept).unwrap(),
+            protocol::CONNECT_ACCEPT_SIZE
+        );
+        assert_eq!(accept[9], 2);
+
+        let hello = hello_envelope(
+            "replacement-number-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        client.send(&protocol::build_unreliable(1, &hello)).unwrap();
+        assert!(
+            server.host.poll(Instant::now()).is_empty(),
+            "the retired connection number must not reach authentication"
+        );
+        assert!(server.sessions.is_empty());
+
+        client.send(&protocol::build_unreliable(2, &hello)).unwrap();
+        let current_events = server.host.poll(Instant::now());
+        assert_eq!(current_events, vec![Event::Data(2, hello)]);
+        for event in current_events {
+            server.handle_event(event).unwrap();
+        }
+        assert_eq!(server.sessions.len(), 1);
+        assert!(server.sessions.contains_key(&2));
+
+        let mut response = [0u8; protocol::MTU];
+        let received = client.recv(&mut response).unwrap();
+        let header = protocol::Header::from_byte(response[0]);
+        assert_eq!(header.property, protocol::property::UNRELIABLE);
+        assert_eq!(header.connection_number, 2);
+        let envelope = decode_envelope(&response[protocol::HEADER_SIZE..received]).unwrap();
+        assert!(envelope.payload_as_server_hello().unwrap().accepted());
     }
 
     #[test]
@@ -1899,9 +2002,9 @@ mod handshake_tests {
         }
 
         first_client
-            .send(&protocol::build_unreliable(&hello))
+            .send(&protocol::build_unreliable(0, &hello))
             .unwrap();
-        first_client.send(&protocol::build_ping(1)).unwrap();
+        first_client.send(&protocol::build_ping(0, 1)).unwrap();
         assert!(
             server.host.poll(Instant::now()).is_empty(),
             "data and keepalive traffic from the evicted address must be ignored"
@@ -1938,9 +2041,9 @@ mod handshake_tests {
         let new_request = protocol::build_connect_request(0, 2, 1, 16, &connect_data);
 
         old_client
-            .send(&protocol::build_unreliable(&old_hello))
+            .send(&protocol::build_unreliable(0, &old_hello))
             .unwrap();
-        old_client.send(&protocol::build_disconnect(1)).unwrap();
+        old_client.send(&protocol::build_disconnect(0, 1)).unwrap();
         new_client.send(&new_request).unwrap();
         std::thread::sleep(Duration::from_millis(10));
 
