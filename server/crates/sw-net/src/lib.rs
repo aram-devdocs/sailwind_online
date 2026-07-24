@@ -50,6 +50,9 @@ const MAX_POLL_MAINTENANCE_SCANS: usize = 512;
 /// Hard ceiling on host keepalive datagrams sent by one fixed-tick poll.
 const MAX_POLL_KEEPALIVE_SENDS: usize = MAX_POLL_MAINTENANCE_SCANS;
 
+/// Hard ceiling on expired reconnect watermarks removed by one fixed-tick poll.
+const MAX_POLL_WATERMARK_CLEANUPS: usize = MAX_POLL_MAINTENANCE_SCANS;
+
 /// Hard ceiling on the event vector returned by one poll.
 const MAX_POLL_EVENTS: usize = MAX_POLL_SOCKET_EVENTS + MAX_POLL_TIMEOUT_EVENTS;
 
@@ -100,6 +103,7 @@ struct PollWork {
     timeout_events: usize,
     maintenance_scans: usize,
     keepalive_sends: usize,
+    watermark_cleanups: usize,
 }
 
 struct Peer {
@@ -116,6 +120,12 @@ struct Peer {
     rtt: Option<Duration>,
 }
 
+struct ReconnectWatermark {
+    connect_time: i64,
+    expires_at: Instant,
+    generation: u64,
+}
+
 /// A UDP host: binds a socket, tracks peers, and exposes an event/send API.
 pub struct Host {
     socket: UdpSocket,
@@ -127,6 +137,9 @@ pub struct Host {
     free_peer_slots: VecDeque<usize>,
     available_free_peer_slots: usize,
     peers_per_ip: HashMap<IpAddr, usize>,
+    reconnect_watermarks: HashMap<SocketAddr, ReconnectWatermark>,
+    reconnect_watermark_order: VecDeque<(SocketAddr, u64)>,
+    next_reconnect_watermark_generation: u64,
     maintenance_cursor: usize,
     connect_key: String,
     timeout: Duration,
@@ -173,6 +186,9 @@ impl Host {
             free_peer_slots: VecDeque::new(),
             available_free_peer_slots: 0,
             peers_per_ip: HashMap::new(),
+            reconnect_watermarks: HashMap::new(),
+            reconnect_watermark_order: VecDeque::new(),
+            next_reconnect_watermark_generation: 0,
             maintenance_cursor: 0,
             connect_key: connect_key.to_string(),
             timeout: DEFAULT_TIMEOUT,
@@ -227,6 +243,7 @@ impl Host {
         self.available_free_peer_slots = self.free_peer_slots.len();
         let mut events = Vec::with_capacity(MAX_POLL_EVENTS);
         let mut work = PollWork::default();
+        self.expire_reconnect_watermarks(now, &mut work);
         self.drain_socket(now, &mut events, &mut work);
         work.socket_events = events.len();
         self.process_peer_maintenance(now, &mut events, &mut work);
@@ -236,6 +253,7 @@ impl Host {
         debug_assert!(work.timeout_events <= MAX_POLL_TIMEOUT_EVENTS);
         debug_assert!(work.maintenance_scans <= MAX_POLL_MAINTENANCE_SCANS);
         debug_assert!(work.keepalive_sends <= MAX_POLL_KEEPALIVE_SENDS);
+        debug_assert!(work.watermark_cleanups <= MAX_POLL_WATERMARK_CLEANUPS);
         debug_assert!(events.len() <= MAX_POLL_EVENTS);
         (events, work)
     }
@@ -345,6 +363,7 @@ impl Host {
             _ => return,
         }
 
+        let mut replaced_existing = false;
         if let Some(existing) = self.peers.get(&addr) {
             // LiteNetLib orders this signed Int64 directly. Do not subtract:
             // a wrapped comparison could let a delayed request evict its live
@@ -367,13 +386,29 @@ impl Host {
             let old_id = existing.id;
             self.remove_peer_at(addr);
             events.push(Event::Disconnected(old_id, DisconnectReason::Remote));
-        } else if self.peers.len() >= self.max_peers
-            || self.peers_per_ip.get(&addr.ip()).copied().unwrap_or(0) >= self.max_peers_per_ip
-        {
-            return;
+            replaced_existing = true;
+        } else {
+            if let Some(watermark) = self.reconnect_watermarks.get_mut(&addr) {
+                // Keep the same direct signed ordering used for a live peer.
+                // Subtraction could overflow across i64::MIN/i64::MAX.
+                if req.connect_time < watermark.connect_time {
+                    return;
+                }
+                if req.connect_time > watermark.connect_time {
+                    watermark.connect_time = req.connect_time;
+                }
+            }
+            if self.peers.len() >= self.max_peers
+                || self.peers_per_ip.get(&addr.ip()).copied().unwrap_or(0) >= self.max_peers_per_ip
+            {
+                return;
+            }
         }
 
         let Some(slot) = self.allocate_peer_slot() else {
+            if replaced_existing {
+                self.record_reconnect_watermark(addr, req.connect_time, now);
+            }
             return;
         };
         let id = PeerId::try_from(slot + 1).expect("bounded peer slot fits PeerId");
@@ -400,7 +435,75 @@ impl Host {
             ping_sent_at: None,
             rtt: None,
         });
+        self.reconnect_watermarks.remove(&addr);
         events.push(Event::Connected(id));
+    }
+
+    fn record_reconnect_watermark(&mut self, addr: SocketAddr, connect_time: i64, now: Instant) {
+        if self.next_reconnect_watermark_generation == u64::MAX {
+            self.reconnect_watermarks.clear();
+            self.reconnect_watermark_order.clear();
+            self.next_reconnect_watermark_generation = 0;
+        }
+        self.next_reconnect_watermark_generation += 1;
+        let generation = self.next_reconnect_watermark_generation;
+
+        if self.reconnect_watermark_order.len() == self.max_peers {
+            let (oldest_addr, oldest_generation) = self
+                .reconnect_watermark_order
+                .pop_front()
+                .expect("a full reconnect watermark order has an entry");
+            if self
+                .reconnect_watermarks
+                .get(&oldest_addr)
+                .is_some_and(|watermark| watermark.generation == oldest_generation)
+            {
+                self.reconnect_watermarks.remove(&oldest_addr);
+            }
+        }
+
+        let expires_at = now.checked_add(self.timeout).unwrap_or(now);
+        match self.reconnect_watermarks.get_mut(&addr) {
+            Some(watermark) => {
+                if connect_time > watermark.connect_time {
+                    watermark.connect_time = connect_time;
+                }
+                watermark.expires_at = expires_at;
+                watermark.generation = generation;
+            }
+            None => {
+                self.reconnect_watermarks.insert(
+                    addr,
+                    ReconnectWatermark {
+                        connect_time,
+                        expires_at,
+                        generation,
+                    },
+                );
+            }
+        }
+        self.reconnect_watermark_order.push_back((addr, generation));
+        debug_assert!(self.reconnect_watermarks.len() <= self.max_peers);
+        debug_assert!(self.reconnect_watermark_order.len() <= self.max_peers);
+    }
+
+    fn expire_reconnect_watermarks(&mut self, now: Instant, work: &mut PollWork) {
+        while work.watermark_cleanups < MAX_POLL_WATERMARK_CLEANUPS {
+            let Some((addr, generation)) = self.reconnect_watermark_order.front().copied() else {
+                break;
+            };
+            match self.reconnect_watermarks.get(&addr) {
+                Some(watermark) if watermark.generation == generation => {
+                    if watermark.expires_at > now {
+                        break;
+                    }
+                    self.reconnect_watermarks.remove(&addr);
+                }
+                _ => {}
+            }
+            self.reconnect_watermark_order.pop_front();
+            work.watermark_cleanups += 1;
+        }
     }
 
     fn insert_peer(&mut self, peer: Peer) {
@@ -602,6 +705,9 @@ impl Host {
         self.free_peer_slots.clear();
         self.available_free_peer_slots = 0;
         self.peers_per_ip.clear();
+        self.reconnect_watermarks.clear();
+        self.reconnect_watermark_order.clear();
+        self.next_reconnect_watermark_generation = 0;
         self.maintenance_cursor = 0;
         events
     }
@@ -640,6 +746,7 @@ mod tests {
         assert!(work.timeout_events <= MAX_POLL_TIMEOUT_EVENTS);
         assert!(work.maintenance_scans <= MAX_POLL_MAINTENANCE_SCANS);
         assert!(work.keepalive_sends <= MAX_POLL_KEEPALIVE_SENDS);
+        assert!(work.watermark_cleanups <= MAX_POLL_WATERMARK_CLEANUPS);
         assert!(events.len() <= MAX_POLL_EVENTS);
     }
 
@@ -1025,13 +1132,27 @@ mod tests {
         assert_eq!(server.free_peer_slots, VecDeque::from([0]));
 
         client
+            .send(&connect_datagram(1, 30, "sailwind-online"))
+            .unwrap();
+        client
             .send(&connect_datagram(2, 40, "sailwind-online"))
             .unwrap();
         assert_eq!(
             server.poll(t0 + Duration::from_millis(2)),
-            vec![Event::Connected(1)]
+            vec![Event::Connected(1)],
+            "the stale request queued first must not reclaim the quarantined slot"
         );
-        assert_eq!(drain_packets(&client).len(), 1);
+        let retry_packets = drain_packets(&client);
+        assert_eq!(
+            retry_packets.len(),
+            1,
+            "the stale request must receive no reply"
+        );
+        assert_eq!(
+            i64::from_le_bytes(retry_packets[0][1..9].try_into().unwrap()),
+            40
+        );
+        assert_eq!(retry_packets[0][9], 2);
         assert!(server.free_peer_slots.is_empty());
 
         client
@@ -1056,6 +1177,80 @@ mod tests {
         assert_eq!(server.peers[&addr].last_recv, t0 + Duration::from_millis(3));
         assert!(server.free_peer_slots.is_empty());
         assert_peer_indices_consistent(&server);
+    }
+
+    #[test]
+    fn reconnect_watermarks_are_capacity_bounded_expire_and_allow_future_sessions() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 1, 1).unwrap();
+        server.timeout = Duration::from_millis(3);
+        let server_addr = server.local_addr().unwrap();
+        let t0 = Instant::now();
+        let mut last_client = None;
+
+        for source in 0..8 {
+            let client = client_from("127.0.0.1", server_addr);
+            client
+                .send(&connect_datagram(1, source * 10 + 1, "sailwind-online"))
+                .unwrap();
+            assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+            assert_eq!(drain_packets(&client).len(), 1);
+
+            client
+                .send(&connect_datagram(2, source * 10 + 2, "sailwind-online"))
+                .unwrap();
+            assert_eq!(
+                server.poll(t0),
+                vec![Event::Disconnected(1, DisconnectReason::Remote)]
+            );
+            assert!(server.reconnect_watermarks.len() <= server.max_peers);
+            assert!(server.reconnect_watermark_order.len() <= server.max_peers);
+            client
+                .send(&connect_datagram(2, source * 10 + 2, "sailwind-online"))
+                .unwrap();
+            assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+            assert_eq!(drain_packets(&client).len(), 1);
+            assert!(server.reconnect_watermarks.is_empty());
+            assert!(server.reconnect_watermark_order.len() <= server.max_peers);
+
+            assert!(server.disconnect(1));
+            assert_eq!(server.peer_count(), 0);
+            last_client = Some(client);
+        }
+
+        let client = last_client.unwrap();
+        let _ = drain_packets(&client);
+        client
+            .send(&connect_datagram(1, i64::MIN, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&client).len(), 1);
+        client
+            .send(&connect_datagram(2, i64::MAX, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0),
+            vec![Event::Disconnected(1, DisconnectReason::Remote)]
+        );
+        assert_eq!(server.reconnect_watermarks.len(), 1);
+        assert_eq!(server.reconnect_watermark_order.len(), 1);
+        assert!(server.poll(t0 + Duration::from_millis(4)).is_empty());
+        assert!(server.reconnect_watermarks.is_empty());
+        assert!(server.reconnect_watermark_order.is_empty());
+
+        client
+            .send(&connect_datagram(3, i64::MIN, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(5)),
+            vec![Event::Connected(1)],
+            "expiry must not permanently reject a legitimate lower signed timestamp"
+        );
+        let accept = drain_packets(&client);
+        assert_eq!(accept.len(), 1);
+        assert_eq!(
+            i64::from_le_bytes(accept[0][1..9].try_into().unwrap()),
+            i64::MIN
+        );
     }
 
     #[test]
