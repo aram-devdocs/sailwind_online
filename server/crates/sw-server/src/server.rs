@@ -1915,6 +1915,72 @@ mod handshake_tests {
     }
 
     #[test]
+    fn retired_transport_event_cannot_resolve_to_a_later_endpoint_in_its_batch() {
+        let cfg = Config {
+            max_transport_peers: 1,
+            max_transport_peers_per_ip: 1,
+            ..Config::default()
+        };
+        let mut server = make_server_with_config(cfg);
+        let (old_client, old_peer) = connect_peer_from(&mut server, "127.0.0.1");
+        let server_addr = server.host.local_addr().unwrap();
+        let new_client = UdpSocket::bind(("127.0.0.2", 0)).unwrap();
+        new_client.connect(server_addr).unwrap();
+        new_client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let old_hello = hello_envelope(
+            "retired-peer-token",
+            sw_contracts::PROTOCOL_VERSION,
+            Some("surface-hash"),
+        );
+        let connect_data = protocol::write_litenet_string(CONNECT_KEY);
+        let new_request = protocol::build_connect_request(0, 2, 1, 16, &connect_data);
+
+        old_client
+            .send(&protocol::build_unreliable(&old_hello))
+            .unwrap();
+        old_client.send(&protocol::build_disconnect(1)).unwrap();
+        new_client.send(&new_request).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+
+        let events = server.host.poll(Instant::now());
+        assert_eq!(
+            events,
+            vec![
+                Event::Data(old_peer, old_hello),
+                Event::Disconnected(old_peer, DisconnectReason::Remote),
+            ]
+        );
+        let Event::Data(data_peer, _) = &events[0] else {
+            panic!("the old data event must remain first");
+        };
+        assert_eq!(
+            server.host.peer_addr(*data_peer),
+            None,
+            "production event handling must not resolve old data against the queued endpoint"
+        );
+        let Event::Disconnected(disconnected_peer, _) = &events[1] else {
+            panic!("the old disconnect event must follow its data");
+        };
+        assert_eq!(data_peer, disconnected_peer);
+        assert_no_outbound_datagram(&new_client);
+
+        new_client.send(&new_request).unwrap();
+        let events = server.host.poll(Instant::now());
+        assert_eq!(events, vec![Event::Connected(old_peer)]);
+        let mut accept = [0u8; protocol::CONNECT_ACCEPT_SIZE];
+        assert_eq!(
+            new_client.recv(&mut accept).unwrap(),
+            protocol::CONNECT_ACCEPT_SIZE
+        );
+        assert_eq!(
+            server.host.peer_addr(old_peer),
+            Some(new_client.local_addr().unwrap())
+        );
+    }
+
+    #[test]
     fn persisted_offline_identity_does_not_compete_with_fresh_token_admission() {
         let persisted_token = "persisted-offline-token";
         let db = Db::open_in_memory().unwrap();

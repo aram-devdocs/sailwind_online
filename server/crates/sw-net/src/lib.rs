@@ -15,7 +15,7 @@
 
 pub mod protocol;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -121,7 +121,11 @@ pub struct Host {
     socket: UdpSocket,
     peers: HashMap<SocketAddr, Peer>,
     peer_slots: Vec<Option<SocketAddr>>,
-    free_peer_slots: Vec<usize>,
+    // Retired slots join the back of this queue. Only the prefix counted by
+    // `available_free_peer_slots` existed when the current poll began, so slot
+    // reuse can never alias an event returned by that poll.
+    free_peer_slots: VecDeque<usize>,
+    available_free_peer_slots: usize,
     peers_per_ip: HashMap<IpAddr, usize>,
     maintenance_cursor: usize,
     connect_key: String,
@@ -166,7 +170,8 @@ impl Host {
             socket,
             peers: HashMap::new(),
             peer_slots: Vec::new(),
-            free_peer_slots: Vec::new(),
+            free_peer_slots: VecDeque::new(),
+            available_free_peer_slots: 0,
             peers_per_ip: HashMap::new(),
             maintenance_cursor: 0,
             connect_key: connect_key.to_string(),
@@ -211,12 +216,15 @@ impl Host {
     /// Pump the socket and internal timers, returning everything that happened.
     ///
     /// `now` is the caller's tick timestamp; timeouts and ping scheduling are
-    /// measured against it.
+    /// measured against it. The caller must finish consuming one returned event
+    /// batch before polling again: the next poll is the boundary at which peer
+    /// slots retired by the prior batch become eligible for reuse.
     pub fn poll(&mut self, now: Instant) -> Vec<Event> {
         self.poll_with_work(now).0
     }
 
     fn poll_with_work(&mut self, now: Instant) -> (Vec<Event>, PollWork) {
+        self.available_free_peer_slots = self.free_peer_slots.len();
         let mut events = Vec::with_capacity(MAX_POLL_EVENTS);
         let mut work = PollWork::default();
         self.drain_socket(now, &mut events, &mut work);
@@ -397,8 +405,11 @@ impl Host {
             let slot = self.peer_slots.len();
             self.peer_slots.push(None);
             Some(slot)
+        } else if self.available_free_peer_slots > 0 {
+            self.available_free_peer_slots -= 1;
+            self.free_peer_slots.pop_front()
         } else {
-            self.free_peer_slots.pop()
+            None
         }
     }
 
@@ -418,7 +429,7 @@ impl Host {
         let peer = self.peers.remove(&addr)?;
         debug_assert_eq!(self.peer_slots[slot], Some(addr));
         self.peer_slots[slot] = None;
-        self.free_peer_slots.push(slot);
+        self.free_peer_slots.push_back(slot);
         Some(peer)
     }
 
@@ -572,6 +583,7 @@ impl Host {
         self.peers.clear();
         self.peer_slots.clear();
         self.free_peer_slots.clear();
+        self.available_free_peer_slots = 0;
         self.peers_per_ip.clear();
         self.maintenance_cursor = 0;
         events
@@ -652,6 +664,7 @@ mod tests {
             server.peer_slots.len(),
             server.free_peer_slots.len() + server.peers.len()
         );
+        assert!(server.available_free_peer_slots <= server.free_peer_slots.len());
         assert!(server.maintenance_cursor <= server.peer_slots.len());
 
         let mut free = vec![false; server.peer_slots.len()];
@@ -953,6 +966,154 @@ mod tests {
     }
 
     #[test]
+    fn removed_peer_id_cannot_alias_a_cross_address_connect_in_the_same_poll() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 1, 1).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let old_client = client_from("127.0.0.1", server_addr);
+        let new_client = client_from("127.0.0.2", server_addr);
+        let now = Instant::now();
+
+        old_client
+            .send(&connect_datagram(1, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&old_client).len(), 1);
+
+        old_client
+            .send(&protocol::build_unreliable(b"old-before-disconnect"))
+            .unwrap();
+        old_client.send(&protocol::build_disconnect(1)).unwrap();
+        new_client
+            .send(&connect_datagram(2, "sailwind-online"))
+            .unwrap();
+
+        let events = server.poll(now);
+        assert_eq!(
+            events,
+            vec![
+                Event::Data(1, b"old-before-disconnect".to_vec()),
+                Event::Disconnected(1, DisconnectReason::Remote),
+            ]
+        );
+        assert_eq!(
+            server.peer_addr(1),
+            None,
+            "an id in an earlier event must not resolve to a later peer from the same batch"
+        );
+        server
+            .send_unreliable(1, b"must-not-reach-the-new-peer")
+            .unwrap();
+        assert!(
+            !server.disconnect(1),
+            "acting on the old event id must not disconnect the new peer"
+        );
+        assert!(
+            drain_packets(&new_client).is_empty(),
+            "the new endpoint must receive neither data nor disconnect for the old id"
+        );
+
+        new_client
+            .send(&connect_datagram(2, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(server.peer_addr(1), Some(new_client.local_addr().unwrap()));
+        let packets = drain_packets(&new_client);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            protocol::Header::from_byte(packets[0][0]).property,
+            protocol::property::CONNECT_ACCEPT
+        );
+        assert_peer_indices_consistent(&server);
+    }
+
+    #[test]
+    fn full_capacity_same_address_replacement_connects_on_the_next_poll_retry() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 1, 1).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+        let now = Instant::now();
+
+        client
+            .send(&connect_datagram(1, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&client).len(), 1);
+
+        client
+            .send(&connect_datagram(2, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(now),
+            vec![Event::Disconnected(1, DisconnectReason::Remote)],
+            "a full-capacity replacement must retire the old id for the complete event batch"
+        );
+        assert_eq!(server.peer_addr(1), None);
+        assert!(drain_packets(&client).is_empty());
+
+        client
+            .send(&connect_datagram(2, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(server.peer_addr(1), Some(client.local_addr().unwrap()));
+        let packets = drain_packets(&client);
+        assert_eq!(packets.len(), 1);
+        let local_peer_id = i32::from_le_bytes(packets[0][11..15].try_into().unwrap());
+        assert_eq!(local_peer_id, 0);
+        assert_peer_indices_consistent(&server);
+    }
+
+    #[test]
+    fn local_disconnect_during_batch_processing_keeps_remaining_events_unresolvable() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 1, 1).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let old_client = client_from("127.0.0.1", server_addr);
+        let retry_client = client_from("127.0.0.2", server_addr);
+        let now = Instant::now();
+
+        old_client
+            .send(&connect_datagram(1, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&old_client).len(), 1);
+
+        old_client
+            .send(&protocol::build_unreliable(b"first"))
+            .unwrap();
+        old_client
+            .send(&protocol::build_unreliable(b"second"))
+            .unwrap();
+        let events = server.poll(now);
+        assert_eq!(
+            events,
+            vec![
+                Event::Data(1, b"first".to_vec()),
+                Event::Data(1, b"second".to_vec()),
+            ]
+        );
+
+        assert!(server.disconnect(1));
+        for event in events.iter().skip(1) {
+            let Event::Data(peer, _) = event else {
+                panic!("expected the remaining data event");
+            };
+            assert_eq!(server.peer_addr(*peer), None);
+            server.send_unreliable(*peer, b"stale-reply").unwrap();
+            assert!(!server.disconnect(*peer));
+        }
+
+        retry_client
+            .send(&connect_datagram(2, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(now), vec![Event::Connected(1)]);
+        assert_eq!(
+            server.peer_addr(1),
+            Some(retry_client.local_addr().unwrap())
+        );
+        assert_eq!(drain_packets(&retry_client).len(), 1);
+        assert_peer_indices_consistent(&server);
+    }
+
+    #[test]
     fn per_ip_admission_uses_bounded_counter_state_instead_of_peer_scans() {
         let source = include_str!("lib.rs");
         let counter_field = ["peers_per_ip: HashMap<IpAddr", ", usize>"].concat();
@@ -1018,11 +1179,15 @@ mod tests {
         first.send(&connect_datagram(6, "sailwind-online")).unwrap();
         assert_eq!(
             server.poll(Instant::now()),
-            vec![
-                Event::Disconnected(1, DisconnectReason::Remote),
-                Event::Connected(1)
-            ]
+            vec![Event::Disconnected(1, DisconnectReason::Remote)]
         );
+        assert_eq!(server.peer_count(), 2);
+        assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 1);
+        assert_eq!(server.peer_addr(1), None);
+        assert_peer_indices_consistent(&server);
+
+        first.send(&connect_datagram(6, "sailwind-online")).unwrap();
+        assert_eq!(server.poll(Instant::now()), vec![Event::Connected(1)]);
         assert_eq!(server.peer_count(), 3);
         assert_eq!(server.peer_count_for_ip("127.0.0.1".parse().unwrap()), 2);
         assert_peer_indices_consistent(&server);
