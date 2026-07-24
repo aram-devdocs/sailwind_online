@@ -346,6 +346,12 @@ impl Host {
         }
 
         if let Some(existing) = self.peers.get(&addr) {
+            // LiteNetLib orders this signed Int64 directly. Do not subtract:
+            // a wrapped comparison could let a delayed request evict its live
+            // successor.
+            if req.connect_time < existing.connect_time {
+                return;
+            }
             if existing.connect_time == req.connect_time {
                 // Retransmitted request: the client missed our accept. Resend it.
                 let accept = protocol::build_connect_accept(
@@ -670,6 +676,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct PeerState {
+        id: PeerId,
+        slot: usize,
+        connect_time: i64,
+        connection_number: u8,
+        local_peer_id: i32,
+        last_recv: Instant,
+        last_ping_sent: Instant,
+        ping_seq: u16,
+        ping_sent_at: Option<Instant>,
+        rtt: Option<Duration>,
+    }
+
+    fn peer_state(server: &Host, addr: SocketAddr) -> PeerState {
+        let peer = &server.peers[&addr];
+        PeerState {
+            id: peer.id,
+            slot: peer.slot,
+            connect_time: peer.connect_time,
+            connection_number: peer.connection_number,
+            local_peer_id: peer.local_peer_id,
+            last_recv: peer.last_recv,
+            last_ping_sent: peer.last_ping_sent,
+            ping_seq: peer.ping_seq,
+            ping_sent_at: peer.ping_sent_at,
+            rtt: peer.rtt,
+        }
+    }
+
     fn assert_peer_indices_consistent(server: &Host) {
         assert_eq!(
             server.peer_slots.len(),
@@ -870,6 +906,156 @@ mod tests {
             server.poll(now),
             vec![Event::Data(2, b"current-hello".to_vec())]
         );
+    }
+
+    #[test]
+    fn same_endpoint_connect_requests_only_replace_with_a_strictly_newer_time() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 3, 3).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+        let addr = client.local_addr().unwrap();
+        let t0 = Instant::now();
+
+        client
+            .send(&connect_datagram(1, 30, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&client).len(), 1);
+
+        client
+            .send(&connect_datagram(2, 40, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(1)),
+            vec![
+                Event::Disconnected(1, DisconnectReason::Remote),
+                Event::Connected(2),
+            ]
+        );
+        let time_40_accept = drain_packets(&client);
+        assert_eq!(time_40_accept.len(), 1);
+        assert_eq!(
+            i64::from_le_bytes(time_40_accept[0][1..9].try_into().unwrap()),
+            40
+        );
+        assert_eq!(time_40_accept[0][9], 2);
+
+        let state_after_time_40 = peer_state(&server, addr);
+        client
+            .send(&connect_datagram(1, 30, "sailwind-online"))
+            .unwrap();
+        assert!(server.poll(t0 + Duration::from_millis(2)).is_empty());
+        assert!(drain_packets(&client).is_empty());
+        assert_eq!(
+            peer_state(&server, addr),
+            state_after_time_40,
+            "an older request must not mutate live-session or liveness state"
+        );
+        assert_eq!(server.peer_count(), 1);
+        assert_eq!(server.peer_addr(2), Some(addr));
+        assert_peer_indices_consistent(&server);
+
+        client
+            .send(&protocol::build_unreliable(1, b"retired-session"))
+            .unwrap();
+        client
+            .send(&protocol::build_unreliable(2, b"current-session"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(3)),
+            vec![Event::Data(2, b"current-session".to_vec())]
+        );
+
+        let state_before_duplicate = peer_state(&server, addr);
+        client
+            .send(&connect_datagram(2, 40, "sailwind-online"))
+            .unwrap();
+        assert!(server.poll(t0 + Duration::from_millis(4)).is_empty());
+        assert_eq!(drain_packets(&client), time_40_accept);
+        assert_eq!(
+            peer_state(&server, addr),
+            state_before_duplicate,
+            "an exact retry must only resend the original accept"
+        );
+
+        client
+            .send(&connect_datagram(3, 50, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(5)),
+            vec![
+                Event::Disconnected(2, DisconnectReason::Remote),
+                Event::Connected(3),
+            ]
+        );
+        let time_50_accept = drain_packets(&client);
+        assert_eq!(time_50_accept.len(), 1);
+        assert_eq!(
+            i64::from_le_bytes(time_50_accept[0][1..9].try_into().unwrap()),
+            50
+        );
+        assert_eq!(time_50_accept[0][9], 3);
+        assert_eq!(server.peer_count(), 1);
+        assert_eq!(server.peer_addr(3), Some(addr));
+        assert_peer_indices_consistent(&server);
+    }
+
+    #[test]
+    fn delayed_older_request_cannot_black_hole_a_full_capacity_peer() {
+        let mut server = Host::bind_with_limits("127.0.0.1:0", "sailwind-online", 1, 1).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_from("127.0.0.1", server_addr);
+        let addr = client.local_addr().unwrap();
+        let t0 = Instant::now();
+
+        client
+            .send(&connect_datagram(1, 30, "sailwind-online"))
+            .unwrap();
+        assert_eq!(server.poll(t0), vec![Event::Connected(1)]);
+        assert_eq!(drain_packets(&client).len(), 1);
+
+        client
+            .send(&connect_datagram(2, 40, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(1)),
+            vec![Event::Disconnected(1, DisconnectReason::Remote)]
+        );
+        assert_eq!(server.peer_count(), 0);
+        assert_eq!(server.free_peer_slots, VecDeque::from([0]));
+
+        client
+            .send(&connect_datagram(2, 40, "sailwind-online"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(2)),
+            vec![Event::Connected(1)]
+        );
+        assert_eq!(drain_packets(&client).len(), 1);
+        assert!(server.free_peer_slots.is_empty());
+
+        client
+            .send(&connect_datagram(1, 30, "sailwind-online"))
+            .unwrap();
+        client
+            .send(&protocol::build_unreliable(1, b"retired-session"))
+            .unwrap();
+        client
+            .send(&protocol::build_unreliable(2, b"current-session"))
+            .unwrap();
+        assert_eq!(
+            server.poll(t0 + Duration::from_millis(3)),
+            vec![Event::Data(1, b"current-session".to_vec())],
+            "the delayed request must not retire the only slot or drop current-session traffic"
+        );
+        assert!(drain_packets(&client).is_empty());
+        assert_eq!(server.peer_count(), 1);
+        assert_eq!(server.peer_addr(1), Some(addr));
+        assert_eq!(server.peers[&addr].connect_time, 40);
+        assert_eq!(server.peers[&addr].connection_number, 2);
+        assert_eq!(server.peers[&addr].last_recv, t0 + Duration::from_millis(3));
+        assert!(server.free_peer_slots.is_empty());
+        assert_peer_indices_consistent(&server);
     }
 
     #[test]
