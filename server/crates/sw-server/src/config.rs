@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_recurrence_is_fresh_for_every_accepted_capacity_and_tick_pair() {
+    fn snapshot_recurrence_validation_matches_every_wire_rate_pair() {
         let default = Config::default();
         default.validate().unwrap();
         assert_eq!(
@@ -541,70 +541,102 @@ mod tests {
             error.to_string().contains("snapshot recurrence"),
             "low-tick rejection must explain the freshness invariant: {error}"
         );
+
+        // The scheduler proof below exhausts every `(peers, nominal_cadence)`
+        // input. Here one peer-capacity boundary and every wire-rate pair prove
+        // that `Config::validate` maps `tick_hz / snapshot_hz` to that proof and
+        // accepts exactly the pairs whose recurrence fits before client expiry.
+        // Keeping these as orthogonal matrices avoids 1024 * 32,640 redundant
+        // configurations, or 66,846,720 duplicate formula/simulation checks.
+        let mut rate_pairs = 0usize;
+        let mut accepted_pairs = 0usize;
+        for tick_hz in 1..=u32::from(u8::MAX) {
+            for snapshot_hz in 1..=tick_hz {
+                rate_pairs += 1;
+                let cfg = Config {
+                    tick_hz,
+                    snapshot_hz,
+                    max_transport_peers: MAX_TRANSPORT_PEERS,
+                    ..Config::default()
+                };
+                let recurrence =
+                    snapshot_recurrence_ticks(MAX_TRANSPORT_PEERS, cfg.ticks_per_snapshot())
+                        .unwrap();
+                let expiry = u64::from(tick_hz) * SNAPSHOT_CLIENT_EXPIRY_SECS;
+                let validation = cfg.validate();
+                assert_eq!(
+                    validation.is_ok(),
+                    recurrence < expiry,
+                    "tick_hz={tick_hz}, snapshot_hz={snapshot_hz}, \
+                     nominal_cadence={}, recurrence={recurrence}, expiry={expiry}, \
+                     validation={validation:?}",
+                    cfg.ticks_per_snapshot()
+                );
+                accepted_pairs += usize::from(validation.is_ok());
+            }
+        }
+        assert_eq!(rate_pairs, 32_640);
+        assert!(accepted_pairs > 0);
+        assert!(accepted_pairs < rate_pairs);
     }
 
     fn simulate_snapshot_recurrence(peers: u32, nominal_cadence: u64) -> u64 {
         if peers <= 1 {
             return 0;
         }
-        let recipient_round = u64::from(peers).div_ceil(SNAPSHOT_PACKETS_PER_TICK as u64);
-        let stable_chunks = u64::from(peers - 1)
-            .min(SNAPSHOT_VISIBILITY_CEILING as u64)
-            .div_ceil(SNAPSHOT_ENTITIES_PER_PACKET as u64);
-        let mut last_due_tick = 0;
-        let mut chunk = 0;
+        let mut tick = 0u64;
+        let mut recipients_remaining = peers;
+        let visible_players = (peers - 1).min(SNAPSHOT_VISIBILITY_CEILING as u32);
+        let mut next_player = 0u32;
+        let mut last_due_tick = None;
         let mut first_target_tick = None;
 
-        for recipient_visit in 0..=nominal_cadence * stable_chunks * 2 {
-            let visit_tick = 1 + recipient_visit * recipient_round;
-            if last_due_tick != 0 && visit_tick - last_due_tick < nominal_cadence {
+        loop {
+            tick += 1;
+            recipients_remaining =
+                recipients_remaining.saturating_sub(SNAPSHOT_PACKETS_PER_TICK as u32);
+            if recipients_remaining != 0 {
                 continue;
             }
-            last_due_tick = visit_tick;
-            if chunk == 0 {
-                if let Some(first) = first_target_tick {
-                    return visit_tick - first;
-                }
-                first_target_tick = Some(visit_tick);
+            recipients_remaining = peers;
+
+            if last_due_tick.is_some_and(|last| tick - last < nominal_cadence) {
+                continue;
             }
-            chunk = (chunk + 1) % stable_chunks;
+            last_due_tick = Some(tick);
+            if next_player == 0 {
+                if let Some(first) = first_target_tick {
+                    return tick - first;
+                }
+                first_target_tick = Some(tick);
+            }
+            next_player = (next_player + SNAPSHOT_ENTITIES_PER_PACKET as u32).min(visible_players);
+            if next_player == visible_players {
+                next_player = 0;
+            }
         }
-        panic!("the bounded scheduler simulation did not repeat its target chunk");
     }
 
     #[test]
-    fn snapshot_recurrence_formula_matches_scheduler_for_all_accepted_rates_and_boundaries() {
-        let peer_boundaries = [1, 2, 5, 6, 16, 31, 32, 33, 64, 1_023, 1_024];
-        let mut simulated = [[0u64; u8::MAX as usize + 1]; 11];
-        for (peer_index, peers) in peer_boundaries.into_iter().enumerate() {
+    fn snapshot_recurrence_formula_matches_every_scheduler_opportunity_simulation() {
+        let started = std::time::Instant::now();
+        let mut cases = 0usize;
+        for peers in 1..=MAX_TRANSPORT_PEERS {
             for nominal_cadence in 1..=u64::from(u8::MAX) {
-                simulated[peer_index][nominal_cadence as usize] =
-                    simulate_snapshot_recurrence(peers, nominal_cadence);
+                cases += 1;
+                assert_eq!(
+                    snapshot_recurrence_ticks(peers, nominal_cadence),
+                    Some(simulate_snapshot_recurrence(peers, nominal_cadence)),
+                    "peers={peers}, nominal_cadence={nominal_cadence}"
+                );
             }
         }
-
-        for tick_hz in 1..=u32::from(u8::MAX) {
-            for snapshot_hz in 1..=tick_hz {
-                for (peer_index, peers) in peer_boundaries.into_iter().enumerate() {
-                    let cfg = Config {
-                        tick_hz,
-                        snapshot_hz,
-                        max_transport_peers: peers,
-                        max_transport_peers_per_ip: peers.min(32),
-                        ..Config::default()
-                    };
-                    if cfg.validate().is_err() {
-                        continue;
-                    }
-                    let nominal_cadence = cfg.ticks_per_snapshot();
-                    assert_eq!(
-                        snapshot_recurrence_ticks(peers, nominal_cadence),
-                        Some(simulated[peer_index][nominal_cadence as usize]),
-                        "tick_hz={tick_hz}, snapshot_hz={snapshot_hz}, peers={peers}"
-                    );
-                }
-            }
-        }
+        let elapsed = started.elapsed();
+        assert_eq!(cases, MAX_TRANSPORT_PEERS as usize * u8::MAX as usize);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "{cases} exhaustive scheduler cases took {elapsed:?}"
+        );
     }
 
     #[test]
