@@ -20,14 +20,26 @@ namespace Sailwind.Online.Client.Net
         /// <summary>True while the current peer is fully connected, i.e. safe to send on.</summary>
         bool IsPeerConnected { get; }
 
+        /// <summary>
+        /// Maximum payload bytes the current peer can send as one unreliable packet, or zero when
+        /// there is no current peer.
+        /// </summary>
+        int MaxUnreliablePayloadSize { get; }
+
         /// <summary>Round-trip estimate in milliseconds for the current peer, or -1 when there is none.</summary>
         int Ping { get; }
 
         /// <summary>Bring the manager up. Returns false when the socket cannot bind.</summary>
         bool Start();
 
-        /// <summary>Open (or re-open) the single peer to <paramref name="host"/>:<paramref name="port"/> with the connect key.</summary>
-        void Connect(string host, int port, string key);
+        /// <summary>
+        /// Open (or keep opening) the single peer to <paramref name="host"/>:<paramref name="port"/>
+        /// with the connect key. Returns true when a current peer exists after the attempt.
+        /// </summary>
+        bool Connect(string host, int port, string key);
+
+        /// <summary>Immediately drop the current peer without reporting a network-originated disconnect.</summary>
+        void DropPeer();
 
         /// <summary>Send one datagram to the current peer with the given delivery method.</summary>
         void Send(byte[] data, DeliveryMethod deliveryMethod);

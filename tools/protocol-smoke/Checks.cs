@@ -18,6 +18,7 @@ namespace Sailwind.ProtocolSmoke
     {
         private const string TokenA = "smoke-token-A";
         private const string TokenB = "smoke-token-B";
+        private const string RetryableHelloReason = "server busy; retry";
 
         private readonly string _serverPath;
         private readonly string _configPath;
@@ -75,6 +76,7 @@ namespace Sailwind.ProtocolSmoke
             SprayHostileInput(ep, 100);
 
             var a = new SmokeClient("A");
+            var b = new SmokeClient("B");
             ulong playerIdA = 0;
             bool serverSurvived;
             try
@@ -85,14 +87,20 @@ namespace Sailwind.ProtocolSmoke
                     handshook ? "LiteNetLib Connect completed within 2s"
                               : "no PeerConnected within 2s (sw-net LiteNetLib framing not interoperating yet)"));
 
-                ServerHello? helloA = handshook ? DoHello(a, "Smoke-A", TokenA) : null;
+                // Establish B's transport before A consumes the fresh-identity
+                // admission gate. Check 3 can then bound B's first hello
+                // exchange without including connection scheduling.
+                b.Connect(ep.Address.ToString(), ep.Port);
+                bool bConnected = PumpUntil(() => b.Connected, 2000, a, b);
+
+                ServerHello? helloA = handshook ? DoHello(a, "Smoke-A", TokenA).Response : null;
                 bool helloOk = IsValidHello(helloA);
                 playerIdA = helloA.HasValue ? helloA.Value.PlayerId : 0;
                 results.Add(new Result(2, "hello", helloOk,
                     helloOk ? $"ServerHello accepted, player_id={playerIdA}, protocol_version={helloA.Value.Capabilities.Value.ProtocolVersion}"
                             : "no accepted ServerHello with player_id, capabilities, clock and weather"));
 
-                results.Add(RunPresence(server, ep, a, playerIdA));
+                results.Add(RunPresence(server, a, b, bConnected, playerIdA));
                 results.Add(RunEcon(a));
                 results.Add(RunMarket(a));
                 results.Add(RunMoorage(a));
@@ -105,6 +113,7 @@ namespace Sailwind.ProtocolSmoke
             }
             finally
             {
+                b.Dispose();
                 a.Dispose();
             }
 
@@ -128,7 +137,12 @@ namespace Sailwind.ProtocolSmoke
         // Check 3: presence and server-driven AoI. A second client B joins the
         // same cell while A streams 20 ClientState updates moving +X; B must see
         // A's cell added and A's x increasing.
-        private Result RunPresence(ServerHarness server, IPEndPoint ep, SmokeClient a, ulong playerIdA)
+        private Result RunPresence(
+            ServerHarness server,
+            SmokeClient a,
+            SmokeClient b,
+            bool bConnected,
+            ulong playerIdA)
         {
             try
             {
@@ -137,17 +151,21 @@ namespace Sailwind.ProtocolSmoke
                     return new Result(3, "presence-aoi", false, "skipped: A has no established session");
                 }
 
-                using var b = new SmokeClient("B");
-                b.Connect(ep.Address.ToString(), ep.Port);
-                if (!PumpUntil(() => b.Connected, 2000, a, b))
+                if (!bConnected || !b.Connected)
                 {
                     return new Result(3, "presence-aoi", false, "client B failed to connect");
                 }
 
-                var helloB = DoHello(b, "Smoke-B", TokenB);
-                if (!IsValidHello(helloB))
+                var helloB = DoHello(b, "Smoke-B", TokenB, requireRetryableFirst: true);
+                if (!IsValidHello(helloB.Response))
                 {
                     return new Result(3, "presence-aoi", false, "client B failed the hello exchange");
+                }
+
+                if (!helloB.SawRetryableResponse)
+                {
+                    return new Result(3, "presence-aoi", false,
+                        $"client B did not observe exact transient response '{RetryableHelloReason}' before acceptance");
                 }
 
                 bool sawAddedCell = false;
@@ -179,7 +197,7 @@ namespace Sailwind.ProtocolSmoke
                 bool increasing = IsIncreasing(xs);
                 bool ok = sawAddedCell && increasing;
                 var detail = ok
-                    ? $"B saw A's cell added and {xs.Count} monotonically increasing x samples"
+                    ? $"B observed '{RetryableHelloReason}', then saw A's cell added and {xs.Count} monotonically increasing x samples"
                     : $"sawAddedCell={sawAddedCell}, x-samples={xs.Count}, increasing={increasing}";
                 return new Result(3, "presence-aoi", ok, detail);
             }
@@ -327,7 +345,7 @@ namespace Sailwind.ProtocolSmoke
                     return new Result(6, "restart-persistence", false, "reconnect after restart failed");
                 }
 
-                var hello = DoHello(a2, "Smoke-A", TokenA);
+                var hello = DoHello(a2, "Smoke-A", TokenA).Response;
                 if (!IsValidHello(hello))
                 {
                     return new Result(6, "restart-persistence", false, "hello after restart failed");
@@ -433,11 +451,64 @@ namespace Sailwind.ProtocolSmoke
             }
         }
 
-        private ServerHello? DoHello(SmokeClient c, string name, string token)
+        private (ServerHello? Response, bool SawRetryableResponse) DoHello(
+            SmokeClient c,
+            string name,
+            string token,
+            bool requireRetryableFirst = false)
         {
-            var hello = Codec.EncodeClientHello(_seq++, name, token, "smoke", "0.0.0", string.Empty);
-            var env = SendAndWait(c, hello, e => e.PayloadType == Payload.ServerHello, 6000, 250);
-            return env.HasValue ? env.Value.PayloadAsServerHello() : (ServerHello?)null;
+            const string apiSurfaceHashSentinel = "protocol-smoke-surface-hash";
+            var sawRetryableResponse = false;
+            var hello = Codec.EncodeClientHello(_seq++, name, token, "smoke", "0.0.0", apiSurfaceHashSentinel);
+            if (requireRetryableFirst)
+            {
+                // Program configures a one-second new-identity gate. Because B
+                // is transport-connected before A is admitted, this bounded
+                // half-second exchange must receive the exact retry response.
+                var first = SendAndWait(
+                    c,
+                    hello,
+                    e => e.PayloadType == Payload.ServerHello,
+                    500,
+                    500);
+                if (!first.HasValue)
+                {
+                    return (null, false);
+                }
+
+                var firstHello = first.Value.PayloadAsServerHello();
+                if (!string.Equals(firstHello.Reason, RetryableHelloReason, StringComparison.Ordinal))
+                {
+                    // Any permanent rejection or direct acceptance is terminal
+                    // evidence that the required transient path did not occur.
+                    return (firstHello, false);
+                }
+
+                sawRetryableResponse = true;
+            }
+
+            var env = SendAndWait(
+                c,
+                hello,
+                e =>
+                {
+                    if (e.PayloadType != Payload.ServerHello)
+                    {
+                        return false;
+                    }
+
+                    var response = e.PayloadAsServerHello();
+                    if (string.Equals(response.Reason, RetryableHelloReason, StringComparison.Ordinal))
+                    {
+                        sawRetryableResponse = true;
+                        return false;
+                    }
+
+                    return true;
+                },
+                6000,
+                250);
+            return (env.HasValue ? env.Value.PayloadAsServerHello() : (ServerHello?)null, sawRetryableResponse);
         }
 
         // Resends `payload` every retryMs (safe because hello, econ and moorage

@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using LiteNetLib;
@@ -66,6 +67,8 @@ namespace Sailwind.Online.Client.Net
         private ulong _playerId;
         private uint _serverDay;
         private float _serverTimeOfDay;
+        private bool _loggedFirstOutboundPosition;
+        private bool _loggedFirstInboundPosition;
 
         /// <summary>Production constructor: drives the real LiteNetLib 1.3.1 transport.</summary>
         public NetClient(INetLog log)
@@ -159,15 +162,27 @@ namespace Sailwind.Online.Client.Net
         /// <summary>Begin (or restart) a session with the given options.</summary>
         public void Connect(ConnectOptions options)
         {
-            _options = options;
-
-            if (!_transport.IsRunning && !_transport.Start())
+            if (options == null)
             {
-                _log.LogError("[Sailwind.Online] Failed to start LiteNetLib NetManager.");
+                throw new ArgumentNullException(nameof(options));
+            }
+
+            if (_status == ConnectionStatus.Connecting && ReferenceEquals(_options, options))
+            {
                 return;
             }
 
-            OpenPeer();
+            if (_status != ConnectionStatus.Disconnected)
+            {
+                _status = ConnectionStatus.Disconnected;
+                _transport.DropPeer();
+            }
+
+            _options = options;
+            _reconnectBackoffMs = DefaultReconnectMs;
+            ResetSession();
+
+            StartTransportAndOpenPeer();
         }
 
         /// <summary>Poll the transport and service the handshake/reconnect timers. Call every frame.</summary>
@@ -186,7 +201,7 @@ namespace Sailwind.Online.Client.Net
             }
             else if (_status == ConnectionStatus.Disconnected && _options != null && now >= _nextReconnectMs)
             {
-                OpenPeer();
+                StartTransportAndOpenPeer();
             }
 
             _cache.PruneStale(now, SnapshotCache.DefaultStaleMs);
@@ -200,15 +215,27 @@ namespace Sailwind.Online.Client.Net
                 return;
             }
 
+            uint timestampMs = unchecked((uint)NowMs);
             byte[] bytes = _codec.EncodeClientState(
                 NextSeq(),
                 pose.Position.X, pose.Position.Y, pose.Position.Z,
                 pose.Rotation.X, pose.Rotation.Y, pose.Rotation.Z, pose.Rotation.W,
                 pose.Velocity.X, pose.Velocity.Y, pose.Velocity.Z,
                 0UL,
-                unchecked((uint)NowMs));
+                timestampMs);
 
-            SendRaw(bytes);
+            if (SendRaw(bytes) && !_loggedFirstOutboundPosition)
+            {
+                _loggedFirstOutboundPosition = true;
+                _log.LogInfo(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "[Sailwind.Online] First outbound position: player_id={0}, pos=({1}, {2}, {3}), t_ms={4}.",
+                    _playerId,
+                    pose.Position.X,
+                    pose.Position.Y,
+                    pose.Position.Z,
+                    timestampMs));
+            }
         }
 
         public void Dispose()
@@ -225,10 +252,40 @@ namespace Sailwind.Online.Client.Net
                 return;
             }
 
+            if (!_transport.IsRunning)
+            {
+                _status = ConnectionStatus.Disconnected;
+                ScheduleReconnect();
+                return;
+            }
+
             _cache.Clear();
-            _transport.Connect(options.Host, options.Port, ConnectKey);
+            ResetPositionObservability();
+            if (!_transport.Connect(options.Host, options.Port, ConnectKey))
+            {
+                _status = ConnectionStatus.Disconnected;
+                ScheduleReconnect();
+                _log.LogWarning(
+                    "[Sailwind.Online] Transport did not create a peer for " +
+                    options.Host + ":" + options.Port + "; will retry.");
+                return;
+            }
+
             _status = ConnectionStatus.Connecting;
             _log.LogInfo("[Sailwind.Online] Connecting to " + options.Host + ":" + options.Port + " ...");
+        }
+
+        private void StartTransportAndOpenPeer()
+        {
+            if (!_transport.IsRunning && !_transport.Start())
+            {
+                _status = ConnectionStatus.Disconnected;
+                ScheduleReconnect();
+                _log.LogError("[Sailwind.Online] Failed to start LiteNetLib NetManager; will retry.");
+                return;
+            }
+
+            OpenPeer();
         }
 
         private void ScheduleReconnect()
@@ -243,12 +300,12 @@ namespace Sailwind.Online.Client.Net
             return _seq;
         }
 
-        private void SendHello()
+        private bool SendHello()
         {
             ConnectOptions? options = _options;
             if (options == null)
             {
-                return;
+                return false;
             }
 
             byte[] bytes = _codec.EncodeClientHello(
@@ -260,38 +317,71 @@ namespace Sailwind.Online.Client.Net
                 options.ModVersion,
                 options.ApiSurfaceHash);
 
-            SendRaw(bytes);
+            if (!SendRaw(bytes))
+            {
+                EndHandshakeAttempt();
+                return false;
+            }
+
             _lastHelloMs = NowMs;
+            return true;
         }
 
-        private void SendRaw(byte[] bytes)
+        private bool SendRaw(byte[] bytes)
         {
             if (!_transport.IsPeerConnected)
             {
-                return;
+                return false;
             }
 
-            if (bytes.Length > Mtu)
+            int maxPayloadSize = _transport.MaxUnreliablePayloadSize;
+            if (maxPayloadSize <= 0 || bytes.Length > maxPayloadSize)
             {
-                _log.LogWarning("[Sailwind.Online] Dropping oversized packet (" + bytes.Length + " > " + Mtu + " bytes).");
-                return;
+                LogOversizedPacket(bytes.Length, maxPayloadSize);
+                return false;
             }
 
-            _transport.Send(bytes, DeliveryMethod.Unreliable);
+            try
+            {
+                _transport.Send(bytes, DeliveryMethod.Unreliable);
+            }
+            catch (TooBigPacketException)
+            {
+                LogOversizedPacket(bytes.Length, maxPayloadSize);
+                return false;
+            }
+
+            return true;
+        }
+
+        private void LogOversizedPacket(int packetSize, int maxPayloadSize)
+        {
+            _log.LogWarning(
+                "[Sailwind.Online] Dropping oversized packet (" + packetSize +
+                " bytes; current unreliable capacity " + maxPayloadSize + " payload bytes).");
         }
 
         private void OnPeerConnected()
         {
+            if (_status != ConnectionStatus.Connecting)
+            {
+                _log.LogDebug(
+                    "[Sailwind.Online] Ignored transport connect while " + StatusText + ".");
+                return;
+            }
+
             _status = ConnectionStatus.Handshaking;
-            _reconnectBackoffMs = DefaultReconnectMs;
-            SendHello();
-            _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
+            if (SendHello())
+            {
+                _log.LogInfo("[Sailwind.Online] Transport up; sending ClientHello.");
+            }
         }
 
         private void OnPeerDisconnected(string reason)
         {
             _status = ConnectionStatus.Disconnected;
             _cache.Clear();
+            ResetPositionObservability();
             ScheduleReconnect();
             _log.LogInfo("[Sailwind.Online] Disconnected (" + reason + "); will retry.");
         }
@@ -311,11 +401,31 @@ namespace Sailwind.Online.Client.Net
 
         void IServerMessageHandler.OnServerHello(ServerHello hello, uint seq)
         {
+            if (_status != ConnectionStatus.Handshaking)
+            {
+                _log.LogDebug(
+                    "[Sailwind.Online] Ignored ServerHello (seq " + seq + ") while " + StatusText + ".");
+                return;
+            }
+
             if (!hello.Accepted)
             {
-                _status = ConnectionStatus.Disconnected;
-                ScheduleReconnect();
-                _log.LogWarning("[Sailwind.Online] ServerHello rejected: " + (hello.Reason ?? "no reason"));
+                RejectHandshake("[Sailwind.Online] ServerHello rejected: " + (hello.Reason ?? "no reason"));
+                return;
+            }
+
+            CapabilityManifest? caps = hello.Capabilities;
+            if (!caps.HasValue)
+            {
+                RejectHandshake("[Sailwind.Online] ServerHello missing capabilities; will retry.");
+                return;
+            }
+
+            if (caps.Value.ProtocolVersion != ProtocolVersion)
+            {
+                RejectHandshake(
+                    "[Sailwind.Online] ServerHello protocol mismatch: client " + ProtocolVersion +
+                    ", server " + caps.Value.ProtocolVersion + "; will retry.");
                 return;
             }
 
@@ -323,8 +433,7 @@ namespace Sailwind.Online.Client.Net
             _playerId = hello.PlayerId;
             _reconnectBackoffMs = DefaultReconnectMs;
 
-            CapabilityManifest? caps = hello.Capabilities;
-            if (caps.HasValue && caps.Value.SnapshotHz > 0)
+            if (caps.Value.SnapshotHz > 0)
             {
                 _snapshotHz = caps.Value.SnapshotHz;
             }
@@ -429,6 +538,19 @@ namespace Sailwind.Online.Client.Net
                 Link = ps.AboardBoat
             };
             _cache.UpsertPlayer(ps.PlayerId, sample);
+
+            if (!_loggedFirstInboundPosition && HandshakeComplete && ps.PlayerId != _playerId)
+            {
+                _loggedFirstInboundPosition = true;
+                _log.LogInfo(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "[Sailwind.Online] First inbound position: remote_player_id={0}, pos=({1}, {2}, {3}), t_ms={4}.",
+                    ps.PlayerId,
+                    sample.Pos.X,
+                    sample.Pos.Y,
+                    sample.Pos.Z,
+                    sample.TMs));
+            }
         }
 
         private void IngestBoat(BoatState bs, long now)
@@ -465,6 +587,39 @@ namespace Sailwind.Online.Client.Net
 
             QuatC value = q.Value;
             return new NetQuat(value.X, value.Y, value.Z, value.W);
+        }
+
+        private void ResetPositionObservability()
+        {
+            _loggedFirstOutboundPosition = false;
+            _loggedFirstInboundPosition = false;
+        }
+
+        private void ResetSession()
+        {
+            _cache.Clear();
+            _seq = 0;
+            _lastHelloMs = 0;
+            _nextReconnectMs = 0;
+            _snapshotHz = 4;
+            _playerId = 0;
+            _serverDay = 0;
+            _serverTimeOfDay = 0;
+            ResetPositionObservability();
+        }
+
+        private void RejectHandshake(string warning)
+        {
+            EndHandshakeAttempt();
+            _log.LogWarning(warning);
+        }
+
+        private void EndHandshakeAttempt()
+        {
+            _status = ConnectionStatus.Disconnected;
+            ResetPositionObservability();
+            ScheduleReconnect();
+            _transport.DropPeer();
         }
 
         public static string FormatTimeOfDay(float fractionOfDay)

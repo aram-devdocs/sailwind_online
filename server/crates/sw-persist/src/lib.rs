@@ -8,12 +8,15 @@
 //! earlier table. Synchronous by design — it is driven directly from the
 //! server's single-threaded tick loop.
 
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 pub use rusqlite::{Error, Result};
 
 /// The latest schema version this build knows how to produce.
 pub const SCHEMA_VERSION: i64 = 2;
+
+/// Hard ceiling for one keyset-paginated mooring cell read.
+pub const MAX_MOORINGS_PAGE_ROWS: usize = 8;
 
 /// Embedded schema for `user_version = 1`. Applied once, in a transaction.
 const MIGRATION_V1: &str = r#"
@@ -94,6 +97,14 @@ pub struct PlayerRow {
     pub gold: i64,
     pub created_at: i64,
     pub last_seen: i64,
+}
+
+/// Result of atomically admitting a player identity against the configured
+/// persistent-row ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerAdmission {
+    Admitted(PlayerRow),
+    CapacityReached,
 }
 
 /// A row of the `moorings` table (a persisted boat mooring).
@@ -189,6 +200,63 @@ impl Db {
         )
     }
 
+    /// Create or refresh a player while atomically enforcing `max_rows`.
+    ///
+    /// An immediate transaction serializes the existence check, count, and
+    /// insert across SQLite connections. Existing identities remain admissible
+    /// after the table reaches capacity; a refused new identity makes no change.
+    pub fn admit_player_by_token(
+        &mut self,
+        token_hash: &str,
+        name: &str,
+        now: i64,
+        max_rows: u32,
+    ) -> Result<PlayerAdmission> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_id = tx
+            .query_row(
+                "SELECT id FROM players WHERE token_hash = ?1",
+                params![token_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing_id {
+            tx.execute(
+                "UPDATE players SET name = ?2, last_seen = ?3 WHERE id = ?1",
+                params![id, name, now],
+            )?;
+            let player = tx.query_row(
+                "SELECT id, name, token_hash, gold, created_at, last_seen
+                 FROM players WHERE id = ?1",
+                params![id],
+                player_from_row,
+            )?;
+            tx.commit()?;
+            return Ok(PlayerAdmission::Admitted(player));
+        }
+
+        let count = tx.query_row("SELECT COUNT(*) FROM players", [], |row| {
+            row.get::<_, u64>(0)
+        })?;
+        if count >= u64::from(max_rows) {
+            tx.commit()?;
+            return Ok(PlayerAdmission::CapacityReached);
+        }
+
+        let player = tx.query_row(
+            "INSERT INTO players (name, token_hash, gold, created_at, last_seen)
+             VALUES (?1, ?2, 0, ?3, ?3)
+             RETURNING id, name, token_hash, gold, created_at, last_seen",
+            params![name, token_hash, now],
+            player_from_row,
+        )?;
+        tx.commit()?;
+        Ok(PlayerAdmission::Admitted(player))
+    }
+
     /// Fetch a player by id.
     pub fn player(&self, id: i64) -> Result<Option<PlayerRow>> {
         self.conn
@@ -198,6 +266,20 @@ impl Db {
                 player_from_row,
             )
             .optional()
+    }
+
+    /// Load at most `limit` persisted identity keys in stable player-id order.
+    ///
+    /// The caller requests one row past its own hard ceiling to detect an
+    /// oversized database without ever materializing an unbounded result.
+    pub fn player_identities(&self, limit: u32) -> Result<Vec<(String, i64)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT token_hash, id FROM players ORDER BY id ASC LIMIT ?1")?;
+        let identities = statement
+            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(identities)
     }
 
     /// A player's current gold balance (0 if the player does not exist).
@@ -346,6 +428,52 @@ impl Db {
         rows.collect()
     }
 
+    /// One stable, bounded page of moorings in a cell ordered by `boat_id`.
+    pub fn moorings_in_cell_after(
+        &self,
+        cell_x: i32,
+        cell_z: i32,
+        after_boat_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MooringRow>> {
+        if !(1..=MAX_MOORINGS_PAGE_ROWS).contains(&limit) {
+            return Err(Error::InvalidParameterName(format!(
+                "mooring page limit must be in 1..={MAX_MOORINGS_PAGE_ROWS}"
+            )));
+        }
+        let limit = i64::try_from(limit).expect("validated mooring page limit fits i64");
+        let mut rows = Vec::with_capacity(limit as usize);
+        if let Some(after_boat_id) = after_boat_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT boat_id, owner, cell_x, cell_z, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, name, created_at
+                 FROM moorings
+                 WHERE cell_x = ?1 AND cell_z = ?2 AND boat_id > ?3
+                 ORDER BY boat_id
+                 LIMIT ?4",
+            )?;
+            let mapped = stmt.query_map(
+                params![cell_x, cell_z, after_boat_id, limit],
+                mooring_from_row,
+            )?;
+            for row in mapped {
+                rows.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT boat_id, owner, cell_x, cell_z, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w, name, created_at
+                 FROM moorings
+                 WHERE cell_x = ?1 AND cell_z = ?2
+                 ORDER BY boat_id
+                 LIMIT ?3",
+            )?;
+            let mapped = stmt.query_map(params![cell_x, cell_z, limit], mooring_from_row)?;
+            for row in mapped {
+                rows.push(row?);
+            }
+        }
+        Ok(rows)
+    }
+
     /// Count of all moorings (used in tests / diagnostics).
     pub fn mooring_count(&self) -> Result<i64> {
         self.conn
@@ -421,6 +549,45 @@ fn mooring_from_row(r: &Row<'_>) -> Result<MooringRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    struct TestDatabase {
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new(stem: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("sw-persist-{stem}-{}-{id}.db", std::process::id()));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let path = path.canonicalize().unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for suffix in ["-wal", "-shm", ""] {
+                let path = format!("{}{suffix}", self.path.display());
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 
     fn sample_mooring(boat_id: i64, owner: i64) -> MooringRow {
         MooringRow {
@@ -536,6 +703,139 @@ mod tests {
     }
 
     #[test]
+    fn player_admission_enforces_capacity_without_blocking_existing_identity() {
+        let mut db = Db::open_in_memory().unwrap();
+
+        let first = match db
+            .admit_player_by_token("hash-one", "First", 100, 2)
+            .unwrap()
+        {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => panic!("first player must fit"),
+        };
+        let second = match db
+            .admit_player_by_token("hash-two", "Second", 100, 2)
+            .unwrap()
+        {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => panic!("second player must fit"),
+        };
+        assert_ne!(first.id, second.id);
+
+        assert_eq!(
+            db.admit_player_by_token("hash-three", "Third", 200, 2)
+                .unwrap(),
+            PlayerAdmission::CapacityReached
+        );
+        assert!(
+            db.player(second.id + 1).unwrap().is_none(),
+            "capacity refusal must not insert a player row"
+        );
+
+        let reconnected = match db
+            .admit_player_by_token("hash-one", "Renamed", 300, 2)
+            .unwrap()
+        {
+            PlayerAdmission::Admitted(player) => player,
+            PlayerAdmission::CapacityReached => {
+                panic!("an existing identity must reconnect at capacity")
+            }
+        };
+        assert_eq!(reconnected.id, first.id);
+        assert_eq!(reconnected.name, "Renamed");
+        assert_eq!(reconnected.created_at, first.created_at);
+        assert_eq!(reconnected.last_seen, 300);
+    }
+
+    #[test]
+    fn player_identity_load_is_stable_and_hard_limited() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.upsert_player_by_token("hash-one", "First", 100).unwrap();
+        db.upsert_player_by_token("hash-two", "Second", 100)
+            .unwrap();
+
+        assert_eq!(
+            db.player_identities(1).unwrap(),
+            vec![("hash-one".to_string(), first.id)]
+        );
+        assert_eq!(db.player_identities(0).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn concurrent_player_admission_enforces_capacity_across_connections() {
+        const CONTENDERS: usize = 8;
+        const RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let database = TestDatabase::new("admission");
+        let path = database.path().to_str().unwrap();
+
+        // Finish migrations before opening the independent connections that
+        // will contend on the same real SQLite file.
+        drop(Db::open(path).unwrap());
+        let connections = (0..CONTENDERS)
+            .map(|_| Db::open(path).unwrap())
+            .collect::<Vec<_>>();
+
+        let start = Arc::new(Barrier::new(CONTENDERS));
+        let (result_tx, result_rx) = mpsc::channel();
+        let handles = connections
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut db)| {
+                let start = Arc::clone(&start);
+                let result_tx = result_tx.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let result = db.admit_player_by_token(
+                        &format!("token-{index}"),
+                        &format!("Player {index}"),
+                        index as i64,
+                        1,
+                    );
+                    result_tx.send((index, result)).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(result_tx);
+
+        let mut admissions = Vec::with_capacity(CONTENDERS);
+        for _ in 0..CONTENDERS {
+            admissions.push(
+                result_rx
+                    .recv_timeout(RESULT_TIMEOUT)
+                    .expect("all admission attempts must finish within the SQLite busy timeout"),
+            );
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut admitted = 0;
+        let mut capacity_reached = 0;
+        for (index, result) in admissions {
+            match result.unwrap_or_else(|error| {
+                panic!(
+                    "contender {index} returned a database error instead of an admission: {error}"
+                )
+            }) {
+                PlayerAdmission::Admitted(_) => admitted += 1,
+                PlayerAdmission::CapacityReached => capacity_reached += 1,
+            }
+        }
+        assert_eq!(admitted, 1);
+        assert_eq!(capacity_reached, CONTENDERS - 1);
+
+        let verifier = Db::open(path).unwrap();
+        let player_count = verifier
+            .conn
+            .query_row("SELECT COUNT(*) FROM players", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(player_count, 1);
+    }
+
+    #[test]
     fn ledger_commit_and_lookup_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         let p = db.upsert_player_by_token("t", "P", 0).unwrap();
@@ -560,6 +860,57 @@ mod tests {
         db.upsert_mooring(&m2).unwrap();
         assert_eq!(db.mooring_count().unwrap(), 1);
         assert_eq!(db.moorings_in_cell(3, -2).unwrap()[0].name, "Renamed");
+    }
+
+    #[test]
+    fn mooring_cell_pages_are_bounded_stable_and_keyset_paginated() {
+        let db = Db::open_in_memory().unwrap();
+        for boat_id in [9, 2, 7, 4, 1] {
+            db.upsert_mooring(&sample_mooring(boat_id, 7)).unwrap();
+        }
+        let mut other_cell = sample_mooring(3, 7);
+        other_cell.cell_x = 99;
+        db.upsert_mooring(&other_cell).unwrap();
+
+        let first = db.moorings_in_cell_after(3, -2, None, 2).unwrap();
+        let second = db
+            .moorings_in_cell_after(3, -2, first.last().map(|row| row.boat_id), 2)
+            .unwrap();
+        let third = db
+            .moorings_in_cell_after(3, -2, second.last().map(|row| row.boat_id), 2)
+            .unwrap();
+
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .chain(&third)
+                .map(|row| row.boat_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 7, 9]
+        );
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(third.len(), 1);
+        assert!(db.moorings_in_cell_after(3, -2, None, 0).is_err());
+        assert!(db
+            .moorings_in_cell_after(3, -2, None, MAX_MOORINGS_PAGE_ROWS + 1)
+            .is_err());
+        let query_plan: String = db
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT boat_id FROM moorings
+                 WHERE cell_x = ?1 AND cell_z = ?2 AND boat_id > ?3
+                 ORDER BY boat_id LIMIT ?4",
+                params![3, -2, 2, 2],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            query_plan.contains("idx_moorings_cell"),
+            "keyset page must use the cell index, got: {query_plan}"
+        );
     }
 
     #[test]

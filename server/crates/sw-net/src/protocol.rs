@@ -104,6 +104,17 @@ impl Header {
             fragmented: false,
         }
     }
+
+    /// A non-fragmented header belonging to one connected session.
+    #[inline]
+    pub fn connected(property: u8, connection_number: u8) -> Header {
+        debug_assert!(connection_number < MAX_CONNECTION_NUMBER);
+        Header {
+            property,
+            connection_number,
+            fragmented: false,
+        }
+    }
 }
 
 /// A parsed ConnectRequest packet (fields after the LiteNetLib target address).
@@ -199,26 +210,27 @@ pub fn build_connect_accept(
     b
 }
 
-/// Wrap `data` in an Unreliable packet (property byte + payload).
-pub fn build_unreliable(data: &[u8]) -> Vec<u8> {
+/// Wrap `data` in an Unreliable packet for `connection_number`.
+pub fn build_unreliable(connection_number: u8, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE + data.len());
-    out.push(Header::plain(property::UNRELIABLE).to_byte());
+    out.push(Header::connected(property::UNRELIABLE, connection_number).to_byte());
     out.extend_from_slice(data);
     out
 }
 
-/// Build a Ping packet with the given sequence number.
-pub fn build_ping(sequence: u16) -> [u8; PING_SIZE] {
+/// Build a Ping packet for `connection_number` with the given sequence number.
+pub fn build_ping(connection_number: u8, sequence: u16) -> [u8; PING_SIZE] {
     let mut b = [0u8; PING_SIZE];
-    b[0] = Header::plain(property::PING).to_byte();
+    b[0] = Header::connected(property::PING, connection_number).to_byte();
     b[1..3].copy_from_slice(&sequence.to_le_bytes());
     b
 }
 
-/// Build a Pong packet echoing `sequence`, carrying our local time in .NET ticks.
-pub fn build_pong(sequence: u16, time_ticks: i64) -> [u8; PONG_SIZE] {
+/// Build a Pong for `connection_number`, echoing `sequence` and carrying our
+/// local time in .NET ticks.
+pub fn build_pong(connection_number: u8, sequence: u16, time_ticks: i64) -> [u8; PONG_SIZE] {
     let mut b = [0u8; PONG_SIZE];
-    b[0] = Header::plain(property::PONG).to_byte();
+    b[0] = Header::connected(property::PONG, connection_number).to_byte();
     b[1..3].copy_from_slice(&sequence.to_le_bytes());
     b[3..11].copy_from_slice(&time_ticks.to_le_bytes());
     b
@@ -232,10 +244,10 @@ pub fn read_sequence(buf: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes([buf[1], buf[2]]))
 }
 
-/// Build a Disconnect packet carrying `connect_time` (validated by the peer).
-pub fn build_disconnect(connect_time: i64) -> [u8; DISCONNECT_SIZE] {
+/// Build a Disconnect for `connection_number`, carrying `connect_time`.
+pub fn build_disconnect(connection_number: u8, connect_time: i64) -> [u8; DISCONNECT_SIZE] {
     let mut b = [0u8; DISCONNECT_SIZE];
-    b[0] = Header::plain(property::DISCONNECT).to_byte();
+    b[0] = Header::connected(property::DISCONNECT, connection_number).to_byte();
     b[1..9].copy_from_slice(&connect_time.to_le_bytes());
     b
 }
@@ -356,8 +368,8 @@ mod tests {
 
     #[test]
     fn ping_pong_golden_bytes() {
-        assert_eq!(build_ping(0x0201), [property::PING, 0x01, 0x02]);
-        let pong = build_pong(0x0201, 0x0A09_0807_0605_0403);
+        assert_eq!(build_ping(0, 0x0201), [property::PING, 0x01, 0x02]);
+        let pong = build_pong(0, 0x0201, 0x0A09_0807_0605_0403);
         assert_eq!(
             pong,
             [
@@ -379,15 +391,41 @@ mod tests {
 
     #[test]
     fn disconnect_golden_roundtrip() {
-        let d = build_disconnect(0x0102_0304_0506_0708);
+        let d = build_disconnect(0, 0x0102_0304_0506_0708);
         assert_eq!(d[0], property::DISCONNECT);
         assert_eq!(read_disconnect_time(&d), Some(0x0102_0304_0506_0708));
     }
 
     #[test]
     fn unreliable_wraps_payload() {
-        let p = build_unreliable(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let p = build_unreliable(0, &[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(p, [property::UNRELIABLE, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn connected_packet_builders_stamp_every_connection_number() {
+        for connection_number in 0..MAX_CONNECTION_NUMBER {
+            let unreliable = build_unreliable(connection_number, &[0xAA]);
+            let ping = build_ping(connection_number, 0x0201);
+            let pong = build_pong(connection_number, 0x0201, 7);
+            let disconnect = build_disconnect(connection_number, 9);
+
+            for (packet, property) in [
+                (unreliable.as_slice(), property::UNRELIABLE),
+                (ping.as_slice(), property::PING),
+                (pong.as_slice(), property::PONG),
+                (disconnect.as_slice(), property::DISCONNECT),
+            ] {
+                assert_eq!(
+                    Header::from_byte(packet[0]),
+                    Header {
+                        property,
+                        connection_number,
+                        fragmented: false,
+                    }
+                );
+            }
+        }
     }
 
     #[test]

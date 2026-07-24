@@ -18,10 +18,21 @@ namespace Sailwind.Online.Net.Tests
         /// <summary>What <see cref="Start"/> returns; false simulates a socket that cannot bind.</summary>
         public bool StartResult = true;
 
+        /// <summary>Queued <see cref="Start"/> outcomes, consumed before <see cref="StartResult"/>.</summary>
+        public readonly Queue<bool> StartResults = new Queue<bool>();
+
+        /// <summary>What <see cref="Connect"/> reports; false simulates no peer being created.</summary>
+        public bool ConnectResult = true;
+
         public int StartCalls;
         public int StopCalls;
         public int ConnectCalls;
+        public int FreshPeerConnectCalls;
+        public int DropPeerCalls;
         public int PollCalls;
+
+        /// <summary>Optional callback invoked during <see cref="DropPeer"/> to model queued callbacks.</summary>
+        public Action DropPeerCallback;
 
         public string LastHost;
         public int LastPort;
@@ -30,12 +41,18 @@ namespace Sailwind.Online.Net.Tests
         /// <summary>Every datagram NetClient handed to <see cref="Send"/>, in order.</summary>
         public readonly List<byte[]> Sent = new List<byte[]>();
 
+        /// <summary>Queued send failures, consumed before a datagram is recorded.</summary>
+        public readonly Queue<Exception> SendFailures = new Queue<Exception>();
+
         private bool _running;
+        private bool _hasPeer;
         private bool _peerConnected;
 
         public bool IsRunning => _running;
 
         public bool IsPeerConnected => _peerConnected;
+
+        public int MaxUnreliablePayloadSize { get; set; } = NetClient.Mtu - 1;
 
         public int Ping { get; set; } = -1;
 
@@ -47,24 +64,50 @@ namespace Sailwind.Online.Net.Tests
         public bool Start()
         {
             StartCalls++;
-            if (StartResult)
+            bool result = StartResults.Count > 0 ? StartResults.Dequeue() : StartResult;
+            if (result)
             {
                 _running = true;
             }
 
-            return StartResult;
+            return result;
         }
 
-        public void Connect(string host, int port, string key)
+        public bool Connect(string host, int port, string key)
         {
             ConnectCalls++;
+            if (ConnectResult && !_hasPeer)
+            {
+                FreshPeerConnectCalls++;
+            }
+
+            if (ConnectResult)
+            {
+                _hasPeer = true;
+            }
+
             LastHost = host;
             LastPort = port;
             LastKey = key;
+            return _hasPeer;
+        }
+
+        public void DropPeer()
+        {
+            DropPeerCalls++;
+            _hasPeer = false;
+            _peerConnected = false;
+            Ping = -1;
+            DropPeerCallback?.Invoke();
         }
 
         public void Send(byte[] data, DeliveryMethod deliveryMethod)
         {
+            if (SendFailures.Count > 0)
+            {
+                throw SendFailures.Dequeue();
+            }
+
             Sent.Add(data);
         }
 
@@ -77,6 +120,7 @@ namespace Sailwind.Online.Net.Tests
         {
             StopCalls++;
             _running = false;
+            _hasPeer = false;
             _peerConnected = false;
         }
 
@@ -85,6 +129,7 @@ namespace Sailwind.Online.Net.Tests
         /// <summary>Simulate the transport completing its connect: the peer becomes send-ready first.</summary>
         public void RaisePeerConnected()
         {
+            _hasPeer = true;
             _peerConnected = true;
             PeerConnected?.Invoke();
         }
@@ -92,6 +137,7 @@ namespace Sailwind.Online.Net.Tests
         /// <summary>Simulate the peer dropping; the peer is no longer send-ready.</summary>
         public void RaisePeerDisconnected(string reason = "RemoteConnectionClose")
         {
+            _hasPeer = false;
             _peerConnected = false;
             PeerDisconnected?.Invoke(reason);
         }

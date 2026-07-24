@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Sailwind.Online.Net.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="$(RepoRoot)contracts/cs/Sailwind.Contracts/Sailwind.Contracts.csproj" />
     <ProjectReference Include="$(RepoRoot)packages/api-abstractions/Sailwind.Api.Abstractions/Sailwind.Api.Abstractions.csproj" />
     <ProjectReference Include="$(RepoRoot)packages/sync/Sailwind.Online.Sync/Sailwind.Online.Sync.csproj" />

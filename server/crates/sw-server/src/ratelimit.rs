@@ -1,30 +1,59 @@
-//! Aggregate per-player market-trade rate limiter.
+//! Aggregate per-session-key rate limiter.
 //!
-//! A minimum-interval throttle keyed by **player**: a given player may have at
-//! most one *new* accepted trade within [`RateLimiter::min_interval_ms`],
-//! regardless of which `port_id` the request names. Keying by player (never by
-//! an attacker-chosen port) makes the throttle rotation-proof — a client cannot
-//! escape the bound by sending a fresh `port_id` on every message — and bounds
-//! the map to players active within the last window rather than to the 2^32
-//! possible port ids.
+//! A minimum-interval throttle keyed by a connected peer or authenticated
+//! player. Callers choose a lifecycle-bounded key, then call
+//! [`RateLimiter::clear`] when that peer or player disconnects. This keeps the
+//! map bounded to active/session keys without scanning all entries during
+//! admission.
 //!
-//! It is deliberately separate from the idempotency dedup in [`sw_econ::Market`]
-//! — the caller checks dedup first, so an idempotent replay of an already-applied
+//! It is deliberately separate from the idempotency dedup in [`sw_econ::Market`]:
+//! the caller checks dedup first, so an idempotent replay of an already-applied
 //! trade is never throttled; only genuinely new trades are.
-//!
-//! Memory stays bounded two ways: every [`RateLimiter::allow`] first evicts
-//! entries whose window has fully elapsed (a stale entry can never throttle
-//! anything, so it is pure waste), and [`RateLimiter::clear`] drops a player's
-//! entry when they disconnect.
 //!
 //! The interval is bounded/saturating at construction time (see
 //! [`crate::config::Config::trade_min_interval_ms_i64`]), so the window math
 //! never overflows.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
+use std::hash::Hash;
 
-/// Tracks the last accepted trade time per player and admits a new trade only
-/// once the configured interval has elapsed, pruning stale entries as it goes.
+/// One process-wide minimum-interval gate with constant memory.
+#[derive(Debug)]
+pub struct GlobalRateLimiter {
+    min_interval_ms: i64,
+    last: Option<i64>,
+}
+
+impl GlobalRateLimiter {
+    /// Build a global limiter with the given minimum interval in milliseconds.
+    pub fn new(min_interval_ms: i64) -> GlobalRateLimiter {
+        GlobalRateLimiter {
+            min_interval_ms,
+            last: None,
+        }
+    }
+
+    /// Admit at most one operation in each process-wide interval.
+    ///
+    /// A rejected attempt does not extend the cooldown. Timestamp rollback is
+    /// treated as no elapsed time, matching [`RateLimiter`].
+    pub fn allow(&mut self, now_ms: i64) -> bool {
+        if self.min_interval_ms <= 0 {
+            return true;
+        }
+        if self
+            .last
+            .is_some_and(|last| now_ms.saturating_sub(last) < self.min_interval_ms)
+        {
+            return false;
+        }
+        self.last = Some(now_ms);
+        true
+    }
+}
+
+/// Tracks the last accepted message time per lifecycle-bounded key and admits a
+/// new message only once the configured interval has elapsed.
 #[derive(Debug)]
 pub struct RateLimiter {
     min_interval_ms: i64,
@@ -32,7 +61,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Build a limiter with the given aggregate per-player minimum interval in
+    /// Build a limiter with the given aggregate per-key minimum interval in
     /// milliseconds. A non-positive interval disables throttling.
     pub fn new(min_interval_ms: i64) -> RateLimiter {
         RateLimiter {
@@ -41,42 +70,108 @@ impl RateLimiter {
         }
     }
 
-    /// Try to admit a new trade by `player` at time `now_ms`.
+    /// Try to admit a new message by `key` at time `now_ms`.
     ///
-    /// Returns `true` and records `now_ms` when the trade is allowed; returns
+    /// Returns `true` and records `now_ms` when the message is allowed; returns
     /// `false` without recording when it falls inside the throttle window, so a
-    /// rejected attempt never extends the cooldown. The decision is aggregate
-    /// per player: the `port_id` a request names cannot open a fresh bucket.
-    pub fn allow(&mut self, player: u64, now_ms: i64) -> bool {
-        // A non-positive interval disables throttling. Never store, so the map
-        // cannot grow at all in this mode.
+    /// rejected attempt never extends the cooldown. A timestamp rollback is
+    /// treated as no elapsed time and cannot bypass the window.
+    pub fn allow(&mut self, key: u64, now_ms: i64) -> bool {
         if self.min_interval_ms <= 0 {
             return true;
         }
-        // Evict every entry whose window has fully elapsed. A stale entry can no
-        // longer throttle anything, so keeping it is pure memory waste; pruning
-        // here bounds the live map to players who traded within the last window.
-        self.last
-            .retain(|_, &mut last| now_ms.saturating_sub(last) < self.min_interval_ms);
-        // A surviving entry means this player is still inside their window, so a
-        // new trade is throttled.
-        if self.last.contains_key(&player) {
-            return false;
+
+        match self.last.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(now_ms);
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                if now_ms.saturating_sub(*entry.get()) < self.min_interval_ms {
+                    return false;
+                }
+                entry.insert(now_ms);
+                true
+            }
         }
-        self.last.insert(player, now_ms);
-        true
     }
 
-    /// Forget a player's throttle state, e.g. on disconnect. A departed
-    /// player's entry is useless and would otherwise linger until its window
-    /// elapsed; dropping it keeps the map bounded to connected players.
-    pub fn clear(&mut self, player: u64) {
-        self.last.remove(&player);
+    /// Forget a key's throttle state on disconnect, keeping storage bounded to
+    /// active peers or authenticated player sessions.
+    pub fn clear(&mut self, key: u64) {
+        self.last.remove(&key);
     }
 
     /// Number of live entries the limiter is tracking. Test-only: it lets the
     /// unit and dispatch tests assert the map stays bounded and is cleared on
     /// disconnect.
+    #[cfg(test)]
+    pub fn tracked_count(&self) -> usize {
+        self.last.len()
+    }
+
+    /// Last admitted monotonic timestamp for a key.
+    #[cfg(test)]
+    pub fn last_accepted_ms(&self, key: u64) -> Option<i64> {
+        self.last.get(&key).copied()
+    }
+}
+
+/// A minimum-interval throttle with a hard ceiling on tracked keys.
+///
+/// When the key budget is full, a new key may replace only the oldest entry
+/// whose cooldown has elapsed. This retains disconnect churn protection
+/// without allowing the limiter itself to grow beyond `max_keys`.
+#[derive(Debug)]
+pub struct BoundedRateLimiter<K> {
+    min_interval_ms: i64,
+    max_keys: usize,
+    last: HashMap<K, i64>,
+    oldest: BTreeSet<(i64, K)>,
+}
+
+impl<K> BoundedRateLimiter<K>
+where
+    K: Clone + Eq + Hash + Ord,
+{
+    /// Build a bounded per-key limiter.
+    pub fn new(min_interval_ms: i64, max_keys: usize) -> BoundedRateLimiter<K> {
+        BoundedRateLimiter {
+            min_interval_ms,
+            max_keys,
+            last: HashMap::new(),
+            oldest: BTreeSet::new(),
+        }
+    }
+
+    /// Admit a key after its cooldown while retaining at most `max_keys`.
+    pub fn allow(&mut self, key: K, now_ms: i64) -> bool {
+        if self.min_interval_ms <= 0 {
+            return true;
+        }
+
+        if let Some(&last_ms) = self.last.get(&key) {
+            if now_ms.saturating_sub(last_ms) < self.min_interval_ms {
+                return false;
+            }
+            self.oldest.remove(&(last_ms, key.clone()));
+        } else if self.last.len() >= self.max_keys {
+            let Some((oldest_ms, oldest_key)) = self.oldest.first().cloned() else {
+                return false;
+            };
+            if now_ms.saturating_sub(oldest_ms) < self.min_interval_ms {
+                return false;
+            }
+            self.oldest.remove(&(oldest_ms, oldest_key.clone()));
+            self.last.remove(&oldest_key);
+        }
+
+        self.last.insert(key.clone(), now_ms);
+        self.oldest.insert((now_ms, key));
+        true
+    }
+
+    /// Number of retained keys.
     #[cfg(test)]
     pub fn tracked_count(&self) -> usize {
         self.last.len()
@@ -97,10 +192,7 @@ mod tests {
     fn a_second_trade_inside_the_window_is_rejected() {
         let mut rl = RateLimiter::new(250);
         assert!(rl.allow(1, 1000));
-        // 100ms later, still inside the 250ms window -> throttled.
         assert!(!rl.allow(1, 1100));
-        // A rejected attempt must not push the cooldown out: once the original
-        // window elapses the next trade is admitted.
         assert!(rl.allow(1, 1250));
     }
 
@@ -113,33 +205,46 @@ mod tests {
 
     #[test]
     fn the_throttle_is_aggregate_per_player_and_rotation_proof() {
-        // Regression for the security review's DoS finding. The pre-fix limiter
-        // keyed by (player, port) and admitted the first trade per key, so a
-        // client rotating port_ids got a fresh bucket every message and was
-        // never throttled. The throttle is now aggregate per PLAYER: once a
-        // player trades, every further trade inside the window is rejected no
-        // matter what port_id (or any other request field) it names.
         let mut rl = RateLimiter::new(250);
         assert!(rl.allow(1, 1000));
-        // A different player keeps an independent bucket.
         assert!(rl.allow(2, 1000));
-        // Player 1 is still throttled 50ms later — there is no per-port escape.
         assert!(!rl.allow(1, 1050));
     }
 
     #[test]
-    fn stale_entries_are_evicted_so_the_map_stays_bounded() {
-        // An attacker sending distinct requests cannot grow the map without
-        // bound: the limiter is keyed by player and prunes entries whose window
-        // has elapsed, so the live size is bounded by the players active within
-        // one window, not by how many messages arrive over time.
+    fn clear_keeps_storage_bounded_to_active_keys() {
         let mut rl = RateLimiter::new(250);
-        for player in 0..10_000u64 {
-            // Each player trades once, a full window apart, so each new arrival
-            // makes the previous entry stale and it is pruned on the next check.
-            assert!(rl.allow(player, (player as i64) * 250));
+        for key in 0..10_000u64 {
+            assert!(rl.allow(key, 1_000));
+            rl.clear(key);
         }
-        assert_eq!(rl.tracked_count(), 1);
+        assert_eq!(rl.tracked_count(), 0);
+    }
+
+    #[test]
+    fn admission_does_not_scan_all_tracked_keys() {
+        let source = include_str!("ratelimit.rs");
+        let full_map_scan = [".ret", "ain("].concat();
+        assert!(
+            !source.contains(&full_map_scan),
+            "allow must not scan every tracked key"
+        );
+
+        let mut rl = RateLimiter::new(250);
+        for key in 0..10_000 {
+            assert!(rl.allow(key, 1_000));
+        }
+        assert_eq!(rl.tracked_count(), 10_000);
+        assert!(!rl.allow(9_999, 1_001));
+    }
+
+    #[test]
+    fn timestamp_rollback_does_not_bypass_the_window() {
+        let mut rl = RateLimiter::new(250);
+        assert!(rl.allow(1, 1_000));
+        assert!(!rl.allow(1, 900));
+        assert!(!rl.allow(1, 1_249));
+        assert!(rl.allow(1, 1_250));
     }
 
     #[test]
@@ -149,7 +254,6 @@ mod tests {
         assert_eq!(rl.tracked_count(), 1);
         rl.clear(1);
         assert_eq!(rl.tracked_count(), 0);
-        // After a clear the player may trade again immediately.
         assert!(rl.allow(1, 1050));
     }
 
@@ -158,8 +262,48 @@ mod tests {
         let mut rl = RateLimiter::new(0);
         assert!(rl.allow(1, 1000));
         assert!(rl.allow(1, 1000));
-        // With throttling disabled the map never grows, so it cannot be a memory
-        // sink either.
         assert_eq!(rl.tracked_count(), 0);
+    }
+
+    #[test]
+    fn global_limiter_has_one_rotation_proof_admission_window() {
+        let mut limiter = GlobalRateLimiter::new(250);
+        assert!(limiter.allow(1_000));
+        for _rotated_peer in 0..10_000 {
+            assert!(!limiter.allow(1_001));
+        }
+        assert!(limiter.allow(1_250));
+    }
+
+    #[test]
+    fn global_limiter_rollback_does_not_bypass_window() {
+        let mut limiter = GlobalRateLimiter::new(250);
+        assert!(limiter.allow(1_000));
+        assert!(!limiter.allow(900));
+        assert!(!limiter.allow(1_249));
+        assert!(limiter.allow(1_250));
+    }
+
+    #[test]
+    fn bounded_limiter_rejects_new_keys_until_an_entry_expires() {
+        let mut limiter = BoundedRateLimiter::new(250, 2);
+        assert!(limiter.allow(1, 1_000));
+        assert!(limiter.allow(2, 1_001));
+        assert!(!limiter.allow(3, 1_249));
+        assert_eq!(limiter.tracked_count(), 2);
+
+        assert!(limiter.allow(3, 1_250));
+        assert_eq!(limiter.tracked_count(), 2);
+        assert!(!limiter.allow(3, 1_251));
+    }
+
+    #[test]
+    fn bounded_limiter_never_exceeds_its_key_budget_under_churn() {
+        let mut limiter = BoundedRateLimiter::new(1, 4);
+        for key in 0..10_000 {
+            assert!(limiter.allow(key, key as i64));
+            assert!(limiter.tracked_count() <= 4);
+        }
+        assert_eq!(limiter.tracked_count(), 4);
     }
 }

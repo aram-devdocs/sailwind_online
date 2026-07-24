@@ -16,7 +16,7 @@ namespace Sailwind.Online.Client.Net
     {
         private readonly EventBasedNetListener _listener = new EventBasedNetListener();
         private readonly NetManager _manager;
-        private NetPeer? _peer;
+        private readonly CurrentPeerSlot<NetPeer> _peer = new CurrentPeerSlot<NetPeer>();
 
         public LiteNetLibTransport()
         {
@@ -40,12 +40,31 @@ namespace Sailwind.Online.Client.Net
 
         public bool IsPeerConnected
         {
-            get { return _peer != null && _peer.ConnectionState == ConnectionState.Connected; }
+            get
+            {
+                NetPeer? peer = _peer.Value;
+                return peer != null && peer.ConnectionState == ConnectionState.Connected;
+            }
+        }
+
+        public int MaxUnreliablePayloadSize
+        {
+            get
+            {
+                NetPeer? peer = _peer.Value;
+                return peer != null
+                    ? peer.GetMaxSinglePacketSize(DeliveryMethod.Unreliable)
+                    : 0;
+            }
         }
 
         public int Ping
         {
-            get { return _peer != null ? _peer.Ping : -1; }
+            get
+            {
+                NetPeer? peer = _peer.Value;
+                return peer != null ? peer.Ping : -1;
+            }
         }
 
         public event Action? PeerConnected;
@@ -58,14 +77,25 @@ namespace Sailwind.Online.Client.Net
             return _manager.Start();
         }
 
-        public void Connect(string host, int port, string key)
+        public bool Connect(string host, int port, string key)
         {
-            _peer = _manager.Connect(host, port, key);
+            return _peer.SetIfPresent(_manager.Connect(host, port, key));
+        }
+
+        public void DropPeer()
+        {
+            NetPeer? peer = _peer.Clear();
+            if (peer == null)
+            {
+                return;
+            }
+
+            _manager.DisconnectPeerForce(peer);
         }
 
         public void Send(byte[] data, DeliveryMethod deliveryMethod)
         {
-            _peer?.Send(data, deliveryMethod);
+            _peer.Value?.Send(data, deliveryMethod);
         }
 
         public void PollEvents()
@@ -80,23 +110,37 @@ namespace Sailwind.Online.Client.Net
                 _manager.Stop();
             }
 
-            _peer = null;
+            _peer.Clear();
         }
 
         private void OnPeerConnected(NetPeer peer)
         {
-            _peer = peer;
+            if (!_peer.IsCurrent(peer))
+            {
+                return;
+            }
+
             PeerConnected?.Invoke();
         }
 
         private void OnPeerDisconnected(NetPeer peer, DisconnectInfo info)
         {
-            _peer = null;
+            if (!_peer.TryClear(peer))
+            {
+                return;
+            }
+
             PeerDisconnected?.Invoke(info.Reason.ToString());
         }
 
         private void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNumber, DeliveryMethod deliveryMethod)
         {
+            if (!_peer.IsCurrent(peer))
+            {
+                reader.Recycle();
+                return;
+            }
+
             byte[] data = reader.GetRemainingBytes();
             reader.Recycle();
             NetworkReceive?.Invoke(data);
@@ -105,6 +149,50 @@ namespace Sailwind.Online.Client.Net
         private void OnNetworkError(IPEndPoint endPoint, SocketError socketError)
         {
             NetworkError?.Invoke(endPoint, socketError);
+        }
+    }
+
+    internal sealed class CurrentPeerSlot<TPeer>
+        where TPeer : class
+    {
+        private TPeer? _value;
+
+        public TPeer? Value
+        {
+            get { return _value; }
+        }
+
+        public bool SetIfPresent(TPeer peer)
+        {
+            if (peer != null)
+            {
+                _value = peer;
+            }
+
+            return _value != null;
+        }
+
+        public TPeer? Clear()
+        {
+            TPeer? peer = _value;
+            _value = null;
+            return peer;
+        }
+
+        public bool IsCurrent(TPeer peer)
+        {
+            return ReferenceEquals(_value, peer);
+        }
+
+        public bool TryClear(TPeer peer)
+        {
+            if (!IsCurrent(peer))
+            {
+                return false;
+            }
+
+            _value = null;
+            return true;
         }
     }
 }

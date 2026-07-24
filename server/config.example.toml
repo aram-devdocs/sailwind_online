@@ -36,6 +36,34 @@ cell_size_m = 1024.0
 # throttled. Must be in 0..=3600000 (0 disables the throttle).
 trade_min_interval_ms = 250
 
+# ClientHello throttle in milliseconds. Per-peer throttling runs before
+# protocol/hash validation, database access, and ServerHello generation. Source
+# IP session admission uses max(hello_min_interval_ms,
+# 2 * new_session_min_interval_ms + 1), which reserves one complete global
+# admission window for other source IPs after a source wins a slot. Keep the
+# hello interval at or below the client's 250 ms retry cadence so a lost
+# ServerHello can be retried on the next attempt. Must be in 1..=250; zero would
+# disable pre-authentication protection.
+hello_min_interval_ms = 250
+
+# Process-wide minimum interval between database admissions for identities
+# without an active session. Active-identity reconnects have a separate
+# per-player window, so reconnect churn cannot monopolize this new-identity
+# budget. Must be in 1..=1000.
+new_session_min_interval_ms = 30
+
+# Hard ceilings on live LiteNetLib transport peers, including peers that have
+# not authenticated yet. The per-IP ceiling prevents source-port rotation from
+# consuming the global peer budget. Both must be positive, the global value may
+# not exceed 65535, and the per-IP value may not exceed the global value.
+max_transport_peers = 1024
+max_transport_peers_per_ip = 16
+
+# Hard ceiling on persistent player rows. Existing identities can reconnect
+# after the table reaches this limit; new identities are refused without
+# creating session or world state. Must be in 1..=1000000.
+max_player_rows = 10000
+
 # Per-player throttles (milliseconds) for the other inbound message classes,
 # mirroring the rotation-proof, memory-bounded trade limiter above. A message
 # beyond the configured rate is dropped before it drives work; an idempotent
